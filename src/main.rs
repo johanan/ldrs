@@ -1,7 +1,9 @@
 use arrow::datatypes::ArrowNativeType;
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, ArrayAccessor, ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray
+    Array, ArrayAccessor, ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use bigdecimal::FromPrimitive;
@@ -12,6 +14,7 @@ use parquet::basic::LogicalType;
 use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use pg_bigdecimal::{BigDecimal, BigInt};
+use postgres_types::to_sql_checked;
 use postgres_types::{ToSql, Type};
 use std::env;
 use std::fs::File;
@@ -118,10 +121,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pg_types_clone = pg_types.clone();
                 println!("pg_types_clone: {:?}", pg_types_clone);
                 async move {
-                    let mut pinned_writer = pinned_writer.lock().await;
                     let num_rows = batch.num_rows();
                     let num_cols = batch.num_columns();
                     println!("num_rows: {:?}, num_cols: {:?}", num_rows, num_cols);
+                    let mut batch_buffer = Vec::<Vec<PgValue<'_>>>::with_capacity(num_rows);
                     // iterate over the rows and then the columns
                     let cols = batch
                         .columns()
@@ -130,50 +133,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(downcast_array)
                         .collect::<Vec<_>>();
                     for row in 0..num_rows {
-                        //let mut row_values = Vec::new();
-                        let mut boxed_vals: Vec<Box<dyn ToSql + Sync>> =
-                            Vec::with_capacity(num_cols);
-                        for col in cols.iter() {
-                            let v: PgValue<'_> = get_value_to_pg_type(col, row);
-                            let val: Box<dyn ToSql + Sync> = match v {
-                                PgValue::Int32(i) => Box::new(i),
-                                PgValue::Int64(i) => Box::new(i),
-                                PgValue::Float32(f) => Box::new(f),
-                                PgValue::Float64(f) => Box::new(f),
-                                PgValue::Decimal128(i, _, scale) => Box::new(i.map(|d| {
-                                    let big_int = BigInt::from_i128(d);
-                                    pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
-                                        BigDecimal::new(
-                                            bi,
-                                            scale.to_i64().expect("Should always be ok"),
-                                        )
-                                    }))
-                                })),
-                                PgValue::Jsonb(s) => {
-                                    Box::new(s.map(|j| serde_json::Value::String(j.to_string())))
-                                }
-                                PgValue::Text(s) => Box::new(s),
-                                PgValue::TimestampNanosecond(ts, true) => {
-                                    Box::new(ts.map(DateTime::<Utc>::from_timestamp_nanos))
-                                }
-                                PgValue::TimestampNanosecond(ts, false) => {
-                                    Box::new(ts.map(NaiveDateTime::from_timestamp_nanos))
-                                }
-                                PgValue::FixedSizeBinaryArray(b, _) => {
-                                    Box::new(b.map(|x| uuid::Uuid::from_slice(x).unwrap()))
-                                }
-                                PgValue::Bool(b) => Box::new(b),
-                            };
-                            boxed_vals.push(val);
-                        }
-                        println!("boxed_vals: {:?}", boxed_vals);
+                        let vals: Vec<PgValue<'_>> = cols
+                            .iter()
+                            .map(|col| get_value_to_pg_type(col, row))
+                            .collect::<Vec<PgValue<'_>>>();
+
+                        println!("vals: {:?}", vals);
+
+                        batch_buffer.push(vals);
+                    }
+
+                    let mut writer_guard = pinned_writer.lock().await;
+                    for row in batch_buffer.iter() {
                         let refs: Vec<&(dyn ToSql + Sync)> =
-                            boxed_vals.iter().map(|x| x.as_ref()).collect();
-                        let wrote = pinned_writer.as_mut().write(&refs).await;
+                            row.iter().map(|val| val as &(dyn ToSql + Sync)).collect();
+                        let wrote = writer_guard.as_mut().write(&refs).await;
                         if wrote.is_err() {
                             println!("Error writing row: {:?}", wrote);
                         }
-                        println!("End of row");
                     }
 
                     Ok(())
@@ -182,8 +159,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    let mut pinned_writer = pinned_writer.lock().await;
-    pinned_writer.as_mut().finish().await.unwrap();
+    let mut writer_guard = pinned_writer.lock().await;
+    writer_guard.as_mut().finish().await.unwrap();
     sink_tx.commit().await.unwrap();
 
     Ok(())
@@ -201,6 +178,52 @@ enum PgValue<'a> {
     Text(Option<&'a str>),
     TimestampNanosecond(Option<i64>, bool),
     FixedSizeBinaryArray(Option<&'a [u8]>, i32),
+}
+
+impl<'a> ToSql for PgValue<'a> {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>>
+    where
+        Self: Sized,
+    {
+        match self {
+            PgValue::Int32(i) => i.to_sql(ty, out),
+            PgValue::Int64(i) => i.to_sql(ty, out),
+            PgValue::Float32(f) => f.to_sql(ty, out),
+            PgValue::Float64(f) => f.to_sql(ty, out),
+            PgValue::Decimal128(i, _, scale) => i
+                .map(|d| {
+                    let big_int = BigInt::from_i128(d);
+                    pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
+                        BigDecimal::new(bi, scale.to_i64().expect("Should always be ok"))
+                    }))
+                })
+                .to_sql(ty, out),
+            PgValue::Jsonb(s) => s
+                .map(|j| serde_json::Value::String(j.to_string()))
+                .to_sql(ty, out),
+            PgValue::Text(s) => s.to_sql(ty, out),
+            PgValue::TimestampNanosecond(ts, true) => ts
+                .map(DateTime::<Utc>::from_timestamp_nanos)
+                .to_sql(ty, out),
+            PgValue::TimestampNanosecond(ts, false) => {
+                ts.map(NaiveDateTime::from_timestamp_nanos).to_sql(ty, out)
+            }
+            PgValue::FixedSizeBinaryArray(b, _) => b
+                .map(|x| uuid::Uuid::from_slice(x).unwrap())
+                .to_sql(ty, out),
+            PgValue::Bool(b) => b.to_sql(ty, out),
+        }
+    }
+
+    to_sql_checked!();
+
+    fn accepts(ty: &Type) -> bool {
+        true
+    }
 }
 
 #[derive(Debug)]
