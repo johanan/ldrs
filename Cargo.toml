@@ -9,6 +9,7 @@ arrow-array = "54.0.0"
 arrow-schema = "54.0.0"
 bigdecimal = "0.4.7"
 chrono = "0.4.39"
+clap = { version = "4.5.27", features = ["derive"] }
 futures = "0.3.31"
 parquet = { version = "54.0.0", features = ["async", "arrow"] }
 pg_bigdecimal = "0.1.5"

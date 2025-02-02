@@ -24,16 +24,37 @@ use tokio::sync::Mutex;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::NoTls;
 
+use clap::{arg, Args, Command, Parser, Subcommand};
+
+#[derive(Subcommand)]
+enum Commands {
+    Load(LoadArgs),
+}
+
+#[derive(Args)]
+struct LoadArgs {
+    #[arg(short, long)]
+    path: String,
+    #[arg(short, long, default_value_t = 250_000)]
+    batch_size: usize,
+}
+
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <file_path>", args[0]);
-        std::process::exit(1);
-    }
+    let cli = Cli::parse();
 
-    let path = &args[1];
-    let file = File::open(path).unwrap();
+    let a: &LoadArgs = match &cli.command {
+        Commands::Load(args) => args,
+        _ => std::process::exit(1),
+    };
+
+    let file = File::open(a.path.clone()).unwrap();
 
     let metadata = ParquetMetaDataReader::new()
         .with_page_indexes(false)
@@ -113,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let a_file = tokio::fs::File::from_std(file);
     let builder = ParquetRecordBatchStreamBuilder::new(a_file).await?;
-    let stream = builder.with_batch_size(1024).build()?;
+    let stream = builder.with_batch_size(a.batch_size).build()?;
     stream
         .try_for_each_concurrent(4, {
             |batch: RecordBatch| {
@@ -138,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .map(|col| get_value_to_pg_type(col, row))
                             .collect::<Vec<PgValue<'_>>>();
 
-                        println!("vals: {:?}", vals);
+                        // println!("vals: {:?}", vals);
 
                         batch_buffer.push(vals);
                     }
@@ -147,10 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for row in batch_buffer.iter() {
                         let refs: Vec<&(dyn ToSql + Sync)> =
                             row.iter().map(|val| val as &(dyn ToSql + Sync)).collect();
-                        let wrote = writer_guard.as_mut().write(&refs).await;
-                        if wrote.is_err() {
-                            println!("Error writing row: {:?}", wrote);
-                        }
+                        //let wrote = writer_guard.as_mut().write(&refs).await;
+                        //if wrote.is_err() {
+                        //    println!("Error writing row: {:?}", wrote);
+                        //}
                     }
 
                     Ok(())
@@ -243,8 +264,6 @@ enum ArrowArrayRef<'a> {
 }
 
 fn downcast_array<'a>((array, pg_type): (&'a ArrayRef, &Type)) -> ArrowArrayRef<'a> {
-    println!("array: {:?}", array);
-    println!("pg_type: {:?}", pg_type);
     match array.data_type() {
         DataType::Int32 => ArrowArrayRef::Int32(array.as_primitive()),
         DataType::Int64 => ArrowArrayRef::Int64(array.as_primitive()),
