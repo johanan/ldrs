@@ -1,3 +1,5 @@
+mod pq;
+
 use arrow::datatypes::ArrowNativeType;
 use arrow_array::cast::AsArray;
 use arrow_array::{
@@ -8,23 +10,20 @@ use arrow_array::{
 use arrow_schema::{DataType, TimeUnit};
 use bigdecimal::FromPrimitive;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use clap::{arg, Args, Command, Parser, Subcommand};
 use futures::TryStreamExt;
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::basic::LogicalType;
-use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use pg_bigdecimal::{BigDecimal, BigInt};
 use postgres_types::to_sql_checked;
 use postgres_types::{ToSql, Type};
-use std::env;
-use std::fs::File;
+use pq::get_file_metadata;
 use std::pin::pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::NoTls;
-
-use clap::{arg, Args, Command, Parser, Subcommand};
+use tracing::{debug, info};
 
 #[derive(Subcommand)]
 enum Commands {
@@ -35,7 +34,7 @@ enum Commands {
 struct LoadArgs {
     #[arg(short, long)]
     path: String,
-    #[arg(short, long, default_value_t = 250_000)]
+    #[arg(short, long, default_value_t = 1024)]
     batch_size: usize,
 }
 
@@ -47,28 +46,20 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
     let a: &LoadArgs = match &cli.command {
         Commands::Load(args) => args,
-        _ => std::process::exit(1),
     };
 
-    let file = File::open(a.path.clone()).unwrap();
+    let builder = get_file_metadata(a.path.clone()).await.unwrap();
 
-    let metadata = ParquetMetaDataReader::new()
-        .with_page_indexes(false)
-        .parse_and_finish(&file)
-        .unwrap();
-
-    let file_md = metadata.file_metadata();
-    println!("num rows: {:?}", file_md.num_rows());
-    println!("{:?}", file_md.version());
-    let schema_name = file_md.schema().name();
-    println!("schema_name: {:?}", schema_name);
+    let file_md = builder.metadata().file_metadata();
+    info!("num rows: {:?}", file_md.num_rows());
 
     let root = file_md.schema();
-    print!("{:?}", root);
+    debug!("{:?}", root);
 
     let f = match root {
         GroupType {
@@ -77,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => Ok(fields),
         _ => Err("Root is not a group type"),
     };
-    println!("{:?}", f);
+    debug!("{:?}", f);
 
     let fields = f.unwrap();
     let mapped = fields
@@ -92,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join(", ");
     ddl.push_str(&fields_ddl);
     ddl.push_str(");");
-    println!("PG ddl: {:?}", ddl);
+    debug!("PG ddl: {:?}", ddl);
 
     let pg_url = "postgres://postgres:postgres@localhost:5432/postgres";
 
@@ -104,11 +95,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let stmt = client.prepare("SELECT $1::TEXT").await?;
-    let rows = client.query(&stmt, &[&"hello world"]).await?;
-    let value: &str = rows[0].get(0);
-    println!("value: {}", value);
-
     let tx = client.transaction().await?;
 
     let _drop = tx
@@ -117,8 +103,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let create = tx.execute(&ddl, &[]).await?;
     tx.commit().await?;
-
-    println!("create: {:?}", create);
 
     let pg_types = mapped.into_iter().map(|t| t.1).collect::<Vec<Type>>();
 
@@ -132,19 +116,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pinned_writer = pin!(writer);
     let pinned_writer = Arc::new(Mutex::new(pinned_writer));
 
-    let a_file = tokio::fs::File::from_std(file);
-    let builder = ParquetRecordBatchStreamBuilder::new(a_file).await?;
+    let start = std::time::Instant::now();
+
     let stream = builder.with_batch_size(a.batch_size).build()?;
     stream
         .try_for_each_concurrent(4, {
             |batch: RecordBatch| {
                 let pinned_writer = Arc::clone(&pinned_writer);
                 let pg_types_clone = pg_types.clone();
-                println!("pg_types_clone: {:?}", pg_types_clone);
+                debug!("pg_types_clone: {:?}", pg_types_clone);
                 async move {
                     let num_rows = batch.num_rows();
                     let num_cols = batch.num_columns();
-                    println!("num_rows: {:?}, num_cols: {:?}", num_rows, num_cols);
+                    info!("num_rows: {:?}, num_cols: {:?}", num_rows, num_cols);
                     let mut batch_buffer = Vec::<Vec<PgValue<'_>>>::with_capacity(num_rows);
                     // iterate over the rows and then the columns
                     let cols = batch
@@ -183,6 +167,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut writer_guard = pinned_writer.lock().await;
     writer_guard.as_mut().finish().await.unwrap();
     sink_tx.commit().await.unwrap();
+
+    let end = std::time::Instant::now();
+    info!("Time to load: {:?}", end - start);
 
     Ok(())
 }

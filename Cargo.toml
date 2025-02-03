@@ -4,17 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-arrow = { version = "54.0.0", features = ["test_utils","prettyprint"] }
-arrow-array = "54.0.0"
-arrow-schema = "54.0.0"
+anyhow = "1.0.95"
+arrow = { version = "54.1.0", features = ["test_utils","prettyprint"] }
+arrow-array = "54.1.0"
+arrow-schema = "54.1.0"
 bigdecimal = "0.4.7"
 chrono = "0.4.39"
 clap = { version = "4.5.27", features = ["derive"] }
 futures = "0.3.31"
-parquet = { version = "54.0.0", features = ["async", "arrow"] }
+object_store = "0.11.2"
+parquet = { version = "54.1.0", features = ["async", "arrow", "object_store"] }
 pg_bigdecimal = "0.1.5"
 postgres-types = "0.2.8"
 serde_json = "1.0.137"
 tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "macros","fs"] }
 tokio-postgres = { version = "0.7.12", features = ["with-chrono-0_4","with-uuid-1", "with-serde_json-1"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+url = "2.5.4"
 uuid = "1.12.1"
