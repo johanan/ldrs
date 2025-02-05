@@ -89,9 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // get url from env var
     let pg_url = std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set")?;
-    let parsed_url = Url::parse(&pg_url).with_context(|| "Could not parse PG URL")?;
-    // check if we need tls
-    let tls = parsed_url.query_pairs().find(|(k, _)| k == "sslmode");
 
     let connector = TlsConnector::new().unwrap();
     let connector = MakeTlsConnector::new(connector);
