@@ -2,6 +2,15 @@
 name = "ldrs"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/johanan/ldrs"
+authors = ["Joshua Johanan"]
+description = "A simple and fast data loader"
+
+[package.metadata.wix]
+upgrade-guid = "8C9C4D06-8A69-41CD-97A4-2C623BEE72A3"
+path-guid = "004BAE91-11D1-4A69-B9EF-CA72B0773731"
+license = false
+eula = false
 
 [dependencies]
 anyhow = "1.0.95"
@@ -34,3 +43,8 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 url = "2.5.4"
 uuid = "1.12.1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
