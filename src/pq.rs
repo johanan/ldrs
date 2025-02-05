@@ -28,17 +28,38 @@ pub async fn get_file_metadata(
     Ok(builder)
 }
 
+pub fn get_fields(
+    metadata: &parquet::file::metadata::FileMetaData,
+) -> anyhow::Result<&Vec<Arc<parquet::schema::types::Type>>, anyhow::Error> {
+    let root = metadata.schema();
+    match root {
+        parquet::schema::types::Type::GroupType { fields, .. } => Ok(fields),
+        _ => Err(anyhow::Error::msg("Invalid schema")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    // will need to get the parquet testing files from arrow-rs
 
-    /*#[tokio::test]
+    #[tokio::test]
     async fn test_get_file_metadata() {
-        let path = "file:///path/to/file".to_string();
+        let cd = std::env::current_dir().unwrap();
+        let path = format!(
+            "file://{}/test_data/public.users.snappy.parquet",
+            cd.display()
+        );
         let result = get_file_metadata(path).await;
         assert!(result.is_ok());
-    }*/
+        let result = result.unwrap();
+        let metadata = result.metadata().file_metadata();
+        println!("metadata: {:?}", metadata);
+        assert_eq!(metadata.num_rows(), 2);
+
+        // now get the fields
+        let fields = get_fields(metadata).unwrap();
+        assert_eq!(fields.len(), 6);
+    }
 
     #[tokio::test]
     async fn test_get_file_metadata_invalid_url() {
