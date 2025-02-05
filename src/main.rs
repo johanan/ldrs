@@ -1,3 +1,6 @@
+mod pq;
+
+use anyhow::Context;
 use arrow::datatypes::ArrowNativeType;
 use arrow_array::cast::AsArray;
 use arrow_array::{
@@ -7,63 +10,74 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, TimeUnit};
 use bigdecimal::FromPrimitive;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{format, DateTime, NaiveDateTime, Utc};
+use clap::{arg, Args, Command, Parser, Subcommand};
 use futures::TryStreamExt;
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use native_tls::{Certificate, TlsConnector};
 use parquet::basic::LogicalType;
-use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use pg_bigdecimal::{BigDecimal, BigInt};
+use postgres_native_tls::MakeTlsConnector;
 use postgres_types::to_sql_checked;
 use postgres_types::{ToSql, Type};
-use std::env;
-use std::fs::File;
+use pq::{get_fields, get_file_metadata};
 use std::pin::pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::NoTls;
+use tracing::{debug, info};
+use url::Url;
+
+#[derive(Subcommand)]
+enum Commands {
+    Load(LoadArgs),
+}
+
+#[derive(Args)]
+struct LoadArgs {
+    #[arg(short, long)]
+    file: String,
+    #[arg(short, long, default_value_t = 1024)]
+    batch_size: usize,
+    #[arg(short, long)]
+    table: String,
+    #[arg(short, long)]
+    post_sql: Option<String>,
+}
+
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <file_path>", args[0]);
-        std::process::exit(1);
-    }
+    tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
 
-    let path = &args[1];
-    let file = File::open(path).unwrap();
-
-    let metadata = ParquetMetaDataReader::new()
-        .with_page_indexes(false)
-        .parse_and_finish(&file)
-        .unwrap();
-
-    let file_md = metadata.file_metadata();
-    println!("num rows: {:?}", file_md.num_rows());
-    println!("{:?}", file_md.version());
-    let schema_name = file_md.schema().name();
-    println!("schema_name: {:?}", schema_name);
-
-    let root = file_md.schema();
-    print!("{:?}", root);
-
-    let f = match root {
-        GroupType {
-            basic_info: _,
-            fields,
-        } => Ok(fields),
-        _ => Err("Root is not a group type"),
+    let a: &LoadArgs = match &cli.command {
+        Commands::Load(args) => args,
     };
-    println!("{:?}", f);
 
-    let fields = f.unwrap();
+    let builder = get_file_metadata(a.file.clone()).await.unwrap();
+
+    let file_md = builder.metadata().file_metadata();
+    info!("num rows: {:?}", file_md.num_rows());
+
+    let fields = get_fields(file_md).unwrap();
     let mapped = fields
         .iter()
         .filter_map(map_parquet_to_ddl)
         .collect::<Vec<(String, Type)>>();
-    let mut ddl = String::from("CREATE TABLE if not exists public.test_load (");
+
+    let (schema, table) = a.table.split_once('.').unwrap();
+    let load_table = format!("{}.{}_load", schema, table);
+    let schema_ddl = format!("CREATE SCHEMA if not exists {};", schema);
+    debug!("loading to table: {:?}", load_table);
+
+    let mut ddl = format!("CREATE TABLE if not exists {} (", load_table);
     let fields_ddl = mapped
         .iter()
         .map(|t| t.0.clone())
@@ -71,11 +85,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join(", ");
     ddl.push_str(&fields_ddl);
     ddl.push_str(");");
-    println!("PG ddl: {:?}", ddl);
+    debug!("PG ddl: {:?}", ddl);
 
-    let pg_url = "postgres://postgres:postgres@localhost:5432/postgres";
+    // get url from env var
+    let pg_url = std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set")?;
+    let parsed_url = Url::parse(&pg_url).with_context(|| "Could not parse PG URL")?;
+    // check if we need tls
+    let tls = parsed_url.query_pairs().find(|(k, _)| k == "sslmode");
 
-    let (mut client, connection) = tokio_postgres::connect(pg_url, NoTls).await?;
+    let connector = TlsConnector::new().unwrap();
+    let connector = MakeTlsConnector::new(connector);
+    let (mut client, connection) = tokio_postgres::connect(&*pg_url, connector).await?;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -83,47 +103,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let stmt = client.prepare("SELECT $1::TEXT").await?;
-    let rows = client.query(&stmt, &[&"hello world"]).await?;
-    let value: &str = rows[0].get(0);
-    println!("value: {}", value);
-
     let tx = client.transaction().await?;
+    let _create_schema = tx.execute(&schema_ddl, &[]).await?;
+    let drop_ddl = format!("drop table if exists {};", load_table);
+    let _drop = tx.execute(&*drop_ddl, &[]).await?;
 
-    let _drop = tx
-        .execute("drop table if exists public.test_load;", &[])
-        .await?;
-
-    let create = tx.execute(&ddl, &[]).await?;
+    let _create = tx.execute(&ddl, &[]).await?;
     tx.commit().await?;
-
-    println!("create: {:?}", create);
 
     let pg_types = mapped.into_iter().map(|t| t.1).collect::<Vec<Type>>();
 
     let sink_tx = client.transaction().await?;
 
-    let sink = sink_tx
-        .copy_in("COPY public.test_load FROM STDIN BINARY")
-        .await
-        .unwrap();
+    let copy_ddl = format!("COPY {} FROM STDIN BINARY", load_table);
+    let sink = sink_tx.copy_in(&*copy_ddl).await.unwrap();
     let writer = BinaryCopyInWriter::new(sink, &pg_types);
     let pinned_writer = pin!(writer);
     let pinned_writer = Arc::new(Mutex::new(pinned_writer));
 
-    let a_file = tokio::fs::File::from_std(file);
-    let builder = ParquetRecordBatchStreamBuilder::new(a_file).await?;
-    let stream = builder.with_batch_size(1024).build()?;
+    let start = std::time::Instant::now();
+
+    let stream = builder.with_batch_size(a.batch_size).build()?;
     stream
         .try_for_each_concurrent(4, {
             |batch: RecordBatch| {
                 let pinned_writer = Arc::clone(&pinned_writer);
                 let pg_types_clone = pg_types.clone();
-                println!("pg_types_clone: {:?}", pg_types_clone);
+                debug!("pg_types_clone: {:?}", pg_types_clone);
                 async move {
                     let num_rows = batch.num_rows();
                     let num_cols = batch.num_columns();
-                    println!("num_rows: {:?}, num_cols: {:?}", num_rows, num_cols);
+                    info!("num_rows: {:?}, num_cols: {:?}", num_rows, num_cols);
                     let mut batch_buffer = Vec::<Vec<PgValue<'_>>>::with_capacity(num_rows);
                     // iterate over the rows and then the columns
                     let cols = batch
@@ -138,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .map(|col| get_value_to_pg_type(col, row))
                             .collect::<Vec<PgValue<'_>>>();
 
-                        println!("vals: {:?}", vals);
+                        // println!("vals: {:?}", vals);
 
                         batch_buffer.push(vals);
                     }
@@ -161,7 +171,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut writer_guard = pinned_writer.lock().await;
     writer_guard.as_mut().finish().await.unwrap();
+
+    // replace the previous table
+    let replace_ddl = vec![
+        format!("DROP TABLE IF EXISTS {};", a.table),
+        format!("SET search_path TO {};", schema),
+        format!("ALTER TABLE {} rename to {};", load_table, table),
+    ];
+
+    for ddl in replace_ddl {
+        let _ = sink_tx.execute(&ddl, &[]).await?;
+    }
+
+    match a.post_sql.as_ref() {
+        Some(sql) => {
+            let _ = sink_tx.execute(sql, &[]).await?;
+        }
+        None => {}
+    }
     sink_tx.commit().await.unwrap();
+
+    let end = std::time::Instant::now();
+    info!("Time to load: {:?}", end - start);
 
     Ok(())
 }
@@ -238,13 +269,9 @@ enum ArrowArrayRef<'a> {
     Boolean(&'a BooleanArray),
     TimestampNanosecond(&'a TimestampNanosecondArray, bool),
     FixedSizeBinaryArray(&'a FixedSizeBinaryArray, i32),
-    //TimestampMillisecond(&'a TimestampMillisecondArray),
-    //TimestampSecond(&'a TimestampSecondArray),
 }
 
 fn downcast_array<'a>((array, pg_type): (&'a ArrayRef, &Type)) -> ArrowArrayRef<'a> {
-    println!("array: {:?}", array);
-    println!("pg_type: {:?}", pg_type);
     match array.data_type() {
         DataType::Int32 => ArrowArrayRef::Int32(array.as_primitive()),
         DataType::Int64 => ArrowArrayRef::Int64(array.as_primitive()),
