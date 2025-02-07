@@ -1,10 +1,19 @@
 use anyhow::Context;
 use object_store::{parse_url, ObjectStore};
+use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
-use parquet::arrow::{arrow_reader::ArrowReaderBuilder, async_reader::ParquetObjectReader};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::info;
 use url::Url;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ColumnDefintion {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub len: i32,
+}
 
 pub async fn get_file_metadata(
     path_url: String,
@@ -35,6 +44,23 @@ pub fn get_fields(
     match root {
         parquet::schema::types::Type::GroupType { fields, .. } => Ok(fields),
         _ => Err(anyhow::Error::msg("Invalid schema")),
+    }
+}
+
+pub fn get_kv_fields(metadata: &parquet::file::metadata::FileMetaData) -> Vec<ColumnDefintion> {
+    match metadata.key_value_metadata() {
+        Some(kv) => {
+            let cols = kv
+                .iter()
+                .find(|k| k.key == "cols")
+                .and_then(|k| k.value.clone());
+            let try_cols = cols.map(|cols| serde_json::from_str(&cols)).transpose();
+            match try_cols {
+                Ok(Some(cols)) => cols,
+                _ => Vec::new(),
+            }
+        }
+        None => Vec::new(),
     }
 }
 

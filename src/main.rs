@@ -10,24 +10,22 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, TimeUnit};
 use bigdecimal::FromPrimitive;
-use chrono::{format, DateTime, NaiveDateTime, Utc};
-use clap::{arg, Args, Command, Parser, Subcommand};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use clap::{arg, Args, Parser, Subcommand};
 use futures::TryStreamExt;
-use native_tls::{Certificate, TlsConnector};
+use native_tls::TlsConnector;
 use parquet::basic::LogicalType;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use pg_bigdecimal::{BigDecimal, BigInt};
 use postgres_native_tls::MakeTlsConnector;
 use postgres_types::to_sql_checked;
 use postgres_types::{ToSql, Type};
-use pq::{get_fields, get_file_metadata};
+use pq::{get_fields, get_file_metadata, ColumnDefintion};
 use std::pin::pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
-use tokio_postgres::NoTls;
 use tracing::{debug, info};
-use url::Url;
 
 #[derive(Subcommand)]
 enum Commands {
@@ -64,12 +62,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let builder = get_file_metadata(a.file.clone()).await.unwrap();
 
     let file_md = builder.metadata().file_metadata();
+    let kv = pq::get_kv_fields(&file_md);
+    info!("kv: {:?}", kv);
     info!("num rows: {:?}", file_md.num_rows());
 
     let fields = get_fields(file_md).unwrap();
     let mapped = fields
         .iter()
-        .filter_map(map_parquet_to_ddl)
+        .filter_map(|pq| map_parquet_to_ddl(pq, &kv))
         .collect::<Vec<(String, Type)>>();
 
     let (schema, table) = a.table.split_once('.').unwrap();
@@ -380,6 +380,7 @@ fn get_value_to_pg_type<'a>(arrow_array: &ArrowArrayRef<'a>, index: usize) -> Pg
 
 fn map_parquet_to_ddl(
     pq: &Arc<parquet::schema::types::Type>,
+    user_defs: &Vec<ColumnDefintion>,
 ) -> Option<(String, postgres_types::Type)> {
     match pq.as_ref() {
         GroupType { .. } => None,
@@ -389,7 +390,20 @@ fn map_parquet_to_ddl(
                 bi if bi.logical_type().is_some() => {
                     // we have a logical type, use that
                     match bi.logical_type().unwrap() {
-                        LogicalType::String => (String::from("TEXT"), postgres_types::Type::TEXT),
+                        LogicalType::String => user_defs
+                            .iter()
+                            .find(|cd| cd.name == name)
+                            .and_then(|cd| {
+                                if cd.ty == "VARCHAR" {
+                                    Some((
+                                        format!("VARCHAR ({})", cd.len),
+                                        postgres_types::Type::VARCHAR,
+                                    ))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or((String::from("TEXT"), postgres_types::Type::TEXT)),
                         LogicalType::Timestamp {
                             is_adjusted_to_u_t_c,
                             ..
