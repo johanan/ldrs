@@ -1,3 +1,4 @@
+mod postgres;
 mod pq;
 
 use anyhow::Context;
@@ -13,19 +14,17 @@ use bigdecimal::FromPrimitive;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{arg, Args, Parser, Subcommand};
 use futures::TryStreamExt;
-use native_tls::TlsConnector;
-use parquet::basic::LogicalType;
-use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use pg_bigdecimal::{BigDecimal, BigInt};
-use postgres_native_tls::MakeTlsConnector;
 use postgres_types::to_sql_checked;
 use postgres_types::{ToSql, Type};
-use pq::{get_fields, get_file_metadata, ColumnDefintion};
+use pq::{get_fields, get_file_metadata};
+use serde_json::Value;
 use std::pin::pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tracing::{debug, info};
+use postgres::{build_fqtn, map_parquet_to_ddl};
 
 #[derive(Subcommand)]
 enum Commands {
@@ -72,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|pq| map_parquet_to_ddl(pq, &kv))
         .collect::<Vec<(String, Type)>>();
 
-    let (schema, table) = a.table.split_once('.').unwrap();
+    let (schema, table) = build_fqtn(&a.table)?;
     let load_table = format!("{}.{}_load", schema, table);
     let schema_ddl = format!("CREATE SCHEMA if not exists {};", schema);
     debug!("loading to table: {:?}", load_table);
@@ -90,16 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // get url from env var
     let pg_url = std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set")?;
 
-    let connector = TlsConnector::new().unwrap();
-    let connector = MakeTlsConnector::new(connector);
-    let (mut client, connection) = tokio_postgres::connect(&*pg_url, connector).await?;
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
-        }
-    });
-
+    let mut client = postgres::create_connection(&pg_url).await?;
     let tx = client.transaction().await?;
     let _create_schema = tx.execute(&schema_ddl, &[]).await?;
     let drop_ddl = format!("drop table if exists {};", load_table);
@@ -130,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 async move {
                     let num_rows = batch.num_rows();
                     let num_cols = batch.num_columns();
-                    info!("num_rows: {:?}, num_cols: {:?}", num_rows, num_cols);
+                    debug!("num_rows: {:?}, num_cols: {:?}", num_rows, num_cols);
                     let mut batch_buffer = Vec::<Vec<PgValue<'_>>>::with_capacity(num_rows);
                     // iterate over the rows and then the columns
                     let cols = batch
@@ -182,7 +172,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match a.post_sql.as_ref() {
         Some(sql) => {
-            let _ = sink_tx.execute(sql, &[]).await?;
+            let multiple_sql = sql.split(";").into_iter().map(|s| str::trim(s)).filter(|s| !s.is_empty());
+            for sql in multiple_sql {
+                info!("Executing post sql: {:?}", sql);
+                let _ = sink_tx.execute(sql, &[]).await?;
+            }
         }
         None => {}
     }
@@ -231,7 +225,8 @@ impl<'a> ToSql for PgValue<'a> {
                 })
                 .to_sql(ty, out),
             PgValue::Jsonb(s) => s
-                .map(|j| serde_json::Value::String(j.to_string()))
+                .map(|j| serde_json::from_str::<Value>(j).expect("Failed to parse json"))
+                .map(|o| tokio_postgres::types::Json(o))
                 .to_sql(ty, out),
             PgValue::Text(s) => s.to_sql(ty, out),
             PgValue::TimestampNanosecond(ts, true) => ts
@@ -374,78 +369,6 @@ fn get_value_to_pg_type<'a>(arrow_array: &ArrowArrayRef<'a>, index: usize) -> Pg
                 Some(bool_array.value(index))
             };
             PgValue::Bool(v)
-        }
-    }
-}
-
-fn map_parquet_to_ddl(
-    pq: &Arc<parquet::schema::types::Type>,
-    user_defs: &Vec<ColumnDefintion>,
-) -> Option<(String, postgres_types::Type)> {
-    match pq.as_ref() {
-        GroupType { .. } => None,
-        PrimitiveType { basic_info, .. } => {
-            let name = pq.name();
-            let pg_type = match basic_info {
-                bi if bi.logical_type().is_some() => {
-                    // we have a logical type, use that
-                    match bi.logical_type().unwrap() {
-                        LogicalType::String => user_defs
-                            .iter()
-                            .find(|cd| cd.name == name)
-                            .and_then(|cd| {
-                                if cd.ty == "VARCHAR" {
-                                    Some((
-                                        format!("VARCHAR ({})", cd.len),
-                                        postgres_types::Type::VARCHAR,
-                                    ))
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or((String::from("TEXT"), postgres_types::Type::TEXT)),
-                        LogicalType::Timestamp {
-                            is_adjusted_to_u_t_c,
-                            ..
-                        } => {
-                            if is_adjusted_to_u_t_c {
-                                (
-                                    String::from("TIMESTAMPTZ"),
-                                    postgres_types::Type::TIMESTAMPTZ,
-                                )
-                            } else {
-                                (String::from("TIMESTAMP"), postgres_types::Type::TIMESTAMP)
-                            }
-                        }
-                        LogicalType::Uuid => (String::from("UUID"), postgres_types::Type::UUID),
-                        LogicalType::Json => (String::from("JSONB"), postgres_types::Type::JSONB),
-                        LogicalType::Decimal { scale, precision } => (
-                            format!("NUMERIC({},{})", precision, scale),
-                            postgres_types::Type::NUMERIC,
-                        ),
-                        _ => (String::from("TEXT"), postgres_types::Type::TEXT),
-                    }
-                }
-                _ => match pq.get_physical_type() {
-                    parquet::basic::Type::FLOAT => {
-                        (String::from("FLOAT4"), postgres_types::Type::FLOAT4)
-                    }
-                    parquet::basic::Type::DOUBLE => {
-                        (String::from("FLOAT8"), postgres_types::Type::FLOAT8)
-                    }
-                    parquet::basic::Type::INT32 => {
-                        (String::from("INT4"), postgres_types::Type::INT4)
-                    }
-                    parquet::basic::Type::INT64 => {
-                        (String::from("INT8"), postgres_types::Type::INT8)
-                    }
-                    parquet::basic::Type::BOOLEAN => {
-                        (String::from("BOOL"), postgres_types::Type::BOOL)
-                    }
-                    _ => (String::from("TEXT"), postgres_types::Type::TEXT),
-                },
-            };
-            Some((format!("{} {}", name, pg_type.0), pg_type.1))
         }
     }
 }
