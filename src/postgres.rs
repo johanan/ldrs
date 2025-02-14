@@ -123,7 +123,7 @@ pub fn build_definition<'a>(
     let drop_ddl = format!("DROP TABLE IF EXISTS {};", load_table);
     let fields_ddl: Vec<String> = types.iter().map(map_parquet_to_ddl).collect();
     let create_ddl = build_ddl(load_table.clone(), &fields_ddl);
-    let drop_target_ddl = format!("DROP TABLE IF EXISTS {};", table);
+    let drop_target_ddl = format!("DROP TABLE IF EXISTS {}.{};", schema, table);
     let set_search_ddl = format!("SET search_path TO {};", schema);
     let rename_ddl = format!("ALTER TABLE {} rename to {};", load_table, table);
     let binary_ddl = format!("COPY {} FROM STDIN BINARY;", load_table);
@@ -228,10 +228,10 @@ pub async fn execute_binary_copy<'a>(
     let mut writer_guard = pinned_writer.lock().await;
     writer_guard.as_mut().finish().await.unwrap();
 
-    let _move = sink_tx.batch_execute(&rename_ddl).await?;
+    sink_tx.batch_execute(&rename_ddl).await?;
     match &definition.post_sql {
         Some(sql) => {
-            sink_tx.batch_execute(&*sql).await?;
+            sink_tx.batch_execute(sql).await?;
         }
         None => {}
     }
@@ -385,5 +385,99 @@ fn get_value_to_pg_type<'a>(arrow_array: &ArrowArrayRef<'a>, index: usize) -> Pg
             };
             PgValue::Bool(v)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::pq::{self, get_fields, get_file_metadata, map_parquet_to_abstract};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_definition_build() {
+        let full_table = "public.users";
+        let pq_types = [
+            ParquetType::BigInt("id"),
+            ParquetType::Text("name"),
+            ParquetType::Timestamp("created_at"),
+        ];
+
+        let first_def = build_definition(full_table, &pq_types, None);
+        assert_eq!(first_def.schema, "public");
+        assert_eq!(first_def.schema_ddl, "CREATE SCHEMA IF NOT EXISTS public;");
+        assert_eq!(
+            first_def.drop_ddl,
+            "DROP TABLE IF EXISTS public.users_load;"
+        );
+        assert_eq!(first_def.create_ddl, "CREATE TABLE if not exists public.users_load (id bigint, name text, created_at timestamp);");
+        assert_eq!(
+            first_def.drop_target_ddl,
+            "DROP TABLE IF EXISTS public.users;"
+        );
+        assert_eq!(first_def.set_search_ddl, "SET search_path TO public;");
+        assert_eq!(
+            first_def.rename_ddl,
+            "ALTER TABLE public.users_load rename to users;"
+        );
+        assert_eq!(
+            first_def.binary_ddl,
+            "COPY public.users_load FROM STDIN BINARY;"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_round_trip() {
+        let cd = std::env::current_dir().unwrap();
+        let path = format!(
+            "file://{}/test_data/public.users.snappy.parquet",
+            cd.display()
+        );
+        let builder = get_file_metadata(path.clone()).await.unwrap();
+        let file_md = builder.metadata().file_metadata().clone();
+        let kv = pq::get_kv_fields(&file_md);
+
+        let fields = get_fields(&file_md).unwrap();
+        let mapped = fields
+            .iter()
+            .filter_map(|pq| map_parquet_to_abstract(pq, &kv))
+            .collect::<Vec<ParquetType>>();
+
+        let definition = build_definition("not_public.users_test", &mapped, None);
+        let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+
+        let mut client = create_connection(pg_url).await.unwrap();
+        prepare_to_copy(&mut client, &definition).await.unwrap();
+
+        let stream = builder.with_batch_size(1024).build().unwrap();
+        execute_binary_copy(&mut client, &definition, &mapped, stream)
+            .await
+            .unwrap();
+
+        // run it again to ensure the process can load a table that exists
+        let post_sql = "CREATE INDEX ON not_public.users_test (unique_id); CREATE UNIQUE INDEX ON not_public.users_test (name);";
+        let definition =
+            build_definition("not_public.users_test", &mapped, Some(post_sql.to_string()));
+        prepare_to_copy(&mut client, &definition).await.unwrap();
+        let builder = get_file_metadata(path).await.unwrap();
+        let stream = builder.with_batch_size(1024).build().unwrap();
+        execute_binary_copy(&mut client, &definition, &mapped, stream)
+            .await
+            .unwrap();
+
+        let row_count = client
+            .query_one("select count(*) from not_public.users_test", &[])
+            .await
+            .unwrap();
+        assert_eq!(row_count.get::<_, i64>(0), 2);
+
+        let check_indexes = client
+            .query_one(
+                "select count(*) from pg_indexes where tablename = 'users_test'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(2, check_indexes.get::<_, i64>(0));
     }
 }
