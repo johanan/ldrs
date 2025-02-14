@@ -29,16 +29,8 @@ struct Cli {
     command: Commands,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
-    let cli = Cli::parse();
-
-    let a: &LoadArgs = match &cli.command {
-        Commands::Load(args) => args,
-    };
-
-    let builder = get_file_metadata(a.file.clone()).await.unwrap();
+async fn load_postgres(args: &LoadArgs, pg_url: String) -> Result<(), anyhow::Error> {
+    let builder = get_file_metadata(args.file.clone()).await?;
     let file_md = builder.metadata().file_metadata().clone();
     let kv = pq::get_kv_fields(&file_md);
     debug!("kv: {:?}", kv);
@@ -50,21 +42,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|pq| map_parquet_to_abstract(pq, &kv))
         .collect::<Vec<ParquetType>>();
 
-    let definition = postgres::build_definition(&a.table, &mapped, a.post_sql.clone());
+    let definition = postgres::build_definition(&args.table, &mapped, args.post_sql.clone())?;
     info!("PG definition: {:?}", definition);
-    // get url from env var
-    let pg_url = std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set")?;
-
-    let start = std::time::Instant::now();
 
     let mut client = postgres::create_connection(&pg_url).await?;
     postgres::prepare_to_copy(&mut client, &definition).await?;
 
-    let stream = builder.with_batch_size(a.batch_size).build()?;
+    let stream = builder.with_batch_size(args.batch_size).build()?;
     postgres::execute_binary_copy(&mut client, &definition, &mapped, stream).await?;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
+
+    let start = std::time::Instant::now();
+
+    let command_exec = match &cli.command {
+        Commands::Load(args) => {
+            match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
+                Ok(pg_url) => load_postgres(args, pg_url).await,
+                Err(e) => Err(e),
+            }
+        }
+    };
 
     let end = std::time::Instant::now();
     info!("Time to load: {:?}", end - start);
-
+    command_exec?;
     Ok(())
 }
