@@ -45,7 +45,7 @@ impl LoadDefintion<'_> {
 }
 
 pub async fn create_connection(conn_url: &str) -> Result<tokio_postgres::Client, anyhow::Error> {
-    let connector = TlsConnector::new().unwrap();
+    let connector = TlsConnector::new().with_context(|| "Could not create TLS connector")?;
     let connector = MakeTlsConnector::new(connector);
     let (client, connection) = tokio_postgres::connect(conn_url, connector).await?;
     tokio::spawn(async move {
@@ -116,8 +116,8 @@ pub fn build_definition<'a>(
     full_table: &'a str,
     types: &[ParquetType<'a>],
     post_sql: Option<String>,
-) -> LoadDefintion<'a> {
-    let (schema, table) = build_fqtn(full_table).unwrap();
+) -> Result<LoadDefintion<'a>, anyhow::Error> {
+    let (schema, table) = build_fqtn(full_table)?;
     let load_table = load_table_name(schema, table);
     let schema_ddl = format!("CREATE SCHEMA IF NOT EXISTS {};", schema);
     let drop_ddl = format!("DROP TABLE IF EXISTS {};", load_table);
@@ -127,7 +127,7 @@ pub fn build_definition<'a>(
     let set_search_ddl = format!("SET search_path TO {};", schema);
     let rename_ddl = format!("ALTER TABLE {} rename to {};", load_table, table);
     let binary_ddl = format!("COPY {} FROM STDIN BINARY;", load_table);
-    LoadDefintion {
+    Ok(LoadDefintion {
         schema,
         table,
         load_table,
@@ -139,7 +139,7 @@ pub fn build_definition<'a>(
         rename_ddl,
         binary_ddl,
         post_sql,
-    }
+    })
 }
 
 pub async fn prepare_to_copy<'a>(
@@ -226,7 +226,11 @@ pub async fn execute_binary_copy<'a>(
         .await?;
 
     let mut writer_guard = pinned_writer.lock().await;
-    writer_guard.as_mut().finish().await.unwrap();
+    writer_guard
+        .as_mut()
+        .finish()
+        .await
+        .with_context(|| "Could not finish copy")?;
 
     sink_tx.batch_execute(&rename_ddl).await?;
     match &definition.post_sql {
@@ -235,7 +239,10 @@ pub async fn execute_binary_copy<'a>(
         }
         None => {}
     }
-    sink_tx.commit().await.unwrap();
+    sink_tx
+        .commit()
+        .await
+        .with_context(|| "Could not commit transaction")?;
 
     Ok(())
 }
@@ -403,7 +410,7 @@ mod tests {
             ParquetType::Timestamp("created_at"),
         ];
 
-        let first_def = build_definition(full_table, &pq_types, None);
+        let first_def = build_definition(full_table, &pq_types, None).unwrap();
         assert_eq!(first_def.schema, "public");
         assert_eq!(first_def.schema_ddl, "CREATE SCHEMA IF NOT EXISTS public;");
         assert_eq!(
@@ -443,7 +450,7 @@ mod tests {
             .filter_map(|pq| map_parquet_to_abstract(pq, &kv))
             .collect::<Vec<ParquetType>>();
 
-        let definition = build_definition("not_public.users_test", &mapped, None);
+        let definition = build_definition("not_public.users_test", &mapped, None).unwrap();
         let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
 
         let mut client = create_connection(pg_url).await.unwrap();
@@ -457,7 +464,7 @@ mod tests {
         // run it again to ensure the process can load a table that exists
         let post_sql = "CREATE INDEX ON not_public.users_test (unique_id); CREATE UNIQUE INDEX ON not_public.users_test (name);";
         let definition =
-            build_definition("not_public.users_test", &mapped, Some(post_sql.to_string()));
+            build_definition("not_public.users_test", &mapped, Some(post_sql.to_string())).unwrap();
         prepare_to_copy(&mut client, &definition).await.unwrap();
         let builder = get_file_metadata(path).await.unwrap();
         let stream = builder.with_batch_size(1024).build().unwrap();
