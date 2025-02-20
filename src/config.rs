@@ -6,7 +6,7 @@ fn default_batch_size() -> usize {
     1024
 }
 
-#[derive(Args, Deserialize)]
+#[derive(Args, Deserialize, Debug)]
 pub struct LoadArgs {
     #[arg(short, long)]
     pub file: String,
@@ -22,7 +22,8 @@ pub struct LoadArgs {
 #[derive(Args)]
 pub struct PGFileLoadArgs {
     #[arg(short, long)]
-    pub file_path: String,
+    pub file_path: Option<String>,
+    pub config_path: String,
 }
 
 #[derive(Deserialize)]
@@ -32,22 +33,30 @@ pub struct PGFileLoad {
     pub tables: Vec<LoadArgs>,
 }
 
-impl PGFileLoad {
-    pub fn parse_args(self) -> Result<Vec<LoadArgs>, anyhow::Error> {
-        self.tables
+#[derive(Debug)]
+pub struct ProcessedPGFileLoad {
+    pub tables: Vec<LoadArgs>,
+}
+
+impl TryFrom<PGFileLoad> for ProcessedPGFileLoad {
+    type Error = anyhow::Error;
+
+    fn try_from(pg_file_load: PGFileLoad) -> Result<Self, Self::Error> {
+        let tables = pg_file_load
+            .tables
             .into_iter()
             .map(|t| {
                 let file_url = Path::new(&t.file);
-                let full_path = self.file_path.as_ref().map_or_else(
+                let full_path = pg_file_load.file_path.as_ref().map_or_else(
                     || file_url.to_path_buf(),
                     |p| {
                         let root_path = Path::new(p);
                         root_path.join(file_url)
                     },
                 );
-                // check if batch_size is not equal to 1024 and if the outer batch_size is Some
-                let batch_size = if t.batch_size == 1024 && self.batch_size.is_some() {
-                    self.batch_size.unwrap()
+                // check if batch_size is equal to 1024 and if the outer batch_size is Some
+                let batch_size = if t.batch_size == 1024 && pg_file_load.batch_size.is_some() {
+                    pg_file_load.batch_size.unwrap()
                 } else {
                     t.batch_size
                 };
@@ -58,7 +67,20 @@ impl PGFileLoad {
                     post_sql: t.post_sql,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<LoadArgs>, anyhow::Error>>()?;
+        Ok(ProcessedPGFileLoad { tables })
+    }
+}
+
+impl PGFileLoad {
+    /// Merge the cli args into self, returning a new PGFileLoad
+    /// where a set file_path will override the file_path in self
+    pub fn merge_cli_args(self, cli: PGFileLoadArgs) -> PGFileLoad {
+        PGFileLoad {
+            file_path: cli.file_path.or(self.file_path),
+            batch_size: None,
+            tables: self.tables,
+        }
     }
 }
 
@@ -119,12 +141,12 @@ tables:
       post_sql: null
         "#;
         let pg_file_load: PGFileLoad = serde_yaml::from_str(pg_file_load).unwrap();
-        let args = pg_file_load.parse_args().unwrap();
-        assert_eq!(args.len(), 1);
-        assert_eq!(args[0].file, "/home/data/test.parquet");
-        assert_eq!(args[0].batch_size, 1024);
-        assert_eq!(args[0].table, "test_table");
-        assert_eq!(args[0].post_sql, None);
+        let args: ProcessedPGFileLoad = pg_file_load.try_into().unwrap();
+        assert_eq!(args.tables.len(), 1);
+        assert_eq!(args.tables[0].file, "/home/data/test.parquet");
+        assert_eq!(args.tables[0].batch_size, 1024);
+        assert_eq!(args.tables[0].table, "test_table");
+        assert_eq!(args.tables[0].post_sql, None);
     }
 
     #[test]
@@ -158,9 +180,42 @@ tables:
                     post_sql: None,
                 }],
             };
-            let args = pg_file_load.parse_args().unwrap();
-            assert_eq!(args[0].file, *expected_file);
-            assert_eq!(args[0].batch_size, *expected_batch_size);
+            let args : ProcessedPGFileLoad = pg_file_load.try_into().unwrap();
+            assert_eq!(args.tables[0].file, *expected_file);
+            assert_eq!(args.tables[0].batch_size, *expected_batch_size);
         }
+    }
+
+    #[test]
+    fn test_pg_file_load_merge_args() {
+        let pg_file_load_yaml = r#"file_path: /home/data
+batch_size: 1024
+tables:
+    - file: test.parquet
+      table: test_table
+        "#;
+        let pg_file_load: PGFileLoad = serde_yaml::from_str(pg_file_load_yaml).unwrap();
+        let cli_args = PGFileLoadArgs {
+            file_path: Some(String::from("/cli/data")),
+            config_path: String::from("config.yaml"),
+        };
+        let merged = pg_file_load.merge_cli_args(cli_args);
+        let merged_file_path = merged.file_path.clone();
+        let tasks : ProcessedPGFileLoad = merged.try_into().unwrap();
+        assert_eq!(merged_file_path, Some(String::from("/cli/data")));
+        assert_eq!(tasks.tables.len(), 1);
+        assert_eq!(tasks.tables[0].file, "/cli/data/test.parquet");
+
+        let pg_file_load: PGFileLoad = serde_yaml::from_str(pg_file_load_yaml).unwrap();
+        let cli_args = PGFileLoadArgs {
+            file_path: None,
+            config_path: String::from("config.yaml"),
+        };
+        let merged = pg_file_load.merge_cli_args(cli_args);
+        let merged_file_path = merged.file_path.clone();
+        let tasks : ProcessedPGFileLoad = merged.try_into().unwrap();
+        assert_eq!(merged_file_path, Some(String::from("/home/data")));
+        assert_eq!(tasks.tables.len(), 1);
+        assert_eq!(tasks.tables[0].file, "/home/data/test.parquet");
     }
 }
