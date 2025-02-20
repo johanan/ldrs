@@ -15,13 +15,10 @@ use serde_json::Value;
 use std::{pin::pin, sync::Arc};
 use tokio::sync::Mutex;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
-use tracing::debug;
+use tracing::{debug, info};
 
 #[derive(Debug)]
-pub struct LoadDefintion<'a> {
-    pub schema: &'a str,
-    pub table: &'a str,
-    pub load_table: String,
+pub struct LoadDefintion {
     pub schema_ddl: String,
     pub drop_ddl: String,
     pub create_ddl: String,
@@ -31,7 +28,7 @@ pub struct LoadDefintion<'a> {
     pub binary_ddl: String,
     pub post_sql: Option<String>,
 }
-impl LoadDefintion<'_> {
+impl LoadDefintion {
     pub fn create_batch(&self) -> String {
         format!("{} {} {}", self.schema_ddl, self.drop_ddl, self.create_ddl)
     }
@@ -116,7 +113,7 @@ pub fn build_definition<'a>(
     full_table: &'a str,
     types: &[ParquetType<'a>],
     post_sql: Option<String>,
-) -> Result<LoadDefintion<'a>, anyhow::Error> {
+) -> Result<LoadDefintion, anyhow::Error> {
     let (schema, table) = build_fqtn(full_table)?;
     let load_table = load_table_name(schema, table);
     let schema_ddl = format!("CREATE SCHEMA IF NOT EXISTS {};", schema);
@@ -128,9 +125,6 @@ pub fn build_definition<'a>(
     let rename_ddl = format!("ALTER TABLE {} rename to {};", load_table, table);
     let binary_ddl = format!("COPY {} FROM STDIN BINARY;", load_table);
     Ok(LoadDefintion {
-        schema,
-        table,
-        load_table,
         schema_ddl,
         drop_ddl,
         create_ddl,
@@ -142,9 +136,9 @@ pub fn build_definition<'a>(
     })
 }
 
-pub async fn prepare_to_copy<'a>(
+pub async fn prepare_to_copy(
     client: &mut tokio_postgres::Client,
-    definition: &LoadDefintion<'a>,
+    definition: &LoadDefintion,
 ) -> Result<(), anyhow::Error> {
     let tx = client
         .transaction()
@@ -161,7 +155,7 @@ pub async fn prepare_to_copy<'a>(
 
 pub async fn execute_binary_copy<'a>(
     client: &mut tokio_postgres::Client,
-    definition: &LoadDefintion<'a>,
+    definition: &LoadDefintion,
     columns: &[ParquetType<'a>],
     stream: ParquetRecordBatchStream<ParquetObjectReader>,
 ) -> Result<(), anyhow::Error> {
@@ -233,16 +227,32 @@ pub async fn execute_binary_copy<'a>(
         .with_context(|| "Could not finish copy")?;
 
     sink_tx.batch_execute(&rename_ddl).await?;
-    match &definition.post_sql {
-        Some(sql) => {
-            sink_tx.batch_execute(sql).await?;
-        }
-        None => {}
+    if let Some(sql) = &definition.post_sql {
+        sink_tx.batch_execute(sql).await?;
     }
+
     sink_tx
         .commit()
         .await
         .with_context(|| "Could not commit transaction")?;
+
+    Ok(())
+}
+
+pub async fn load_postgres<'a>(
+    pq_types: &[ParquetType<'a>],
+    table: &str,
+    post_sql: Option<String>,
+    pg_url: &str,
+    stream: ParquetRecordBatchStream<ParquetObjectReader>,
+) -> Result<(), anyhow::Error> {
+    let definition = build_definition(table, pq_types, post_sql)?;
+    info!("PG definition: {:?}", definition);
+
+    let mut client = create_connection(pg_url).await?;
+    prepare_to_copy(&mut client, &definition).await?;
+
+    execute_binary_copy(&mut client, &definition, pq_types, stream).await?;
 
     Ok(())
 }
@@ -254,14 +264,14 @@ pub enum PgValue<'a> {
     Int64(Option<i64>),
     Float32(Option<f32>),
     Float64(Option<f64>),
-    Decimal128(Option<i128>, u8, i8),
+    Decimal128(Option<i128>, (), i8),
     Jsonb(Option<&'a str>),
     Text(Option<&'a str>),
     TimestampNanosecond(Option<i64>, bool),
-    FixedSizeBinaryArray(Option<&'a [u8]>, i32),
+    FixedSizeBinaryArray(Option<&'a [u8]>, ()),
 }
 
-impl<'a> ToSql for PgValue<'a> {
+impl ToSql for PgValue<'_> {
     fn to_sql(
         &self,
         ty: &Type,
@@ -286,7 +296,7 @@ impl<'a> ToSql for PgValue<'a> {
                 .to_sql(ty, out),
             PgValue::Jsonb(s) => s
                 .map(|j| serde_json::from_str::<Value>(j).expect("Failed to parse json"))
-                .map(|o| tokio_postgres::types::Json(o))
+                .map(tokio_postgres::types::Json)
                 .to_sql(ty, out),
             PgValue::Text(s) => s.to_sql(ty, out),
             PgValue::TimestampNanosecond(ts, true) => ts
@@ -304,7 +314,7 @@ impl<'a> ToSql for PgValue<'a> {
 
     to_sql_checked!();
 
-    fn accepts(ty: &Type) -> bool {
+    fn accepts(_ty: &Type) -> bool {
         true
     }
 }
@@ -343,14 +353,14 @@ fn get_value_to_pg_type<'a>(arrow_array: &ArrowArrayRef<'a>, index: usize) -> Pg
             };
             PgValue::Float64(v)
         }
-        ArrowArrayRef::Decimal128(decimal_array, precision, scale) => {
+        ArrowArrayRef::Decimal128(decimal_array, _precision, scale) => {
             let v = if decimal_array.is_null(index) {
                 None
             } else {
                 let value = decimal_array.value(index);
                 Some(value)
             };
-            PgValue::Decimal128(v, *precision, *scale)
+            PgValue::Decimal128(v, (), *scale)
         }
         ArrowArrayRef::Jsonb(string_array) => {
             let v = if string_array.is_null(index) {
@@ -376,13 +386,13 @@ fn get_value_to_pg_type<'a>(arrow_array: &ArrowArrayRef<'a>, index: usize) -> Pg
             };
             PgValue::TimestampNanosecond(v, *is_utc)
         }
-        ArrowArrayRef::FixedSizeBinaryArray(fixed_size_binary_array, size) => {
+        ArrowArrayRef::FixedSizeBinaryArray(fixed_size_binary_array, _size) => {
             let v = if fixed_size_binary_array.is_null(index) {
                 None
             } else {
                 Some(fixed_size_binary_array.value(index))
             };
-            PgValue::FixedSizeBinaryArray(v, *size)
+            PgValue::FixedSizeBinaryArray(v, ())
         }
         ArrowArrayRef::Boolean(bool_array) => {
             let v = if bool_array.is_null(index) {
@@ -411,7 +421,6 @@ mod tests {
         ];
 
         let first_def = build_definition(full_table, &pq_types, None).unwrap();
-        assert_eq!(first_def.schema, "public");
         assert_eq!(first_def.schema_ddl, "CREATE SCHEMA IF NOT EXISTS public;");
         assert_eq!(
             first_def.drop_ddl,
@@ -436,10 +445,7 @@ mod tests {
     #[tokio::test]
     async fn full_round_trip() {
         let cd = std::env::current_dir().unwrap();
-        let path = format!(
-            "file://{}/test_data/public.users.snappy.parquet",
-            cd.display()
-        );
+        let path = format!("{}/test_data/public.users.snappy.parquet", cd.display());
         let builder = get_file_metadata(path.clone()).await.unwrap();
         let file_md = builder.metadata().file_metadata().clone();
         let kv = pq::get_kv_fields(&file_md);
@@ -450,28 +456,27 @@ mod tests {
             .filter_map(|pq| map_parquet_to_abstract(pq, &kv))
             .collect::<Vec<ParquetType>>();
 
-        let definition = build_definition("not_public.users_test", &mapped, None).unwrap();
         let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
-
-        let mut client = create_connection(pg_url).await.unwrap();
-        prepare_to_copy(&mut client, &definition).await.unwrap();
-
         let stream = builder.with_batch_size(1024).build().unwrap();
-        execute_binary_copy(&mut client, &definition, &mapped, stream)
+
+        load_postgres(&mapped, "not_public.users_test", None, pg_url, stream)
             .await
             .unwrap();
-
         // run it again to ensure the process can load a table that exists
         let post_sql = "CREATE INDEX ON not_public.users_test (unique_id); CREATE UNIQUE INDEX ON not_public.users_test (name);";
-        let definition =
-            build_definition("not_public.users_test", &mapped, Some(post_sql.to_string())).unwrap();
-        prepare_to_copy(&mut client, &definition).await.unwrap();
         let builder = get_file_metadata(path).await.unwrap();
         let stream = builder.with_batch_size(1024).build().unwrap();
-        execute_binary_copy(&mut client, &definition, &mapped, stream)
-            .await
-            .unwrap();
+        load_postgres(
+            &mapped,
+            "not_public.users_test",
+            Some(post_sql.to_string()),
+            pg_url,
+            stream,
+        )
+        .await
+        .unwrap();
 
+        let client = create_connection(pg_url).await.unwrap();
         let row_count = client
             .query_one("select count(*) from not_public.users_test", &[])
             .await

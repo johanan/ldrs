@@ -1,0 +1,9 @@
+file_path: test_data
+
+tables:
+  - file: public.users.snappy.parquet
+    table: public.users_replica
+    post_sql: CREATE INDEX if not exists users_index ON public.users (unique_id)
+  
+  - file: public.strings.snappy.parquet
+    table: public.strings_replica

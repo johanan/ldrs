@@ -13,7 +13,7 @@ use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::info;
-use url::Url;
+use url::{ParseError, Url};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ColumnDefintion {
@@ -72,10 +72,28 @@ pub enum ParquetType<'a> {
     Boolean(&'a str),
 }
 
+pub fn base_or_relative_path(path: &str) -> Result<Url, anyhow::Error> {
+    let try_parse = Url::parse(path);
+    match try_parse {
+        Ok(url) => Ok(url),
+        Err(ParseError::RelativeUrlWithoutBase) => {
+            let current_dir =
+                std::env::current_dir().with_context(|| "Could not get current dir")?;
+            let base = Url::parse(&format!("file://{}/", current_dir.display()))
+                .with_context(|| "Could not parse base path file URL")?;
+            Url::options()
+                .base_url(Some(&base))
+                .parse(path)
+                .with_context(|| "Could not parse relative path file URL")
+        }
+        _ => Err(anyhow::Error::msg("Could not parse path URL")),
+    }
+}
+
 pub async fn get_file_metadata(
     path_url: String,
 ) -> Result<ParquetRecordBatchStreamBuilder<ParquetObjectReader>, anyhow::Error> {
-    let path_parsed = Url::parse(&path_url).with_context(|| "Could not parse path URL")?;
+    let path_parsed = base_or_relative_path(&path_url)?;
 
     let (store, path) =
         parse_url(&path_parsed).with_context(|| "Could not find a valid object store")?;
@@ -215,6 +233,25 @@ pub fn downcast_array<'a>((array, pg_type): (&'a ArrayRef, &ParquetType<'a>)) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_base_or_relative_path() {
+        let cd = std::env::current_dir().unwrap();
+        let base_path = format!("file://{}/home/data", cd.display());
+        let no_file_base = format!("{}/home/data", cd.display());
+        let tests = [
+            ("file:///home/data", "file:///home/data", true),
+            ("home/data", base_path.as_str(), true),
+            (no_file_base.as_str(), base_path.as_str(), true),
+        ];
+        for (path, expected, is_ok) in tests.iter() {
+            let result = base_or_relative_path(path);
+            assert_eq!(result.is_ok(), *is_ok);
+            if *is_ok {
+                assert_eq!(result.unwrap().as_str(), *expected);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_get_file_metadata() {
