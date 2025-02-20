@@ -1,26 +1,18 @@
+mod config;
 mod postgres;
 mod pq;
 
 use anyhow::Context;
-use clap::{arg, Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
+use config::{LoadArgs, PGFileLoad, PGFileLoadArgs};
+use postgres::load_postgres;
 use pq::{get_fields, get_file_metadata, map_parquet_to_abstract, ParquetType};
 use tracing::{debug, info};
 
 #[derive(Subcommand)]
 enum Commands {
     Load(LoadArgs),
-}
-
-#[derive(Args)]
-struct LoadArgs {
-    #[arg(short, long)]
-    file: String,
-    #[arg(short, long, default_value_t = 1024)]
-    batch_size: usize,
-    #[arg(short, long)]
-    table: String,
-    #[arg(short, long)]
-    post_sql: Option<String>,
+    PGConfig(PGFileLoadArgs),
 }
 
 #[derive(Parser)]
@@ -29,7 +21,7 @@ struct Cli {
     command: Commands,
 }
 
-async fn load_postgres(args: &LoadArgs, pg_url: String) -> Result<(), anyhow::Error> {
+async fn load_postgres_cmd(args: &LoadArgs, pg_url: String) -> Result<(), anyhow::Error> {
     let builder = get_file_metadata(args.file.clone()).await?;
     let file_md = builder.metadata().file_metadata().clone();
     let kv = pq::get_kv_fields(&file_md);
@@ -42,20 +34,13 @@ async fn load_postgres(args: &LoadArgs, pg_url: String) -> Result<(), anyhow::Er
         .filter_map(|pq| map_parquet_to_abstract(pq, &kv))
         .collect::<Vec<ParquetType>>();
 
-    let definition = postgres::build_definition(&args.table, &mapped, args.post_sql.clone())?;
-    info!("PG definition: {:?}", definition);
-
-    let mut client = postgres::create_connection(&pg_url).await?;
-    postgres::prepare_to_copy(&mut client, &definition).await?;
-
     let stream = builder.with_batch_size(args.batch_size).build()?;
-    postgres::execute_binary_copy(&mut client, &definition, &mapped, stream).await?;
-
+    load_postgres(&mapped, &args.table, args.post_sql.clone(), &pg_url, stream).await?;
     Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
@@ -64,7 +49,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command_exec = match &cli.command {
         Commands::Load(args) => {
             match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
-                Ok(pg_url) => load_postgres(args, pg_url).await,
+                Ok(pg_url) => load_postgres_cmd(args, pg_url).await,
+                Err(e) => Err(e),
+            }
+        }
+        Commands::PGConfig(args) => {
+            // open the file and parse the yaml
+            let pg_file_load = std::fs::read_to_string(args.file_path.clone())
+                .with_context(|| "Unable to read file")?;
+            let pg_file_load: PGFileLoad =
+                serde_yaml::from_str(&pg_file_load).with_context(|| "Unable to parse yaml")?;
+            match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
+                Ok(pg_url) => {
+                    let tasks = pg_file_load.parse_args()?;
+                    let total_tasks = tasks.len();
+                    for (i, pg_load) in tasks.iter().enumerate() {
+                        let task_start = std::time::Instant::now();
+                        info!("Running task: {}/{}", i + 1, total_tasks);
+                        load_postgres_cmd(pg_load, pg_url.clone()).await?;
+                        let task_end = std::time::Instant::now();
+                        info!("Task time: {:?}", task_end - task_start);
+                    }
+                    Ok(())
+                }
                 Err(e) => Err(e),
             }
         }
@@ -72,6 +79,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let end = std::time::Instant::now();
     info!("Time to load: {:?}", end - start);
-    command_exec?;
-    Ok(())
+    command_exec
 }
