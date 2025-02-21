@@ -1,4 +1,5 @@
 mod config;
+mod delta;
 mod postgres;
 mod pq;
 
@@ -13,6 +14,7 @@ use tracing::{debug, info};
 enum Commands {
     Load(LoadArgs),
     PGConfig(PGFileLoadArgs),
+    Delta,
 }
 
 #[derive(Parser)]
@@ -55,14 +57,15 @@ async fn main() -> Result<(), anyhow::Error> {
         }
         Commands::PGConfig(args) => {
             // open the file and parse the yaml
-            let pg_file_load : ProcessedPGFileLoad = std::fs::read_to_string(args.config_path.clone())
-                .with_context(|| "Unable to read file")
-                .and_then(|f| {
-                    serde_yaml::from_str::<'_, PGFileLoad>(&f)
-                        .with_context(|| "Unable to parse yaml")
-                })
-                .map(|pg_file_load| pg_file_load.merge_cli_args(args))
-                .and_then(|pg_file_load| pg_file_load.try_into())?;
+            let pg_file_load: ProcessedPGFileLoad =
+                std::fs::read_to_string(args.config_path.clone())
+                    .with_context(|| "Unable to read file")
+                    .and_then(|f| {
+                        serde_yaml::from_str::<'_, PGFileLoad>(&f)
+                            .with_context(|| "Unable to parse yaml")
+                    })
+                    .map(|pg_file_load| pg_file_load.merge_cli_args(args))
+                    .and_then(|pg_file_load| pg_file_load.try_into())?;
 
             match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
                 Ok(pg_url) => {
@@ -79,6 +82,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 Err(e) => Err(e),
             }
         }
+        Commands::Delta => delta::test_delta().await,
     };
 
     let end = std::time::Instant::now();
