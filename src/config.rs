@@ -180,7 +180,7 @@ tables:
                     post_sql: None,
                 }],
             };
-            let args : ProcessedPGFileLoad = pg_file_load.try_into().unwrap();
+            let args: ProcessedPGFileLoad = pg_file_load.try_into().unwrap();
             assert_eq!(args.tables[0].file, *expected_file);
             assert_eq!(args.tables[0].batch_size, *expected_batch_size);
         }
@@ -201,7 +201,7 @@ tables:
         };
         let merged = pg_file_load.merge_cli_args(cli_args);
         let merged_file_path = merged.file_path.clone();
-        let tasks : ProcessedPGFileLoad = merged.try_into().unwrap();
+        let tasks: ProcessedPGFileLoad = merged.try_into().unwrap();
         assert_eq!(merged_file_path, Some(String::from("/cli/data")));
         assert_eq!(tasks.tables.len(), 1);
         assert_eq!(tasks.tables[0].file, "/cli/data/test.parquet");
@@ -213,7 +213,7 @@ tables:
         };
         let merged = pg_file_load.merge_cli_args(cli_args);
         let merged_file_path = merged.file_path.clone();
-        let tasks : ProcessedPGFileLoad = merged.try_into().unwrap();
+        let tasks: ProcessedPGFileLoad = merged.try_into().unwrap();
         assert_eq!(merged_file_path, Some(String::from("/home/data")));
         assert_eq!(tasks.tables.len(), 1);
         assert_eq!(tasks.tables[0].file, "/home/data/test.parquet");

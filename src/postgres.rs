@@ -83,8 +83,8 @@ pub fn map_parquet_to_ddl(pq: &ParquetType) -> String {
         ParquetType::Numeric(name, precision, scale) => {
             format!("{} numeric({}, {})", name, precision, scale)
         }
-        ParquetType::Timestamp(name) => format!("{} timestamp", name),
-        ParquetType::TimestampTz(name) => format!("{} timestamptz", name),
+        ParquetType::Timestamp(name, ..) => format!("{} timestamp", name),
+        ParquetType::TimestampTz(name, ..) => format!("{} timestamptz", name),
         ParquetType::Real(name) => format!("{} real", name),
         ParquetType::Text(name) => format!("{} text", name),
         ParquetType::Uuid(name) => format!("{} uuid", name),
@@ -100,8 +100,8 @@ pub fn map_parquet_to_pg_type(pq: &ParquetType) -> postgres_types::Type {
         ParquetType::Integer(_) => postgres_types::Type::INT4,
         ParquetType::Jsonb(_) => postgres_types::Type::JSONB,
         ParquetType::Numeric(_, _, _) => postgres_types::Type::NUMERIC,
-        ParquetType::Timestamp(_) => postgres_types::Type::TIMESTAMP,
-        ParquetType::TimestampTz(_) => postgres_types::Type::TIMESTAMPTZ,
+        ParquetType::Timestamp(_, _) => postgres_types::Type::TIMESTAMP,
+        ParquetType::TimestampTz(_, _) => postgres_types::Type::TIMESTAMPTZ,
         ParquetType::Real(_) => postgres_types::Type::FLOAT4,
         ParquetType::Text(_) => postgres_types::Type::TEXT,
         ParquetType::Uuid(_) => postgres_types::Type::UUID,
@@ -267,6 +267,7 @@ pub enum PgValue<'a> {
     Decimal128(Option<i128>, (), i8),
     Jsonb(Option<&'a str>),
     Text(Option<&'a str>),
+    TimestampMicrosecond(Option<i64>, bool),
     TimestampNanosecond(Option<i64>, bool),
     FixedSizeBinaryArray(Option<&'a [u8]>, ()),
 }
@@ -299,6 +300,12 @@ impl ToSql for PgValue<'_> {
                 .map(tokio_postgres::types::Json)
                 .to_sql(ty, out),
             PgValue::Text(s) => s.to_sql(ty, out),
+            PgValue::TimestampMicrosecond(ts, true) => ts
+                .map(DateTime::<Utc>::from_timestamp_micros)
+                .to_sql(ty, out),
+            PgValue::TimestampMicrosecond(ts, false) => {
+                ts.map(NaiveDateTime::from_timestamp_micros).to_sql(ty, out)
+            }
             PgValue::TimestampNanosecond(ts, true) => ts
                 .map(DateTime::<Utc>::from_timestamp_nanos)
                 .to_sql(ty, out),
@@ -378,6 +385,22 @@ fn get_value_to_pg_type<'a>(arrow_array: &ArrowArrayRef<'a>, index: usize) -> Pg
             };
             PgValue::Text(v)
         }
+        ArrowArrayRef::TimestampMillisecond(ts_array, is_utc) => {
+            let v = if ts_array.is_null(index) {
+                None
+            } else {
+                Some(ts_array.value(index))
+            };
+            PgValue::TimestampMicrosecond(v, *is_utc)
+        }
+        ArrowArrayRef::TimestampMicrosecond(ts_array, is_utc) => {
+            let v = if ts_array.is_null(index) {
+                None
+            } else {
+                Some(ts_array.value(index))
+            };
+            PgValue::TimestampMicrosecond(v, *is_utc)
+        }
         ArrowArrayRef::TimestampNanosecond(ts_array, is_utc) => {
             let v = if ts_array.is_null(index) {
                 None
@@ -407,6 +430,8 @@ fn get_value_to_pg_type<'a>(arrow_array: &ArrowArrayRef<'a>, index: usize) -> Pg
 
 #[cfg(test)]
 mod tests {
+    use parquet::{basic::TimeUnit, format::MilliSeconds};
+
     use crate::pq::{self, get_fields, get_file_metadata, map_parquet_to_abstract};
 
     use super::*;
@@ -417,7 +442,7 @@ mod tests {
         let pq_types = [
             ParquetType::BigInt("id"),
             ParquetType::Text("name"),
-            ParquetType::Timestamp("created_at"),
+            ParquetType::Timestamp("created_at", TimeUnit::MILLIS(MilliSeconds {})),
         ];
 
         let first_def = build_definition(full_table, &pq_types, None).unwrap();

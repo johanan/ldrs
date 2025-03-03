@@ -6,6 +6,7 @@ mod pq;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
+use delta::DeltaLoad;
 use postgres::load_postgres;
 use pq::{get_fields, get_file_metadata, map_parquet_to_abstract, ParquetType};
 use tracing::{debug, info};
@@ -14,7 +15,7 @@ use tracing::{debug, info};
 enum Commands {
     Load(LoadArgs),
     PGConfig(PGFileLoadArgs),
-    Delta,
+    Delta(DeltaLoad),
 }
 
 #[derive(Parser)]
@@ -82,7 +83,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 Err(e) => Err(e),
             }
         }
-        Commands::Delta => delta::test_delta().await,
+        Commands::Delta(args) => delta::delta_run(&args).await,
     };
 
     let end = std::time::Instant::now();
