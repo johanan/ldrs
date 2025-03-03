@@ -1,10 +1,12 @@
 mod config;
+mod delta;
 mod postgres;
 mod pq;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
+use delta::DeltaLoad;
 use postgres::load_postgres;
 use pq::{get_fields, get_file_metadata, map_parquet_to_abstract, ParquetType};
 use tracing::{debug, info};
@@ -13,6 +15,7 @@ use tracing::{debug, info};
 enum Commands {
     Load(LoadArgs),
     PGConfig(PGFileLoadArgs),
+    Delta(DeltaLoad),
 }
 
 #[derive(Parser)]
@@ -55,14 +58,15 @@ async fn main() -> Result<(), anyhow::Error> {
         }
         Commands::PGConfig(args) => {
             // open the file and parse the yaml
-            let pg_file_load : ProcessedPGFileLoad = std::fs::read_to_string(args.config_path.clone())
-                .with_context(|| "Unable to read file")
-                .and_then(|f| {
-                    serde_yaml::from_str::<'_, PGFileLoad>(&f)
-                        .with_context(|| "Unable to parse yaml")
-                })
-                .map(|pg_file_load| pg_file_load.merge_cli_args(args))
-                .and_then(|pg_file_load| pg_file_load.try_into())?;
+            let pg_file_load: ProcessedPGFileLoad =
+                std::fs::read_to_string(args.config_path.clone())
+                    .with_context(|| "Unable to read file")
+                    .and_then(|f| {
+                        serde_yaml::from_str::<'_, PGFileLoad>(&f)
+                            .with_context(|| "Unable to parse yaml")
+                    })
+                    .map(|pg_file_load| pg_file_load.merge_cli_args(args))
+                    .and_then(|pg_file_load| pg_file_load.try_into())?;
 
             match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
                 Ok(pg_url) => {
@@ -79,6 +83,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 Err(e) => Err(e),
             }
         }
+        Commands::Delta(args) => delta::delta_run(&args).await,
     };
 
     let end = std::time::Instant::now();

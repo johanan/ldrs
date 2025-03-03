@@ -2,7 +2,8 @@ use anyhow::Context;
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float32Array,
-    Float64Array, Int32Array, Int64Array, StringArray, TimestampNanosecondArray,
+    Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use object_store::{parse_url, ObjectStore};
@@ -60,8 +61,8 @@ pub struct ColumnDefintion {
 pub enum ParquetType<'a> {
     Varchar(&'a str, i32),
     Text(&'a str),
-    TimestampTz(&'a str),
-    Timestamp(&'a str),
+    TimestampTz(&'a str, parquet::basic::TimeUnit),
+    Timestamp(&'a str, parquet::basic::TimeUnit),
     Uuid(&'a str),
     Jsonb(&'a str),
     Numeric(&'a str, i32, i32),
@@ -164,12 +165,12 @@ pub fn map_parquet_to_abstract<'a>(
                             .unwrap_or(ParquetType::Text(name)),
                         LogicalType::Timestamp {
                             is_adjusted_to_u_t_c: true,
-                            ..
-                        } => ParquetType::TimestampTz(name),
+                            unit,
+                        } => ParquetType::TimestampTz(name, unit),
                         LogicalType::Timestamp {
                             is_adjusted_to_u_t_c: false,
-                            ..
-                        } => ParquetType::Timestamp(name),
+                            unit,
+                        } => ParquetType::Timestamp(name, unit),
                         LogicalType::Uuid => ParquetType::Uuid(name),
                         LogicalType::Json => ParquetType::Jsonb(name),
                         LogicalType::Decimal { scale, precision } => {
@@ -202,6 +203,8 @@ pub enum ArrowArrayRef<'a> {
     Jsonb(&'a StringArray),
     Utf8(&'a StringArray),
     Boolean(&'a BooleanArray),
+    TimestampMillisecond(&'a TimestampMillisecondArray, bool),
+    TimestampMicrosecond(&'a TimestampMicrosecondArray, bool),
     TimestampNanosecond(&'a TimestampNanosecondArray, bool),
     FixedSizeBinaryArray(&'a FixedSizeBinaryArray, i32),
 }
@@ -212,9 +215,18 @@ pub fn downcast_array<'a>((array, pg_type): (&'a ArrayRef, &ParquetType<'a>)) ->
         DataType::Int64 => ArrowArrayRef::Int64(array.as_primitive()),
         DataType::Float32 => ArrowArrayRef::Float32(array.as_primitive()),
         DataType::Float64 => ArrowArrayRef::Float64(array.as_primitive()),
-        DataType::Timestamp(TimeUnit::Nanosecond, is_utc) => {
-            ArrowArrayRef::TimestampNanosecond(array.as_primitive(), is_utc.is_some())
-        }
+        DataType::Timestamp(unit, is_utc) => match unit {
+            TimeUnit::Millisecond => {
+                ArrowArrayRef::TimestampMillisecond(array.as_primitive(), is_utc.is_some())
+            }
+            TimeUnit::Microsecond => {
+                ArrowArrayRef::TimestampMicrosecond(array.as_primitive(), is_utc.is_some())
+            }
+            TimeUnit::Nanosecond => {
+                ArrowArrayRef::TimestampNanosecond(array.as_primitive(), is_utc.is_some())
+            }
+            _ => unimplemented!(),
+        },
         DataType::FixedSizeBinary(size) => {
             ArrowArrayRef::FixedSizeBinaryArray(array.as_fixed_size_binary(), *size)
         }
