@@ -1,17 +1,25 @@
-use std::path::Path;
+mod schema;
+
+use std::{path::Path, sync::Arc};
 
 use anyhow::Context;
+use arrow_schema::{Schema, SchemaRef};
 use bigdecimal::ToPrimitive;
 use clap::Args;
 use deltalake::{
     arrow::array::RecordBatch,
-    kernel::{DataType, StructField, StructType},
+    datafusion::{
+        catalog::TableProvider, datasource::provider_as_source, logical_expr::LogicalPlanBuilder,
+        physical_plan::memory::LazyBatchGenerator,
+    },
+    kernel::{DataType, StructField, StructType, Transaction},
     open_table,
+    operations::{transaction::CommitProperties, write::WriteBuilder},
     table::DeltaTable,
-    DeltaOps,
+    DeltaOps, DeltaResult,
 };
-use futures::TryStreamExt;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
+use schema::{analyze_schema_conversions, convert_batch, map_convert_schema, ColumnConversion};
 use serde::Deserialize;
 use tracing::info;
 
@@ -37,7 +45,7 @@ pub async fn delta_run(load_args: &DeltaLoad) -> Result<(), anyhow::Error> {
     let table_path = Path::new(&load_args.table_name);
     let full_table_path = root.join(table_path);
     let uri = full_table_path.to_string_lossy().to_string();
-    let stream = builder.with_batch_size(1024).build()?;
+    let stream = builder.with_batch_size(250000).build()?;
 
     // Check if table exists first
     let mut table = match open_table(&uri).await {
@@ -64,7 +72,8 @@ pub async fn delta_run(load_args: &DeltaLoad) -> Result<(), anyhow::Error> {
     info!("num rows: {:?}", file_md.num_rows());
     info!("delta table version: {:?}", table.version());
 
-    overwrite_table_from_parquet(&mut table, stream).await?;
+    //overwrite_table_from_parquet(&mut table, stream).await?;
+    write(&mut table, stream).await?;
 
     Ok(())
 }
@@ -75,8 +84,8 @@ fn map_parquet_to_delta(pq_col: &ParquetType) -> Result<StructField, anyhow::Err
             Ok(StructField::new(name, DataType::TIMESTAMP_NTZ, true))
         }
         ParquetType::TimestampTz(name, _) => Ok(StructField::new(name, DataType::TIMESTAMP, true)),
-        ParquetType::Uuid(name) => Ok(StructField::new(name, DataType::BINARY, true)
-            .with_metadata([("paruqet_type", "UUID")])),
+        ParquetType::Uuid(name) => Ok(StructField::new(name, DataType::STRING, true)
+            .with_metadata([("parquet_type", "UUID")])),
         ParquetType::Jsonb(name) => Ok(StructField::new(name, DataType::STRING, true)
             .with_metadata([("parquet_type", "JSONB")])),
         ParquetType::Numeric(name, precision, scale) => {
@@ -114,22 +123,118 @@ pub fn schema_from_parquet(pq: Vec<ParquetType>) -> Result<StructType, anyhow::E
     Ok(StructType::new(fields))
 }
 
-pub async fn overwrite_table_from_parquet(
+pub async fn write(
     table: &mut DeltaTable,
     stream: ParquetRecordBatchStream<ParquetObjectReader>,
 ) -> Result<(), anyhow::Error> {
-    info!("schema: {:?}", stream.schema());
-    let writer = DeltaOps(table.clone());
-    let batches: Vec<RecordBatch> = stream
-        .try_collect()
-        .await
-        .with_context(|| "Failed to read parquet stream")?;
-    let _table = writer
-        .write(batches)
-        .with_save_mode(deltalake::protocol::SaveMode::Overwrite)
-        .await
-        .with_context(|| "Failed to write to table")?;
+    let builder = WriteBuilder::new(table.log_store(), table.state.clone())
+        .with_save_mode(deltalake::protocol::SaveMode::Append);
+    let table = to_lazy_table(stream)?;
+    let plan = LogicalPlanBuilder::scan("source", provider_as_source(table), None)?.build()?;
+    info!("plan: {:?}", plan);
+    let txn = Transaction::new("ldrs v0.9.0", 1);
+    let commit = CommitProperties::default().with_application_transaction(txn);
+    builder
+        .with_input_execution_plan(Arc::new(plan))
+        .with_commit_properties(commit)
+        .await?;
     Ok(())
+}
+
+pub fn to_lazy_table(
+    stream: ParquetRecordBatchStream<ParquetObjectReader>,
+) -> DeltaResult<Arc<dyn TableProvider>> {
+    use deltalake::delta_datafusion::LazyTableProvider;
+    use parking_lot::RwLock;
+    use std::sync::{Arc, Mutex};
+
+    let stream_mutex = Arc::new(Mutex::new(stream));
+
+    #[derive(Debug)]
+    struct ParquetStreamBatchGenerator {
+        stream: Arc<Mutex<ParquetRecordBatchStream<ParquetObjectReader>>>,
+        conversions: Vec<ColumnConversion>,
+        target_schema: SchemaRef,
+    }
+
+    impl ParquetStreamBatchGenerator {
+        fn new(stream: Arc<Mutex<ParquetRecordBatchStream<ParquetObjectReader>>>) -> Self {
+            let schema = {
+                let locked_stream = stream.lock().unwrap();
+                locked_stream.schema().clone()
+            };
+            let conversions = analyze_schema_conversions(&schema);
+            info!("conversions: {:?}", conversions);
+            let target_schema = Arc::new(Schema::new(
+                schema
+                    .fields()
+                    .iter()
+                    .zip(conversions.iter())
+                    .map(|(field, conversion)| map_convert_schema(field, conversion))
+                    .collect::<Vec<_>>(),
+            ));
+            Self {
+                stream,
+                conversions,
+                target_schema,
+            }
+        }
+    }
+
+    impl std::fmt::Display for ParquetStreamBatchGenerator {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ParquetStreamBatchGenerator")
+        }
+    }
+
+    impl LazyBatchGenerator for ParquetStreamBatchGenerator {
+        fn generate_next_batch(
+            &mut self,
+        ) -> deltalake::datafusion::error::Result<Option<RecordBatch>> {
+            use futures::{executor::block_on, StreamExt};
+
+            // Get the next batch from the stream
+            let mut stream = self.stream.lock().map_err(|_| {
+                deltalake::datafusion::error::DataFusionError::Execution(
+                    "Failed to lock the ArrowArrayStreamReader".to_string(),
+                )
+            })?;
+
+            let next_result = block_on(stream.next());
+            info!("loading next batch ");
+
+            match next_result {
+                Some(Ok(batch)) => {
+                    // Apply conversions to the batch
+                    let converted_batch =
+                        convert_batch(&batch, &self.conversions).map_err(|e| {
+                            deltalake::datafusion::error::DataFusionError::Execution(format!(
+                                "Failed to convert batch: {}",
+                                e
+                            ))
+                        })?;
+
+                    Ok(Some(converted_batch))
+                }
+                Some(Err(err)) => Err(deltalake::datafusion::error::DataFusionError::ArrowError(
+                    err.into(),
+                    None,
+                )),
+                None => Ok(None), // End of stream
+            }
+        }
+    }
+
+    let generator = ParquetStreamBatchGenerator::new(stream_mutex);
+    let target_schema = generator.target_schema.clone();
+
+    let parquet_generator: Arc<RwLock<dyn LazyBatchGenerator>> = Arc::new(RwLock::new(generator));
+
+    // Create the LazyTableProvider with our generator
+    Ok(Arc::new(LazyTableProvider::try_new(
+        target_schema,
+        vec![parquet_generator],
+    )?))
 }
 
 pub async fn create_table_from_parquet(
@@ -171,10 +276,7 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_table("users", Arc::new(table.clone()))
             .unwrap();
-        let df = ctx
-            .sql("SELECT * from users")
-            .await
-            .unwrap();
+        let df = ctx.sql("SELECT * from users").await.unwrap();
         let results = df.collect().await.unwrap();
         let result = results.get(0).unwrap();
         assert_eq!(result.num_rows(), 2);
@@ -182,10 +284,7 @@ mod tests {
 
         // it is overwrite so run it again
         delta_run(&delta_load).await.unwrap();
-        let df = ctx
-            .sql("SELECT * from users")
-            .await
-            .unwrap();
+        let df = ctx.sql("SELECT * from users").await.unwrap();
         let results = df.collect().await.unwrap();
         let result = results.get(0).unwrap();
         assert_eq!(result.num_rows(), 2);

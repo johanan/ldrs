@@ -20,10 +20,11 @@ arrow-schema = "53.4.0"
 bigdecimal = "0.4.7"
 chrono = "0.4.39"
 clap = { version = "4.5.27", features = ["derive"] }
-deltalake = { version = "0.23.2", features = ["datafusion"] }
+deltalake = { version = "0.24.0", features = ["datafusion","azure"] }
 futures = "0.3.31"
 native-tls = { version = "0.2.13", features = ["vendored"] }
 object_store = "0.11.2"
+parking_lot = "0.12.3"
 parquet = { version = "53.4.0", features = ["async", "arrow", "object_store"] }
 pg_bigdecimal = "0.1.5"
 postgres-native-tls = "0.5.1"
