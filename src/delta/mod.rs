@@ -1,6 +1,6 @@
 mod schema;
 
-use std::{path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::Context;
 use arrow_schema::{Schema, SchemaRef};
@@ -13,7 +13,6 @@ use deltalake::{
         physical_plan::memory::LazyBatchGenerator,
     },
     kernel::{DataType, StructField, StructType, Transaction},
-    open_table,
     operations::{transaction::CommitProperties, write::WriteBuilder},
     table::DeltaTable,
     DeltaOps, DeltaResult,
@@ -35,6 +34,8 @@ pub struct DeltaLoad {
     pub file: String,
     #[arg(short, long)]
     pub table_name: String,
+    #[arg(short, long)]
+    pub load_mode: deltalake::protocol::SaveMode,
 }
 
 pub async fn delta_run(load_args: &DeltaLoad) -> Result<(), anyhow::Error> {
@@ -45,15 +46,20 @@ pub async fn delta_run(load_args: &DeltaLoad) -> Result<(), anyhow::Error> {
     let table_path = Path::new(&load_args.table_name);
     let full_table_path = root.join(table_path);
     let uri = full_table_path.to_string_lossy().to_string();
-    let stream = builder.with_batch_size(250000).build()?;
+    let stream = builder.with_batch_size(1024).build()?;
+
+    let options = HashMap::from([(String::from("timeout"), String::from("60s"))]);
+    let ops = DeltaOps::try_from_uri_with_storage_options(&uri, options)
+        .await
+        .with_context(|| format!("Failed to create DeltaOps for {}", uri))?;
 
     // Check if table exists first
-    let mut table = match open_table(&uri).await {
-        Ok(table) => {
+    let mut table = match ops.0.state {
+        Some(_) => {
             info!("Table exists");
-            table
+            ops.0
         }
-        Err(_) => {
+        None => {
             info!("Creating new table");
             let fields = get_fields(&file_md)?;
             let mapped = fields
@@ -63,8 +69,6 @@ pub async fn delta_run(load_args: &DeltaLoad) -> Result<(), anyhow::Error> {
 
             let schema = schema_from_parquet(mapped)?;
             info!("Schema: {:?}", schema);
-            // Get fresh ops since we need to create
-            let ops = DeltaOps::try_from_uri(&uri).await?;
             create_table_from_parquet(ops, table_path.to_string_lossy().to_string(), schema).await?
         }
     };
@@ -72,8 +76,7 @@ pub async fn delta_run(load_args: &DeltaLoad) -> Result<(), anyhow::Error> {
     info!("num rows: {:?}", file_md.num_rows());
     info!("delta table version: {:?}", table.version());
 
-    //overwrite_table_from_parquet(&mut table, stream).await?;
-    write(&mut table, stream).await?;
+    write(&mut table, stream, load_args.load_mode).await?;
 
     Ok(())
 }
@@ -126,9 +129,9 @@ pub fn schema_from_parquet(pq: Vec<ParquetType>) -> Result<StructType, anyhow::E
 pub async fn write(
     table: &mut DeltaTable,
     stream: ParquetRecordBatchStream<ParquetObjectReader>,
+    mode: deltalake::protocol::SaveMode,
 ) -> Result<(), anyhow::Error> {
-    let builder = WriteBuilder::new(table.log_store(), table.state.clone())
-        .with_save_mode(deltalake::protocol::SaveMode::Append);
+    let builder = WriteBuilder::new(table.log_store(), table.state.clone()).with_save_mode(mode);
     let table = to_lazy_table(stream)?;
     let plan = LogicalPlanBuilder::scan("source", provider_as_source(table), None)?.build()?;
     info!("plan: {:?}", plan);
@@ -252,11 +255,9 @@ pub async fn create_table_from_parquet(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use deltalake::datafusion::prelude::SessionContext;
-
     use super::*;
+    use deltalake::datafusion::prelude::SessionContext;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_delta_lake_from_parquet() {
@@ -265,29 +266,43 @@ mod tests {
         let delta_root = format!("{}/test_data/delta", cd.display());
         let delta_load = DeltaLoad {
             delta_root: delta_root.clone(),
-            file,
+            file: file.clone(),
             table_name: "users".to_string(),
+            load_mode: deltalake::protocol::SaveMode::Overwrite,
         };
         delta_run(&delta_load).await.unwrap();
 
-        let table = deltalake::open_table(format!("{}/users", delta_root))
+        let table = deltalake::open_table(format!("{}/users", delta_root.clone()))
             .await
             .unwrap();
         let ctx = SessionContext::new();
-        ctx.register_table("users", Arc::new(table.clone()))
-            .unwrap();
-        let df = ctx.sql("SELECT * from users").await.unwrap();
-        let results = df.collect().await.unwrap();
-        let result = results.get(0).unwrap();
-        assert_eq!(result.num_rows(), 2);
-        assert_eq!(result.schema().fields.len(), 6);
+        let dataframe = ctx.read_table(Arc::new(table.clone())).unwrap();
+        let results = dataframe.collect().await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 2);
+        assert_eq!(results[0].schema().fields.len(), 6);
 
         // it is overwrite so run it again
         delta_run(&delta_load).await.unwrap();
-        let df = ctx.sql("SELECT * from users").await.unwrap();
-        let results = df.collect().await.unwrap();
-        let result = results.get(0).unwrap();
-        assert_eq!(result.num_rows(), 2);
-        assert_eq!(result.schema().fields.len(), 6);
+        let dataframe = ctx.read_table(Arc::new(table.clone())).unwrap();
+        let results = dataframe.collect().await.unwrap();
+        assert_eq!(results.len(), 1);
+
+        // now run an append
+        let delta_load = DeltaLoad {
+            delta_root: delta_root.clone(),
+            file,
+            table_name: "users".to_string(),
+            load_mode: deltalake::protocol::SaveMode::Append,
+        };
+        delta_run(&delta_load).await.unwrap();
+        let table = deltalake::open_table(format!("{}/users", delta_root))
+            .await
+            .unwrap();
+
+        let dataframe = ctx.read_table(Arc::new(table.clone())).unwrap();
+        let results = dataframe.collect().await.unwrap();
+
+        assert_eq!(results.len(), 2);
     }
 }
