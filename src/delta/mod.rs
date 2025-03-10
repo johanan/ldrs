@@ -25,6 +25,7 @@ use tracing::info;
 use crate::pq::{
     get_fields, get_file_metadata, get_kv_fields, map_parquet_to_abstract, ParquetType,
 };
+use deltalake::azure::register_handlers;
 
 #[derive(Args, Deserialize, Debug)]
 pub struct DeltaLoad {
@@ -39,6 +40,7 @@ pub struct DeltaLoad {
 }
 
 pub async fn delta_run(load_args: &DeltaLoad) -> Result<(), anyhow::Error> {
+    register_handlers(None);
     let builder = get_file_metadata(load_args.file.clone()).await?;
     let file_md = builder.metadata().file_metadata().clone();
     let kv = get_kv_fields(&file_md);
