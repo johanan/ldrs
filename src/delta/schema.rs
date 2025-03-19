@@ -187,9 +187,8 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(TimestampNanosecondArray::from_vec(
+                Arc::new(TimestampNanosecondArray::from(
                     vec![1000000000, 2000000000, 3000000000],
-                    None,
                 )),
                 Arc::new(FixedSizeBinaryArray::from(vec![
                     &[0; 16],

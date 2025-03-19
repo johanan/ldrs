@@ -14,18 +14,18 @@ eula = false
 
 [dependencies]
 anyhow = "1.0.95"
-arrow = { version = "53.4.0", features = [] }
-arrow-array = "53.4.0"
-arrow-schema = "53.4.0"
+arrow = { version = "54", features = [] }
+arrow-array = "54"
+arrow-schema = "54"
 bigdecimal = "0.4.7"
 chrono = "0.4.39"
 clap = { version = "4.5.27", features = ["derive"] }
-deltalake = { version = "0.24.0", features = ["datafusion","azure"] }
+deltalake = { version = "0.25.0", features = ["datafusion","azure"] }
 futures = "0.3.31"
 native-tls = { version = "0.2.13", features = ["vendored"] }
 object_store = "0.11.2"
 parking_lot = "0.12.3"
-parquet = { version = "53.4.0", features = ["async", "arrow", "object_store"] }
+parquet = { version = "54", features = ["async", "arrow", "object_store"] }
 pg_bigdecimal = "0.1.5"
 postgres-native-tls = "0.5.1"
 postgres-types = "0.2.8"
@@ -36,7 +36,6 @@ tokio = { version = "1.43.0", features = [
   "rt",
   "rt-multi-thread",
   "macros",
-  "fs",
 ] }
 tokio-postgres = { version = "0.7.12", features = [
   "with-chrono-0_4",

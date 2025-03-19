@@ -471,7 +471,7 @@ mod tests {
     async fn full_round_trip() {
         let cd = std::env::current_dir().unwrap();
         let path = format!("{}/test_data/public.users.snappy.parquet", cd.display());
-        let builder = get_file_metadata(path.clone()).await.unwrap();
+        let builder = get_file_metadata(path.clone(), None).await.unwrap();
         let file_md = builder.metadata().file_metadata().clone();
         let kv = pq::get_kv_fields(&file_md);
 
@@ -489,7 +489,7 @@ mod tests {
             .unwrap();
         // run it again to ensure the process can load a table that exists
         let post_sql = "CREATE INDEX ON not_public.users_test (unique_id); CREATE UNIQUE INDEX ON not_public.users_test (name);";
-        let builder = get_file_metadata(path).await.unwrap();
+        let builder = get_file_metadata(path, None).await.unwrap();
         let stream = builder.with_batch_size(1024).build().unwrap();
         load_postgres(
             &mapped,

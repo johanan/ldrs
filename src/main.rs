@@ -25,7 +25,7 @@ struct Cli {
 }
 
 async fn load_postgres_cmd(args: &LoadArgs, pg_url: String) -> Result<(), anyhow::Error> {
-    let builder = get_file_metadata(args.file.clone()).await?;
+    let builder = get_file_metadata(args.file.clone(), None).await?;
     let file_md = builder.metadata().file_metadata().clone();
     let kv = pq::get_kv_fields(&file_md);
     debug!("kv: {:?}", kv);
@@ -48,6 +48,13 @@ async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
     let start = std::time::Instant::now();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
 
     let command_exec = match cli.command {
         Commands::Load(args) => {
@@ -83,10 +90,12 @@ async fn main() -> Result<(), anyhow::Error> {
                 Err(e) => Err(e),
             }
         }
-        Commands::Delta(args) => delta::delta_run(&args).await,
+        Commands::Delta(args) => delta::delta_run(&args, rt.handle().clone()).await,
     };
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 
     let end = std::time::Instant::now();
     info!("Time to load: {:?}", end - start);
+    info!("Debug source:\n{command_exec:#?}");
     command_exec
 }
