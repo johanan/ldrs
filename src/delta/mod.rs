@@ -1,6 +1,6 @@
 mod schema;
 
-use std::{collections::HashMap, f64::consts::E, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use anyhow::Context;
 use arrow_schema::{Schema, SchemaRef};
@@ -17,15 +17,14 @@ use deltalake::{
     table::DeltaTable,
     DeltaOps, DeltaResult,
 };
-use object_store::azure::MicrosoftAzureBuilder;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
 use schema::{analyze_schema_conversions, convert_batch, map_convert_schema, ColumnConversion};
 use serde::Deserialize;
 use tracing::info;
-use url::Url;
 
+use crate::{parquet_provider::builder_from_string, storage::StorageProvider};
 use crate::pq::{
-    get_fields, get_file_metadata, get_kv_fields, map_parquet_to_abstract, ParquetType,
+    get_fields, get_kv_fields, map_parquet_to_abstract, ParquetType,
 };
 use deltalake::azure::register_handlers;
 
@@ -41,91 +40,25 @@ pub struct DeltaLoad {
     pub load_mode: deltalake::protocol::SaveMode,
 }
 
-struct AzureUrl {
-    storage_account: String,
-    blob_path: String,
-}
-
-impl AzureUrl {
-    fn to_object_store_url(&self) -> String {
-        format!("azure://{}", self.blob_path)
-    }
-
-    fn to_object_store_options(&self) -> HashMap<String, String> {
-        HashMap::from([
-            ("azure_storage_account_name".to_string(), self.storage_account.clone()),
-        ])
-    }
-}
-
-fn is_azure_url(url: &str) -> Result<Url, anyhow::Error> {
-    let url = Url::parse(url).with_context(|| format!("Failed to parse URL: {}", url))?;
-    match url.scheme() {
-        "azure" | "az" => Ok(url),
-        "https" => {
-            let host = url.host_str().ok_or_else(|| anyhow::anyhow!("No host found"))?;
-            if host.ends_with("blob.core.windows.net") {
-                Ok(url)
-            } else {
-                Err(anyhow::anyhow!("Invalid host"))
-            }
-        },
-        _ => Err(anyhow::anyhow!("Invalid scheme")),
-    }
-}
-    
-
-fn parse_az_url(url: Url) -> Result<AzureUrl, anyhow::Error> {
-    let host = url.host_str().ok_or_else(|| anyhow::anyhow!("No host found"))?;
-    let path = match url.path() {
-        "/" => Err(anyhow::anyhow!("No path found")),
-        p => Ok(p),
-    }?;
-
-    let clean_path = path.strip_prefix('/').unwrap_or(path);
-
-    match url.scheme() {
-        "https" | "azure" => {
-            match host.split_once('.') {
-                Some((account, _)) => Ok(AzureUrl {
-                    storage_account: account.to_string(),
-                    blob_path: clean_path.to_string(),
-                }),
-                None => Ok(AzureUrl {
-                    storage_account: host.to_string(),
-                    blob_path: clean_path.to_string(),
-                }),
-            }
-        },
-        _ => Err(anyhow::anyhow!("Invalid scheme")),
-    }
-}
-
-pub async fn delta_run(load_args: &DeltaLoad, handle: tokio::runtime::Handle) -> Result<(), anyhow::Error> {
+pub async fn delta_run(
+    load_args: &DeltaLoad,
+    handle: tokio::runtime::Handle,
+) -> Result<(), anyhow::Error> {
     register_handlers(None);
-    let builder = get_file_metadata(load_args.file.clone(), Some(handle)).await?;
+    let builder = builder_from_string(load_args.file.clone(), handle).await?;
     let file_md = builder.metadata().file_metadata().clone();
     let kv = get_kv_fields(&file_md);
+    // build delta table path
     let root = Path::new(&load_args.delta_root);
     let table_path = Path::new(&load_args.table_name);
-    let full_table_path = root.join(table_path);
-    let uri = full_table_path.to_string_lossy().to_string();
+    let full_table_path = root.join(table_path).to_string_lossy().to_string();
+
     let stream = builder.with_batch_size(1024).build()?;
 
-    let options = std::collections::HashMap::from([
-        (String::from("timeout"), String::from("120s")),
-    ]);
-
-    let azure_url = is_azure_url(&uri).and_then(parse_az_url);
-
-    let (uri, options) = match azure_url {
-        Ok(az) => {
-            let uri = az.to_object_store_url();
-            let options = az.to_object_store_options();
-            (uri, options)
-        },
-        Err(_) => (uri, options),
-    };
+    let timeout = (String::from("timeout"), String::from("120s"));
+    let storage = StorageProvider::try_from_string(&full_table_path)?;
+    let (uri, mut options) = storage.get_delta_uri_options();
+    options.insert(timeout.0, timeout.1);
 
     let ops = DeltaOps::try_from_uri_with_storage_options(&uri, options)
         .await
@@ -389,32 +322,5 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
-    }
-
-    #[test]
-    fn test_azure_parsing() {
-        let examples = vec![
-            (
-                "https://ldrsaccount.blob.core.windows.net/delta/users",
-                "ldrsaccount",
-                "delta/users",
-            ),
-            (
-                "azure://ldrsaccount.blob.core.windows.net/delta/users/1",
-                "ldrsaccount",
-                "delta/users/1",
-            ),
-            (
-                "azure://ldrsaccount/delta/users/1/",
-                "ldrsaccount",
-                "delta/users/1/",
-            ),
-        ];
-        for (url, expected, expected_path) in examples {
-            let is_azure = is_azure_url(url).unwrap();
-            let azure_url = parse_az_url(is_azure).unwrap();
-            assert_eq!(azure_url.storage_account, expected);
-            assert_eq!(azure_url.blob_path, expected_path);
-        }
     }
 }
