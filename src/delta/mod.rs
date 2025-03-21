@@ -1,6 +1,6 @@
 mod schema;
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use anyhow::Context;
 use arrow_schema::{Schema, SchemaRef};
@@ -22,8 +22,9 @@ use schema::{analyze_schema_conversions, convert_batch, map_convert_schema, Colu
 use serde::Deserialize;
 use tracing::info;
 
+use crate::{parquet_provider::builder_from_string, storage::StorageProvider};
 use crate::pq::{
-    get_fields, get_file_metadata, get_kv_fields, map_parquet_to_abstract, ParquetType,
+    get_fields, get_kv_fields, map_parquet_to_abstract, ParquetType,
 };
 use deltalake::azure::register_handlers;
 
@@ -39,18 +40,26 @@ pub struct DeltaLoad {
     pub load_mode: deltalake::protocol::SaveMode,
 }
 
-pub async fn delta_run(load_args: &DeltaLoad) -> Result<(), anyhow::Error> {
+pub async fn delta_run(
+    load_args: &DeltaLoad,
+    handle: tokio::runtime::Handle,
+) -> Result<(), anyhow::Error> {
     register_handlers(None);
-    let builder = get_file_metadata(load_args.file.clone()).await?;
+    let builder = builder_from_string(load_args.file.clone(), handle).await?;
     let file_md = builder.metadata().file_metadata().clone();
     let kv = get_kv_fields(&file_md);
+    // build delta table path
     let root = Path::new(&load_args.delta_root);
     let table_path = Path::new(&load_args.table_name);
-    let full_table_path = root.join(table_path);
-    let uri = full_table_path.to_string_lossy().to_string();
+    let full_table_path = root.join(table_path).to_string_lossy().to_string();
+
     let stream = builder.with_batch_size(1024).build()?;
 
-    let options = HashMap::from([(String::from("timeout"), String::from("60s"))]);
+    let timeout = (String::from("timeout"), String::from("120s"));
+    let storage = StorageProvider::try_from_string(&full_table_path)?;
+    let (uri, mut options) = storage.get_delta_uri_options();
+    options.insert(timeout.0, timeout.1);
+
     let ops = DeltaOps::try_from_uri_with_storage_options(&uri, options)
         .await
         .with_context(|| format!("Failed to create DeltaOps for {}", uri))?;
@@ -272,7 +281,13 @@ mod tests {
             table_name: "users".to_string(),
             load_mode: deltalake::protocol::SaveMode::Overwrite,
         };
-        delta_run(&delta_load).await.unwrap();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+
+        delta_run(&delta_load, rt.handle().clone()).await.unwrap();
 
         let table = deltalake::open_table(format!("{}/users", delta_root.clone()))
             .await
@@ -285,7 +300,7 @@ mod tests {
         assert_eq!(results[0].schema().fields.len(), 6);
 
         // it is overwrite so run it again
-        delta_run(&delta_load).await.unwrap();
+        delta_run(&delta_load, rt.handle().clone()).await.unwrap();
         let dataframe = ctx.read_table(Arc::new(table.clone())).unwrap();
         let results = dataframe.collect().await.unwrap();
         assert_eq!(results.len(), 1);
@@ -297,7 +312,7 @@ mod tests {
             table_name: "users".to_string(),
             load_mode: deltalake::protocol::SaveMode::Append,
         };
-        delta_run(&delta_load).await.unwrap();
+        delta_run(&delta_load, rt.handle().clone()).await.unwrap();
         let table = deltalake::open_table(format!("{}/users", delta_root))
             .await
             .unwrap();
@@ -306,5 +321,6 @@ mod tests {
         let results = dataframe.collect().await.unwrap();
 
         assert_eq!(results.len(), 2);
+        tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
     }
 }

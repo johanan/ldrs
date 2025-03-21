@@ -1,4 +1,5 @@
-use anyhow::Context;
+use std::sync::Arc;
+
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float32Array,
@@ -6,15 +7,9 @@ use arrow_array::{
     TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
-use object_store::{parse_url, ObjectStore};
-use parquet::arrow::async_reader::ParquetObjectReader;
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::basic::LogicalType;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tracing::info;
-use url::{ParseError, Url};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ColumnDefintion {
@@ -71,46 +66,6 @@ pub enum ParquetType<'a> {
     Integer(&'a str),
     BigInt(&'a str),
     Boolean(&'a str),
-}
-
-pub fn base_or_relative_path(path: &str) -> Result<Url, anyhow::Error> {
-    let try_parse = Url::parse(path);
-    match try_parse {
-        Ok(url) => Ok(url),
-        Err(ParseError::RelativeUrlWithoutBase) => {
-            let current_dir =
-                std::env::current_dir().with_context(|| "Could not get current dir")?;
-            let base = Url::parse(&format!("file://{}/", current_dir.display()))
-                .with_context(|| "Could not parse base path file URL")?;
-            Url::options()
-                .base_url(Some(&base))
-                .parse(path)
-                .with_context(|| "Could not parse relative path file URL")
-        }
-        _ => Err(anyhow::Error::msg("Could not parse path URL")),
-    }
-}
-
-pub async fn get_file_metadata(
-    path_url: String,
-) -> Result<ParquetRecordBatchStreamBuilder<ParquetObjectReader>, anyhow::Error> {
-    let path_parsed = base_or_relative_path(&path_url)?;
-
-    let (store, path) =
-        parse_url(&path_parsed).with_context(|| "Could not find a valid object store")?;
-    let store = Arc::new(store);
-
-    let meta = store
-        .head(&path)
-        .await
-        .with_context(|| "Could not find file in store")?;
-    info!("meta: {:?}", meta);
-
-    let reader = ParquetObjectReader::new(store, meta);
-    let builder = ParquetRecordBatchStreamBuilder::new(reader)
-        .await
-        .with_context(|| "Could not create parquet record batch stream builder")?;
-    Ok(builder)
 }
 
 pub fn get_fields(
@@ -245,25 +200,8 @@ pub fn downcast_array<'a>((array, pg_type): (&'a ArrayRef, &ParquetType<'a>)) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_base_or_relative_path() {
-        let cd = std::env::current_dir().unwrap();
-        let base_path = format!("file://{}/home/data", cd.display());
-        let no_file_base = format!("{}/home/data", cd.display());
-        let tests = [
-            ("file:///home/data", "file:///home/data", true),
-            ("home/data", base_path.as_str(), true),
-            (no_file_base.as_str(), base_path.as_str(), true),
-        ];
-        for (path, expected, is_ok) in tests.iter() {
-            let result = base_or_relative_path(path);
-            assert_eq!(result.is_ok(), *is_ok);
-            if *is_ok {
-                assert_eq!(result.unwrap().as_str(), *expected);
-            }
-        }
-    }
+    use crate::parquet_provider::builder_from_string;
+    use crate::test_utils::{create_runtime, drop_runtime};
 
     #[tokio::test]
     async fn test_get_file_metadata() {
@@ -272,7 +210,8 @@ mod tests {
             "file://{}/test_data/public.users.snappy.parquet",
             cd.display()
         );
-        let result = get_file_metadata(path).await;
+        let rt = create_runtime();
+        let result = builder_from_string(path, rt.handle().clone()).await;
         assert!(result.is_ok());
         let result = result.unwrap();
         let metadata = result.metadata().file_metadata();
@@ -282,12 +221,15 @@ mod tests {
         // now get the fields
         let fields = get_fields(metadata).unwrap();
         assert_eq!(fields.len(), 6);
+        drop_runtime(rt);
     }
 
     #[tokio::test]
     async fn test_get_file_metadata_invalid_url() {
         let path = "path/to/file".to_string();
-        let result = get_file_metadata(path).await;
+        let rt = create_runtime();
+        let result = builder_from_string(path, rt.handle().clone()).await;
         assert!(result.is_err());
+        drop_runtime(rt);
     }
 }

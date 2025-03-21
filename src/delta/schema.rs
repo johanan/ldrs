@@ -187,10 +187,9 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(TimestampNanosecondArray::from_vec(
-                    vec![1000000000, 2000000000, 3000000000],
-                    None,
-                )),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1000000000, 2000000000, 3000000000,
+                ])),
                 Arc::new(FixedSizeBinaryArray::from(vec![
                     &[0; 16],
                     Uuid::parse_str("c2beae0a-2f21-4f23-a5a2-94b68ed1c213")
