@@ -7,3 +7,16 @@ until docker exec postgres_test pg_isready -U postgres -d postgres; do
 done
 
 echo "Postgres ready"
+
+docker exec postgres_test psql -U postgres -d postgres -c "
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'test_role') THEN
+    CREATE ROLE test_role;
+  END IF;
+END
+\$\$;
+GRANT test_role TO postgres;
+
+GRANT ALL PRIVILEGES ON DATABASE postgres TO test_role;
+"
