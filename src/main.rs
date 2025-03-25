@@ -48,7 +48,7 @@ async fn load_postgres_cmd(
         .collect::<Vec<ParquetType>>();
 
     let stream = builder.with_batch_size(args.batch_size).build()?;
-    load_postgres(&mapped, &args.table, args.post_sql.clone(), &pg_url, stream).await?;
+    load_postgres(&mapped, &args.table, args.post_sql.clone(), &pg_url, args.role.clone(), stream).await?;
     Ok(())
 }
 

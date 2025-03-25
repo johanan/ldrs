@@ -27,6 +27,7 @@ pub struct LoadDefintion {
     pub rename_ddl: String,
     pub binary_ddl: String,
     pub post_sql: Option<String>,
+    pub role_sql: Option<String>,
 }
 impl LoadDefintion {
     pub fn create_batch(&self) -> String {
@@ -113,6 +114,7 @@ pub fn build_definition<'a>(
     full_table: &'a str,
     types: &[ParquetType<'a>],
     post_sql: Option<String>,
+    role: Option<String>,
 ) -> Result<LoadDefintion, anyhow::Error> {
     let (schema, table) = build_fqtn(full_table)?;
     let load_table = load_table_name(schema, table);
@@ -124,6 +126,7 @@ pub fn build_definition<'a>(
     let set_search_ddl = format!("SET search_path TO {};", schema);
     let rename_ddl = format!("ALTER TABLE {} rename to {};", load_table, table);
     let binary_ddl = format!("COPY {} FROM STDIN BINARY;", load_table);
+    let role_sql = role.map(|r| format!("SET ROLE {};", r));
     Ok(LoadDefintion {
         schema_ddl,
         drop_ddl,
@@ -133,6 +136,7 @@ pub fn build_definition<'a>(
         rename_ddl,
         binary_ddl,
         post_sql,
+        role_sql
     })
 }
 
@@ -144,6 +148,10 @@ pub async fn prepare_to_copy(
         .transaction()
         .await
         .with_context(|| "Could not create transaction")?;
+    // set role for the transaction
+    if let Some(sql) = &definition.role_sql {
+        tx.batch_execute(sql).await?;
+    }
     tx.batch_execute(&definition.create_batch())
         .await
         .with_context(|| "Could not create table")?;
@@ -168,6 +176,10 @@ pub async fn execute_binary_copy<'a>(
         .transaction()
         .await
         .with_context(|| "Could not create transaction")?;
+
+    if let Some(sql) = &definition.role_sql {
+        sink_tx.batch_execute(sql).await?;
+    }
 
     let sink = sink_tx
         .copy_in(&definition.binary_ddl)
@@ -244,9 +256,11 @@ pub async fn load_postgres<'a>(
     table: &str,
     post_sql: Option<String>,
     pg_url: &str,
+    role: Option<String>,
     stream: ParquetRecordBatchStream<ParquetObjectReader>,
 ) -> Result<(), anyhow::Error> {
-    let definition = build_definition(table, pq_types, post_sql)?;
+    
+    let definition = build_definition(table, pq_types, post_sql, role)?;
     info!("PG definition: {:?}", definition);
 
     let mut client = create_connection(pg_url).await?;
@@ -451,7 +465,7 @@ mod tests {
             ParquetType::Timestamp("created_at", TimeUnit::MILLIS(MilliSeconds {})),
         ];
 
-        let first_def = build_definition(full_table, &pq_types, None).unwrap();
+        let first_def = build_definition(full_table, &pq_types, None, None).unwrap();
         assert_eq!(first_def.schema_ddl, "CREATE SCHEMA IF NOT EXISTS public;");
         assert_eq!(
             first_def.drop_ddl,
@@ -496,9 +510,18 @@ mod tests {
         let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
         let stream = builder.with_batch_size(1024).build().unwrap();
 
-        load_postgres(&mapped, "not_public.users_test", None, pg_url, stream)
+        load_postgres(&mapped, "not_public.users_test", None, pg_url, Some(String::from("test_role")), stream)
             .await
             .unwrap();
+        
+        // check table owner
+        let client = create_connection(pg_url).await.unwrap();
+        let owner = client
+            .query_one("SELECT tableowner FROM pg_catalog.pg_tables WHERE schemaname = 'not_public' AND tablename = 'users_test'", &[])
+            .await
+            .unwrap();
+        assert_eq!(owner.get::<_, String>(0), "test_role");
+        
         // run it again to ensure the process can load a table that exists
         let post_sql = "CREATE INDEX ON not_public.users_test (unique_id); CREATE UNIQUE INDEX ON not_public.users_test (name);";
         let builder = builder_from_string(path, rt.handle().clone()).await.unwrap();
@@ -508,12 +531,12 @@ mod tests {
             "not_public.users_test",
             Some(post_sql.to_string()),
             pg_url,
+            None,
             stream,
         )
         .await
         .unwrap();
 
-        let client = create_connection(pg_url).await.unwrap();
         let row_count = client
             .query_one("select count(*) from not_public.users_test", &[])
             .await
@@ -527,6 +550,12 @@ mod tests {
             )
             .await
             .unwrap();
+        // should be user as no role is sent
+        let owner = client
+            .query_one("SELECT tableowner FROM pg_catalog.pg_tables WHERE schemaname = 'not_public' AND tablename = 'users_test'", &[])
+            .await
+            .unwrap();
+        assert_eq!(owner.get::<_, String>(0), "postgres");
         assert_eq!(2, check_indexes.get::<_, i64>(0));
         drop_runtime(rt);
     }
