@@ -136,7 +136,7 @@ pub fn build_definition<'a>(
         rename_ddl,
         binary_ddl,
         post_sql,
-        role_sql
+        role_sql,
     })
 }
 
@@ -259,7 +259,6 @@ pub async fn load_postgres<'a>(
     role: Option<String>,
     stream: ParquetRecordBatchStream<ParquetObjectReader>,
 ) -> Result<(), anyhow::Error> {
-    
     let definition = build_definition(table, pq_types, post_sql, role)?;
     info!("PG definition: {:?}", definition);
 
@@ -447,7 +446,6 @@ mod tests {
     use parquet::{basic::TimeUnit, format::MilliSeconds};
 
     use crate::parquet_provider::builder_from_string;
-    use crate::test_utils;
     use crate::{
         parquet_provider,
         pq::{self, get_fields, map_parquet_to_abstract},
@@ -492,12 +490,9 @@ mod tests {
         let cd = std::env::current_dir().unwrap();
         let path = format!("{}/test_data/public.users.snappy.parquet", cd.display());
         let rt = create_runtime();
-        let builder = parquet_provider::builder_from_string(
-            path.clone(),
-            rt.handle().clone(),
-        )
-        .await
-        .unwrap();
+        let builder = parquet_provider::builder_from_string(path.clone(), rt.handle().clone())
+            .await
+            .unwrap();
         let file_md = builder.metadata().file_metadata().clone();
         let kv = pq::get_kv_fields(&file_md);
 
@@ -510,10 +505,17 @@ mod tests {
         let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
         let stream = builder.with_batch_size(1024).build().unwrap();
 
-        load_postgres(&mapped, "not_public.users_test", None, pg_url, Some(String::from("test_role")), stream)
-            .await
-            .unwrap();
-        
+        load_postgres(
+            &mapped,
+            "not_public.users_test",
+            None,
+            pg_url,
+            Some(String::from("test_role")),
+            stream,
+        )
+        .await
+        .unwrap();
+
         // check table owner
         let client = create_connection(pg_url).await.unwrap();
         let owner = client
@@ -521,10 +523,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owner.get::<_, String>(0), "test_role");
-        
+
         // run it again to ensure the process can load a table that exists
         let post_sql = "CREATE INDEX ON not_public.users_test (unique_id); CREATE UNIQUE INDEX ON not_public.users_test (name);";
-        let builder = builder_from_string(path, rt.handle().clone()).await.unwrap();
+        let builder = builder_from_string(path, rt.handle().clone())
+            .await
+            .unwrap();
         let stream = builder.with_batch_size(1024).build().unwrap();
         load_postgres(
             &mapped,

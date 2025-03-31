@@ -69,9 +69,17 @@ impl<'a> AzureUrl {
     }
 
     pub fn get_delta_uri_options(&self) -> (String, HashMap<String, String>) {
-        (format!("azure://{}/{}", self.container, self.path), HashMap::from([
-            ("azure_storage_account_name".to_string(), self.storage_account.clone())
-        ]))
+        (
+            format!("azure://{}/{}", self.container, self.path),
+            HashMap::from([(
+                "azure_storage_account_name".to_string(),
+                self.storage_account.clone(),
+            )]),
+        )
+    }
+
+    pub fn get_url(&self) -> Url {
+        self.url.clone()
     }
 }
 
