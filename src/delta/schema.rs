@@ -132,7 +132,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use arrow_array::StringArray;
     use arrow_schema::DataType;
-    use chrono::NaiveDateTime;
 
     #[test]
     fn test_analyze_schema_conversions() {

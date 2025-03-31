@@ -1,10 +1,9 @@
 use anyhow::{Context, Error};
-use parquet::
-    arrow::{
-        arrow_reader::ArrowReaderBuilder,
-        async_reader::{AsyncReader, ParquetObjectReader},
-        ParquetRecordBatchStreamBuilder,
-    };
+use parquet::arrow::{
+    arrow_reader::ArrowReaderBuilder,
+    async_reader::{AsyncReader, ParquetObjectReader},
+    ParquetRecordBatchStreamBuilder,
+};
 use tokio::runtime::Handle;
 use tracing::info;
 use url::Url;

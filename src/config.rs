@@ -185,7 +185,7 @@ tables:
                     batch_size: 1024,
                     table: String::from("test_table"),
                     post_sql: None,
-                    role: None
+                    role: None,
                 }],
             };
             let args: ProcessedPGFileLoad = pg_file_load.try_into().unwrap();

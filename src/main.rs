@@ -11,7 +11,7 @@ mod test_utils;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
-use delta::DeltaLoad;
+use delta::{DeltaLoad, DeltaMerge};
 use parquet_provider::builder_from_string;
 use postgres::load_postgres;
 use pq::{get_fields, map_parquet_to_abstract, ParquetType};
@@ -22,6 +22,7 @@ enum Commands {
     Load(LoadArgs),
     PGConfig(PGFileLoadArgs),
     Delta(DeltaLoad),
+    Merge(DeltaMerge),
 }
 
 #[derive(Parser)]
@@ -48,7 +49,15 @@ async fn load_postgres_cmd(
         .collect::<Vec<ParquetType>>();
 
     let stream = builder.with_batch_size(args.batch_size).build()?;
-    load_postgres(&mapped, &args.table, args.post_sql.clone(), &pg_url, args.role.clone(), stream).await?;
+    load_postgres(
+        &mapped,
+        &args.table,
+        args.post_sql.clone(),
+        &pg_url,
+        args.role.clone(),
+        stream,
+    )
+    .await?;
     Ok(())
 }
 
@@ -101,6 +110,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
         Commands::Delta(args) => delta::delta_run(&args, rt.handle().clone()).await,
+        Commands::Merge(args) => delta::delta_merge(&args, rt.handle().clone()).await,
     };
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 

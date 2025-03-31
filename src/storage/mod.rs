@@ -25,7 +25,7 @@ pub fn base_or_relative_path(path: &str) -> Result<Url, anyhow::Error> {
     }
 }
 
-pub enum StorageProvider{
+pub enum StorageProvider {
     Azure(azure::AzureUrl),
     Local(Url, object_store::path::Path),
 }
@@ -72,6 +72,15 @@ impl StorageProvider {
                 let options = std::collections::HashMap::new();
                 (url.to_string(), options)
             }
+        }
+    }
+
+    /// Returns the URL of the storage provider
+    /// that was used to create the object store
+    pub fn get_url(&self) -> Url {
+        match self {
+            StorageProvider::Azure(azure) => azure.get_url(),
+            StorageProvider::Local(url, _) => url.clone(),
         }
     }
 }
