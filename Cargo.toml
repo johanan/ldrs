@@ -1,6 +1,6 @@
 [package]
 name = "ldrs"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 repository = "https://github.com/johanan/ldrs"
 authors = ["Joshua Johanan"]
@@ -21,6 +21,7 @@ bigdecimal = "0.4.7"
 chrono = "0.4.39"
 clap = { version = "4.5.27", features = ["derive"] }
 deltalake = { version = "0.25.0", features = ["datafusion","azure"] }
+dotenvy = "0.15.7"
 futures = "0.3.31"
 native-tls = { version = "0.2.13", features = ["vendored"] }
 object_store = "0.11.2"
