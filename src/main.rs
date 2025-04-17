@@ -1,18 +1,11 @@
-mod delta;
-mod ldrs_postgres;
-mod parquet_provider;
-mod pq;
-mod storage;
-
-#[cfg(test)]
-mod test_utils;
-
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use delta::{DeltaLoad, DeltaMerge};
 use dotenvy::dotenv;
-use ldrs_postgres::{
-    config::{LoadArgs, PGFileLoadArgs}, load_from_file, load_postgres_cmd
+use ldrs::delta::{delta_merge, delta_run, DeltaLoad, DeltaMerge};
+use ldrs::ldrs_arrow::{mvr_to_stream, peek_arrow_stream, print_arrow_ipc_batches, ArrowIpcStreamArgs};
+use ldrs::ldrs_postgres::{
+    config::{LoadArgs, PGFileLoadArgs},
+    load_from_file, load_postgres_cmd,
 };
 use tracing::info;
 
@@ -22,6 +15,7 @@ enum Commands {
     PGConfig(PGFileLoadArgs),
     Delta(DeltaLoad),
     Merge(DeltaMerge),
+    Mvr(ArrowIpcStreamArgs),
 }
 
 #[derive(Parser)]
@@ -58,8 +52,20 @@ async fn main() -> Result<(), anyhow::Error> {
                 Err(e) => Err(e),
             }
         }
-        Commands::Delta(args) => delta::delta_run(&args, rt.handle().clone()).await,
-        Commands::Merge(args) => delta::delta_merge(&args, rt.handle().clone()).await,
+        Commands::Delta(args) => delta_run(&args, rt.handle().clone()).await,
+        Commands::Merge(args) => delta_merge(&args, rt.handle().clone()).await,
+        Commands::Mvr(args) => {
+            let result = mvr_to_stream(&args.full_table).await?;
+            let (schema, stream) = peek_arrow_stream(result.stream).await?;
+            info!("Schema: {:?}", schema);
+            print_arrow_ipc_batches(stream).await?;
+
+            match result.command_handle.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(anyhow::anyhow!("Command failed: {}", e)),
+                Err(e) => Err(anyhow::anyhow!("Command task panicked: {}", e)),
+            }
+        }
     };
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 

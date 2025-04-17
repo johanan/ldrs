@@ -25,7 +25,7 @@ use schema::{analyze_schema_conversions, convert_batch, map_convert_schema, Colu
 use serde::Deserialize;
 use tracing::info;
 
-use crate::pq::{get_fields, get_kv_fields, map_parquet_to_abstract, ParquetType};
+use crate::{pq::{get_fields, get_kv_fields, map_parquet_to_abstract}, types::ColumnSchema};
 use crate::{parquet_provider::builder_from_string, storage::StorageProvider};
 use deltalake::azure::register_handlers;
 
@@ -129,7 +129,7 @@ fn get_schema(
     let mapped = fields
         .iter()
         .filter_map(|pq| map_parquet_to_abstract(pq, &kv))
-        .collect::<Vec<ParquetType>>();
+        .collect::<Vec<ColumnSchema>>();
 
     schema_from_parquet(mapped)
 }
@@ -165,17 +165,17 @@ async fn ensure_table(
     Ok(table)
 }
 
-fn map_parquet_to_delta(pq_col: &ParquetType) -> Result<StructField, anyhow::Error> {
+fn map_parquet_to_delta(pq_col: &ColumnSchema) -> Result<StructField, anyhow::Error> {
     match *pq_col {
-        ParquetType::Timestamp(name, _) => {
+        ColumnSchema::Timestamp(name, _) => {
             Ok(StructField::new(name, DataType::TIMESTAMP_NTZ, true))
         }
-        ParquetType::TimestampTz(name, _) => Ok(StructField::new(name, DataType::TIMESTAMP, true)),
-        ParquetType::Uuid(name) => Ok(StructField::new(name, DataType::STRING, true)
+        ColumnSchema::TimestampTz(name, _) => Ok(StructField::new(name, DataType::TIMESTAMP, true)),
+        ColumnSchema::Uuid(name) => Ok(StructField::new(name, DataType::STRING, true)
             .with_metadata([("parquet_type", "UUID")])),
-        ParquetType::Jsonb(name) => Ok(StructField::new(name, DataType::STRING, true)
+        ColumnSchema::Jsonb(name) => Ok(StructField::new(name, DataType::STRING, true)
             .with_metadata([("parquet_type", "JSONB")])),
-        ParquetType::Numeric(name, precision, scale) => {
+        ColumnSchema::Numeric(name, precision, scale) => {
             let precision = precision
                 .to_u8()
                 .ok_or_else(|| anyhow::anyhow!("precision too large"))?;
@@ -186,23 +186,23 @@ fn map_parquet_to_delta(pq_col: &ParquetType) -> Result<StructField, anyhow::Err
                 .with_context(|| "Could not create decimal column type")?;
             Ok(StructField::new(name, dec, true))
         }
-        ParquetType::Varchar(name, length) => {
+        ColumnSchema::Varchar(name, length) => {
             let length = length
                 .to_u32()
                 .ok_or_else(|| anyhow::anyhow!("length too large"))?;
             Ok(StructField::new(name, DataType::STRING, true)
                 .with_metadata([("parquet_type", "VARCHAR"), ("length", &length.to_string())]))
         }
-        ParquetType::Text(name) => Ok(StructField::new(name, DataType::STRING, true)),
-        ParquetType::Integer(name) => Ok(StructField::new(name, DataType::INTEGER, true)),
-        ParquetType::BigInt(name) => Ok(StructField::new(name, DataType::LONG, true)),
-        ParquetType::Real(name) => Ok(StructField::new(name, DataType::FLOAT, true)),
-        ParquetType::Double(name) => Ok(StructField::new(name, DataType::DOUBLE, true)),
-        ParquetType::Boolean(name) => Ok(StructField::new(name, DataType::BOOLEAN, true)),
+        ColumnSchema::Text(name) => Ok(StructField::new(name, DataType::STRING, true)),
+        ColumnSchema::Integer(name) => Ok(StructField::new(name, DataType::INTEGER, true)),
+        ColumnSchema::BigInt(name) => Ok(StructField::new(name, DataType::LONG, true)),
+        ColumnSchema::Real(name) => Ok(StructField::new(name, DataType::FLOAT, true)),
+        ColumnSchema::Double(name) => Ok(StructField::new(name, DataType::DOUBLE, true)),
+        ColumnSchema::Boolean(name) => Ok(StructField::new(name, DataType::BOOLEAN, true)),
     }
 }
 
-pub fn schema_from_parquet(pq: Vec<ParquetType>) -> Result<StructType, anyhow::Error> {
+pub fn schema_from_parquet(pq: Vec<ColumnSchema>) -> Result<StructType, anyhow::Error> {
     let fields = pq
         .iter()
         .map(map_parquet_to_delta)
