@@ -1,4 +1,10 @@
-use std::{pin::{pin, Pin}, process::Stdio, vec};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::{pin, Pin},
+    process::Stdio,
+    vec,
+};
 
 use anyhow::Context;
 use arrow::ipc::reader::StreamReader;
@@ -11,8 +17,9 @@ use parquet::format::{MicroSeconds, NanoSeconds};
 use tokio::{process::Command, task};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::SyncIoBridge;
+use tracing::{debug, info};
 
-use crate::types::ColumnSchema;
+use crate::types::{ColumnDefintion, ColumnSchema};
 
 #[derive(Args, Debug)]
 pub struct ArrowIpcStreamArgs {
@@ -46,47 +53,48 @@ fn map_arrow_time_to_pq_time(time_unit: &arrow_schema::TimeUnit) -> parquet::bas
     }
 }
 
-pub fn map_to_pq_types<'a>(arrow_field: &'a FieldRef) -> Option<ColumnSchema<'a>> {
-    match arrow_field.data_type() {
-        arrow_schema::DataType::Utf8 => Some(ColumnSchema::Text(arrow_field.name())),
-        arrow_schema::DataType::Timestamp(time_unit, tz) => match tz {
-            Some(_) => Some(ColumnSchema::TimestampTz(
-                arrow_field.name(),
-                map_arrow_time_to_pq_time(time_unit),
-            )),
-            None => Some(ColumnSchema::Timestamp(
-                arrow_field.name(),
-                map_arrow_time_to_pq_time(time_unit),
-            )),
-        },
-        arrow_schema::DataType::Int64 => Some(ColumnSchema::BigInt(arrow_field.name())),
-        arrow_schema::DataType::Int32 => Some(ColumnSchema::Integer(arrow_field.name())),
-        arrow_schema::DataType::Float64 => Some(ColumnSchema::Double(arrow_field.name())),
-        arrow_schema::DataType::Float32 => Some(ColumnSchema::Real(arrow_field.name())),
-        arrow_schema::DataType::Boolean => Some(ColumnSchema::Boolean(arrow_field.name())),
-        arrow_schema::DataType::Binary => Some(ColumnSchema::Text(arrow_field.name())),
-        arrow_schema::DataType::Date32 => Some(ColumnSchema::Integer(arrow_field.name())),
-        _ => None,
-    }
-}
-
-pub struct MvrStreamResult<S> {
-    pub stream: S,
+/// Struct to hold the result of the mvr_to_stream function
+///
+/// If the command fails, the command_handle will return an error
+/// but the batch_stream and schema_stream will still be valid.
+/// The schema will have to be checked to see if there are any fields.
+/// No fields means the command failed and the underlying error should be
+/// checked from the command_handle.
+pub struct MvrStreamResult<B, S> {
+    pub batch_stream: B,
+    pub schema_stream: S,
     pub command_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
 }
 
-pub async fn mvr_to_stream(full_table: &str) -> Result<
+pub async fn mvr_to_stream(
+    full_table: &str,
+) -> Result<
     MvrStreamResult<
         impl futures::TryStream<Ok = RecordBatch, Error = arrow::error::ArrowError> + Send,
+        impl Future<Output = Option<arrow_schema::SchemaRef>> + Send,
     >,
     anyhow::Error,
 > {
     let mut cmd = Command::new("mvr");
-    let args = vec!["mv", "--format", "arrow", "--name", full_table, "-d"];
+    let args = vec![
+        "mv",
+        "--format",
+        "arrow",
+        "--name",
+        full_table,
+        "-d",
+        "--quiet",
+        "--batch-size",
+        "1024",
+    ];
+
+    let cmd = cmd.args(args);
+    // log the command for debugging
+    info!("Running command: {:?}", cmd);
 
     cmd.env("MVR_DEST", "stdout://");
 
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
@@ -103,17 +111,25 @@ pub async fn mvr_to_stream(full_table: &str) -> Result<
         .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let (schema_tx, schema_rx) = tokio::sync::oneshot::channel();
+
     task::spawn_blocking(move || {
         let sync_reader = SyncIoBridge::new(stdout);
         let buf_reader = std::io::BufReader::new(sync_reader);
         let mut stream_reader = StreamReader::try_new(buf_reader, None)
             .with_context(|| "Failed to create StreamReader")?;
 
+        let schema = stream_reader.schema();
+        if schema_tx.send(schema).is_err() {
+            // The receiver was dropped before we could send
+            return Err(anyhow::anyhow!("Failed to send schema: receiver dropped"));
+        }
+
         while let Some(batch_result) = stream_reader.next() {
-            println!("Processing batch");
-            // If send fails (receiver dropped), stop processing
+            debug!("Processing batch");
+            // get the error from blocking_send
             if tx.blocking_send(batch_result).is_err() {
-                break;
+                return Err(anyhow::anyhow!("Failed to send batch"));
             }
         }
 
@@ -138,39 +154,59 @@ pub async fn mvr_to_stream(full_table: &str) -> Result<
         Ok(())
     });
 
-    let stream = ReceiverStream::new(rx).map(|result| result);
+    let batch_stream = ReceiverStream::new(rx).map(|result| result);
+    let schema_future = async move {
+        match schema_rx.await {
+            Ok(schema) => {
+                // Return None for empty schemas (error indicator)
+                if schema.fields().is_empty() {
+                    None
+                } else {
+                    Some(schema)
+                }
+            }
+            Err(_) => None,
+        }
+    };
+
     Ok(MvrStreamResult {
-        stream,
+        batch_stream,
+        schema_stream: schema_future,
         command_handle,
     })
 }
 
-pub async fn peek_arrow_stream<S>(
-    stream: S,
-) -> Result<(
-    arrow_schema::SchemaRef,
-    impl futures::TryStream<Ok = RecordBatch, Error = S::Error> + Send,
-), anyhow::Error>
-where
-    S: futures::TryStream<Ok = RecordBatch, Error = arrow::error::ArrowError> + Send + 'static,
-{
-    use futures::{StreamExt, TryStreamExt};
-
-    let mut stream = Box::pin(stream.into_stream());
-    // Get the first batch
-    let first_batch_result = stream.next().await
-        .ok_or_else(|| anyhow::anyhow!("Arrow IPC stream contained no batches"))?;
-    
-    // Check if the first batch is valid
-    let first_batch = first_batch_result
-        .map_err(|e| anyhow::anyhow!("Error reading first batch: {}", e))?;
-    
-    // Clone the schema so we fully own it
-    let schema = first_batch.schema();
-    
-    // Create a stream starting with first batch, followed by the rest
-    let first_batch_stream = futures::stream::once(async move { Ok(first_batch) });
-    let combined_stream = first_batch_stream.chain(stream);
-    
-    Ok((schema, combined_stream))
+pub fn map_arrow_to_abstract<'a>(
+    field: &'a FieldRef,
+    user_defs: &HashMap<String, String>,
+) -> Option<ColumnSchema<'a>> {
+    let name = field.name();
+    match field.data_type() {
+        arrow_schema::DataType::Utf8 => Some(ColumnSchema::Text(name)),
+        arrow_schema::DataType::Timestamp(time_unit, tz) => match tz {
+            Some(_) => Some(ColumnSchema::TimestampTz(
+                name,
+                map_arrow_time_to_pq_time(time_unit),
+            )),
+            None => Some(ColumnSchema::Timestamp(
+                name,
+                map_arrow_time_to_pq_time(time_unit),
+            )),
+        },
+        arrow_schema::DataType::Int16 => Some(ColumnSchema::SmallInt(name)),
+        arrow_schema::DataType::Int64 => Some(ColumnSchema::BigInt(name)),
+        arrow_schema::DataType::Int32 => Some(ColumnSchema::Integer(name)),
+        arrow_schema::DataType::Float64 => Some(ColumnSchema::Double(name)),
+        arrow_schema::DataType::Float32 => Some(ColumnSchema::Real(name)),
+        arrow_schema::DataType::Boolean => Some(ColumnSchema::Boolean(name)),
+        arrow_schema::DataType::Binary => Some(ColumnSchema::Text(name)),
+        arrow_schema::DataType::Date32 => Some(ColumnSchema::Integer(name)),
+        arrow_schema::DataType::FixedSizeBinary(16) => Some(ColumnSchema::Uuid(name)),
+        arrow_schema::DataType::Decimal128(precision, scale) => Some(ColumnSchema::Numeric(
+            name,
+            (*precision).into(),
+            (*scale).into(),
+        )),
+        _ => None,
+    }
 }

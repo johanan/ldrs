@@ -10,17 +10,17 @@ use arrow_array::RecordBatch;
 use bigdecimal::FromPrimitive;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
+use futures::StreamExt;
 use futures::TryStreamExt;
 use native_tls::TlsConnector;
 use pg_bigdecimal::{BigDecimal, BigInt};
 use postgres_native_tls::MakeTlsConnector;
 use postgres_types::{to_sql_checked, ToSql, Type};
 use serde_json::Value;
-use std::pin::Pin;
 use std::pin::pin;
+use std::pin::Pin;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tracing::{debug, info};
-use futures::StreamExt;
 
 #[derive(Debug)]
 pub struct LoadDefintion {
@@ -81,6 +81,7 @@ pub fn build_ddl(load_table: String, fields: &[String]) -> String {
 
 pub fn map_parquet_to_ddl(pq: &ColumnSchema) -> String {
     match pq {
+        ColumnSchema::SmallInt(name) => format!("{} smallint", name),
         ColumnSchema::BigInt(name) => format!("{} bigint", name),
         ColumnSchema::Boolean(name) => format!("{} boolean", name),
         ColumnSchema::Double(name) => format!("{} double precision", name),
@@ -100,6 +101,7 @@ pub fn map_parquet_to_ddl(pq: &ColumnSchema) -> String {
 
 pub fn map_parquet_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
     match pq {
+        ColumnSchema::SmallInt(_) => postgres_types::Type::INT2,
         ColumnSchema::BigInt(_) => postgres_types::Type::INT8,
         ColumnSchema::Boolean(_) => postgres_types::Type::BOOL,
         ColumnSchema::Double(_) => postgres_types::Type::FLOAT8,
@@ -173,36 +175,35 @@ pub async fn process_record_batch<'a>(
 ) -> Result<(), anyhow::Error> {
     let num_rows = batch.num_rows();
     let columns = batch.columns();
-    
+
     // Create TypedColumnAccessor for each column
-    let accessors: Vec<TypedColumnAccessor> = 
+    let accessors: Vec<TypedColumnAccessor> =
         columns.iter().map(TypedColumnAccessor::new).collect();
 
     let mut batch_buffer = Vec::<Vec<PgTypedValue>>::with_capacity(num_rows);
-    
+
     // Process each row
     for row_idx in 0..num_rows {
         // Create PgTypedValue for each column in this row
         let row_values: Vec<PgTypedValue> = accessors
             .iter()
             .zip(parquet_types)
-            .map(|(accessor, parquet_type)| {
-                PgTypedValue::new(accessor, row_idx, parquet_type)
-            })
+            .map(|(accessor, parquet_type)| PgTypedValue::new(accessor, row_idx, parquet_type))
             .collect();
-        
+
         batch_buffer.push(row_values);
     }
 
     for row in batch_buffer.iter() {
-        let refs: Vec<&(dyn ToSql + Sync)> = row
-            .iter()
-            .map(|val| val as &(dyn ToSql + Sync))
-            .collect();
-        writer.as_mut().write(&refs).await
+        let refs: Vec<&(dyn ToSql + Sync)> =
+            row.iter().map(|val| val as &(dyn ToSql + Sync)).collect();
+        writer
+            .as_mut()
+            .write(&refs)
+            .await
             .with_context(|| "Failed to write row to PostgreSQL")?;
     }
-    
+
     Ok(())
 }
 
@@ -245,11 +246,13 @@ where
             Ok(b) => b,
             Err(e) => return Err(anyhow::anyhow!("Stream error: {}", e)),
         };
-        
+
         process_record_batch(&mut pinned_writer, &batch, columns).await?;
     }
 
-    pinned_writer.finish().await
+    pinned_writer
+        .finish()
+        .await
         .with_context(|| "Could not finish copy")?;
 
     sink_tx.batch_execute(&definition.rename_and_move()).await?;
@@ -312,6 +315,23 @@ pub async fn load_postgres_cmd(
     Ok(())
 }
 
+pub async fn load_postgres_from_arrow<'a, S, E>(
+    schema: Vec<ColumnSchema<'a>>,
+    stream: S,
+) -> Result<(), anyhow::Error>
+where
+    S: futures::TryStream<Ok = RecordBatch, Error = E> + Send,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let pg_url = std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set")?;
+    let table = "public.users_arrow";
+    let post_sql = None;
+    let role = None;
+
+    load_postgres(&schema, table, post_sql, &pg_url, role, stream).await?;
+    Ok(())
+}
+
 pub async fn load_from_file(
     args: PGFileLoadArgs,
     pg_url: String,
@@ -365,17 +385,12 @@ impl<'a> ToSql for PgTypedValue<'a> {
     ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
         // Use the ParquetType to determine the semantic meaning
         match self.accessor {
+            TypedColumnAccessor::Int16(_) => self.accessor.Int16(self.row_idx).to_sql(ty, out),
             TypedColumnAccessor::Int32(_) => self.accessor.Int32(self.row_idx).to_sql(ty, out),
             TypedColumnAccessor::Int64(_) => self.accessor.Int64(self.row_idx).to_sql(ty, out),
-            TypedColumnAccessor::Float32(_) => {
-                self.accessor.Float32(self.row_idx).to_sql(ty, out)
-            }
-            TypedColumnAccessor::Float64(_) => {
-                self.accessor.Float64(self.row_idx).to_sql(ty, out)
-            }
-            TypedColumnAccessor::Boolean(_) => {
-                self.accessor.Boolean(self.row_idx).to_sql(ty, out)
-            }
+            TypedColumnAccessor::Float32(_) => self.accessor.Float32(self.row_idx).to_sql(ty, out),
+            TypedColumnAccessor::Float64(_) => self.accessor.Float64(self.row_idx).to_sql(ty, out),
+            TypedColumnAccessor::Boolean(_) => self.accessor.Boolean(self.row_idx).to_sql(ty, out),
             TypedColumnAccessor::Decimal128(_, _, scale) => {
                 self.accessor
                     .Decimal128(self.row_idx)

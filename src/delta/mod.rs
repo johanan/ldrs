@@ -25,8 +25,11 @@ use schema::{analyze_schema_conversions, convert_batch, map_convert_schema, Colu
 use serde::Deserialize;
 use tracing::info;
 
-use crate::{pq::{get_fields, get_kv_fields, map_parquet_to_abstract}, types::ColumnSchema};
 use crate::{parquet_provider::builder_from_string, storage::StorageProvider};
+use crate::{
+    pq::{get_fields, get_kv_fields, map_parquet_to_abstract},
+    types::ColumnSchema,
+};
 use deltalake::azure::register_handlers;
 
 #[derive(Args, Deserialize, Debug)]
@@ -195,6 +198,7 @@ fn map_parquet_to_delta(pq_col: &ColumnSchema) -> Result<StructField, anyhow::Er
         }
         ColumnSchema::Text(name) => Ok(StructField::new(name, DataType::STRING, true)),
         ColumnSchema::Integer(name) => Ok(StructField::new(name, DataType::INTEGER, true)),
+        ColumnSchema::SmallInt(name) => Ok(StructField::new(name, DataType::SHORT, true)),
         ColumnSchema::BigInt(name) => Ok(StructField::new(name, DataType::LONG, true)),
         ColumnSchema::Real(name) => Ok(StructField::new(name, DataType::FLOAT, true)),
         ColumnSchema::Double(name) => Ok(StructField::new(name, DataType::DOUBLE, true)),

@@ -1,20 +1,14 @@
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray
+    Array, ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use futures::TryStream;
 use serde::{Deserialize, Serialize};
 
 use crate::types::ColumnSchema;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ColumnDefinition {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub ty: String,
-    pub len: i32,
-}
 
 macro_rules! define_column_accessor {
     ($(($variant:ident, $array_type:ty, $value_type:ty)),*) => {
@@ -74,6 +68,7 @@ macro_rules! define_column_accessor {
 // Use the macro
 define_column_accessor!(
     (Boolean, BooleanArray, bool),
+    (Int16, Int16Array, i16),
     (Int32, Int32Array, i32),
     (Int64, Int64Array, i64),
     (Float32, Float32Array, f32),

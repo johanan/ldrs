@@ -3,9 +3,7 @@
 use arrow::array::{Decimal128Builder, GenericStringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use arrow_array::{
-    Int32Array, TimestampMicrosecondArray, TimestampMillisecondArray,
-};
+use arrow_array::{Int32Array, TimestampMicrosecondArray, TimestampMillisecondArray};
 use arrow_schema::TimeUnit;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use ldrs::arrow_access::TypedColumnAccessor;
@@ -95,9 +93,7 @@ enum UnionType<'a> {
     Decimal128(Option<i128>),
 }
 
-fn typed_accessor_approach(
-    batch: &RecordBatch,
-) -> Vec<Vec<UnionType<'_>>> {
+fn typed_accessor_approach(batch: &RecordBatch) -> Vec<Vec<UnionType<'_>>> {
     let columns = batch.columns();
     let num_rows = batch.num_rows();
 
@@ -114,15 +110,15 @@ fn typed_accessor_approach(
             let value = match accessor {
                 TypedColumnAccessor::Int32(arr) => UnionType::Int32(accessor.Int32(row)),
                 TypedColumnAccessor::Utf8(arr) => UnionType::Utf8(accessor.Utf8(row)),
-                TypedColumnAccessor::TimestampMillisecond(arr, _) => UnionType::Int64(
-                    accessor.TimestampMillisecond(row),
-                ),
-                TypedColumnAccessor::TimestampMicrosecond(arr, _) => UnionType::Int64(
-                    accessor.TimestampMicrosecond(row),
-                ),
-                TypedColumnAccessor::Decimal128(arr, _, _) => UnionType::Decimal128(
-                    accessor.Decimal128(row),
-                ),
+                TypedColumnAccessor::TimestampMillisecond(arr, _) => {
+                    UnionType::Int64(accessor.TimestampMillisecond(row))
+                }
+                TypedColumnAccessor::TimestampMicrosecond(arr, _) => {
+                    UnionType::Int64(accessor.TimestampMicrosecond(row))
+                }
+                TypedColumnAccessor::Decimal128(arr, _, _) => {
+                    UnionType::Decimal128(accessor.Decimal128(row))
+                }
                 _ => continue,
             };
             row_values.push(value);

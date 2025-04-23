@@ -1,18 +1,10 @@
-use std::sync::Arc;
 use parquet::basic::LogicalType;
 use parquet::file::metadata::FileMetaData;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-use crate::types::ColumnSchema;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ColumnDefintion {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub ty: String,
-    pub len: i32,
-}
+use crate::types::{ColumnDefintion, ColumnSchema};
 
 pub fn get_fields(
     metadata: &parquet::file::metadata::FileMetaData,
@@ -58,7 +50,7 @@ pub fn map_parquet_to_abstract<'a>(
                             .find(|cd| cd.name == name)
                             .and_then(|cd| {
                                 if cd.ty == "VARCHAR" {
-                                    Some(ColumnSchema::Varchar(name, cd.len))
+                                    Some(ColumnSchema::Varchar(name, cd.length))
                                 } else {
                                     None
                                 }

@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 /// Maps a Parquet schema’s type to a corresponding PostgreSQL type. PostgreSQL types are used as
 /// the abstract representation of the Parquet schema.
 ///
@@ -43,7 +45,16 @@ pub enum ColumnSchema<'a> {
     Numeric(&'a str, i32, i32),
     Real(&'a str),
     Double(&'a str),
+    SmallInt(&'a str),
     Integer(&'a str),
     BigInt(&'a str),
     Boolean(&'a str),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ColumnDefintion {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub length: i32,
 }
