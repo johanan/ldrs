@@ -1,10 +1,11 @@
 pub mod config;
 pub mod mvr_config;
-
 use crate::arrow_access::TypedColumnAccessor;
+use crate::ldrs_arrow::map_arrow_to_abstract;
+use crate::ldrs_arrow::mvr_to_stream;
 use crate::parquet_provider::builder_from_string;
 use crate::pq::get_column_schema;
-use crate::types::ColumnSchema;
+use crate::types::{ColumnSchema, MvrColumn};
 use anyhow::Context;
 use arrow::datatypes::ArrowNativeType;
 use arrow_array::RecordBatch;
@@ -13,6 +14,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
 use futures::StreamExt;
 use futures::TryStreamExt;
+use mvr_config::{load_config, MvrConfig};
 use native_tls::TlsConnector;
 use pg_bigdecimal::{BigDecimal, BigInt};
 use postgres_native_tls::MakeTlsConnector;
@@ -318,23 +320,6 @@ pub async fn load_postgres_cmd(
     Ok(())
 }
 
-pub async fn load_postgres_from_arrow<'a, S, E>(
-    schema: Vec<ColumnSchema<'a>>,
-    stream: S,
-) -> Result<(), anyhow::Error>
-where
-    S: futures::TryStream<Ok = RecordBatch, Error = E> + Send,
-    E: std::error::Error + Send + Sync + 'static,
-{
-    let pg_url = std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set")?;
-    let table = "public.users_arrow";
-    let post_sql = None;
-    let role = None;
-
-    load_postgres(&schema, table, post_sql, &pg_url, role, stream).await?;
-    Ok(())
-}
-
 pub async fn load_from_file(
     args: PGFileLoadArgs,
     pg_url: String,
@@ -353,6 +338,61 @@ pub async fn load_from_file(
         let task_start = std::time::Instant::now();
         info!("Running task: {}/{}", i + 1, total_tasks);
         load_postgres_cmd(pg_load, pg_url.clone(), handle.clone()).await?;
+        let task_end = std::time::Instant::now();
+        info!("Task time: {:?}", task_end - task_start);
+    }
+    Ok(())
+}
+
+/// Load data into PostgreSQL using MVR configuration file
+///
+/// This function reads an MVR configuration file, processes each configuration item,
+/// executes the SQL query in each, and loads the resulting data into PostgreSQL tables.
+/// It handles the full workflow from MVR config to data loading.
+///
+/// # Arguments
+///
+/// * `args` - MVR configuration including file path and optional overrides
+/// * `pg_url` - PostgreSQL connection URL
+///
+/// # Returns
+///
+/// * `Result<(), anyhow::Error>`
+pub async fn load_from_mvr_config(args: MvrConfig, pg_url: String) -> Result<(), anyhow::Error> {
+    let tables = load_config(&args)?;
+    let total_tasks = tables.len();
+    for (i, config) in tables.iter().enumerate() {
+        let task_start = std::time::Instant::now();
+        info!("Running task: {}/{}", i + 1, total_tasks);
+        let mvr_arrow = mvr_to_stream(&config.sql, &config.columns).await?;
+        let schema = mvr_arrow.schema_stream.await;
+
+        match schema {
+            Some(schema) => {
+                let mapped = schema
+                    .fields()
+                    .iter()
+                    .filter_map(map_arrow_to_abstract)
+                    .collect::<Vec<_>>();
+                load_postgres(
+                    &mapped,
+                    &config.table,
+                    config.post_sql.clone(),
+                    &pg_url,
+                    config.role.clone(),
+                    mvr_arrow.batch_stream,
+                )
+                .await?
+            }
+            None => {
+                info!("No schema found. Most likely mvr failed.");
+            }
+        }
+        match mvr_arrow.command_handle.await {
+            Ok(Ok(())) => (), // Command completed successfully
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Command failed: {}", e)),
+            Err(e) => return Err(anyhow::anyhow!("Command task panicked: {}", e)),
+        }
         let task_end = std::time::Instant::now();
         info!("Task time: {:?}", task_end - task_start);
     }
@@ -450,10 +490,11 @@ impl<'a> ToSql for PgTypedValue<'a> {
                 .Date32(self.row_idx)
                 .map(|d| {
                     //chrono::NaiveDate::from_ymd(1970, 1, 1) + chrono::Duration::days(d.into())
-                    chrono::NaiveDate::from_num_days_from_ce_opt(719163 + d).expect("Failed to parse date")
+                    chrono::NaiveDate::from_num_days_from_ce_opt(719163 + d)
+                        .expect("Failed to parse date")
                 })
                 .to_sql(ty, out),
-            
+
             // string types
             TypedColumnAccessor::Utf8(_) => match self.col_schema {
                 ColumnSchema::Jsonb(_) => self

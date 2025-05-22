@@ -21,12 +21,6 @@ use tracing::{debug, info};
 
 use crate::types::{ColumnDefintion, ColumnSchema, MvrColumn};
 
-#[derive(Args, Debug)]
-pub struct ArrowIpcStreamArgs {
-    #[arg(short, long)]
-    pub full_table: String,
-}
-
 pub async fn print_arrow_ipc_batches<S>(stream: S) -> Result<(), anyhow::Error>
 where
     S: futures::TryStream<Ok = RecordBatch, Error = arrow::error::ArrowError> + Send,
@@ -68,7 +62,7 @@ pub struct MvrStreamResult<B, S> {
 
 pub async fn mvr_to_stream(
     sql: &str,
-    columns: Option<Vec<MvrColumn>>,
+    columns: &Vec<MvrColumn>,
 ) -> Result<
     MvrStreamResult<
         impl futures::TryStream<Ok = RecordBatch, Error = arrow::error::ArrowError> + Send,
@@ -78,7 +72,7 @@ pub async fn mvr_to_stream(
 > {
     let mut cmd = Command::new("mvr");
     let column_json =
-        serde_json::to_string(&columns).with_context(|| "Failed to serialize columns to JSON")?;
+        serde_json::to_string(columns).with_context(|| "Failed to serialize columns to JSON")?;
     let args = vec![
         "mv",
         "--format",

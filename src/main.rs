@@ -1,17 +1,14 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
-use futures::FutureExt;
 use ldrs::delta::{delta_merge, delta_run, DeltaLoad, DeltaMerge};
-use ldrs::ldrs_arrow::{
-    map_arrow_to_abstract, mvr_to_stream, print_arrow_ipc_batches, ArrowIpcStreamArgs,
-};
-use ldrs::ldrs_postgres::load_postgres_from_arrow;
+use ldrs::ldrs_arrow::{map_arrow_to_abstract, mvr_to_stream};
+use ldrs::ldrs_postgres::load_from_mvr_config;
+use ldrs::ldrs_postgres::mvr_config::MvrConfig;
 use ldrs::ldrs_postgres::{
     config::{LoadArgs, PGFileLoadArgs},
     load_from_file, load_postgres_cmd,
 };
-use tokio_stream::StreamExt;
 use tracing::info;
 
 #[derive(Subcommand)]
@@ -20,7 +17,7 @@ enum Commands {
     PGConfig(PGFileLoadArgs),
     Delta(DeltaLoad),
     Merge(DeltaMerge),
-    Mvr(ArrowIpcStreamArgs),
+    Mvr(MvrConfig),
 }
 
 #[derive(Parser)]
@@ -67,30 +64,9 @@ fn main() -> Result<(), anyhow::Error> {
             Commands::Delta(args) => delta_run(&args, rt.handle().clone()).await,
             Commands::Merge(args) => delta_merge(&args, rt.handle().clone()).await,
             Commands::Mvr(args) => {
-                let result = mvr_to_stream(&args.full_table).await?;
-
-                let schema = result.schema_stream.await;
-                match schema {
-                    Some(schema) => {
-                        let mapped = schema
-                            .fields()
-                            .iter()
-                            .filter_map(map_arrow_to_abstract)
-                            .collect::<Vec<_>>();
-                        info!("Schema: {:?}", schema);
-                        info!("Mapped: {:?}", mapped);
-                        load_postgres_from_arrow(mapped, result.batch_stream).await?;
-                        //print_arrow_ipc_batches(result.batch_stream).await?;
-                    }
-                    None => {
-                        info!("No schema found. Most likely mvr failed.");
-                    }
-                }
-
-                match result.command_handle.await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(anyhow::anyhow!("Command failed: {}", e)),
-                    Err(e) => Err(anyhow::anyhow!("Command task panicked: {}", e)),
+                match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
+                    Ok(pg_url) => load_from_mvr_config(args, pg_url).await,
+                    Err(e) => Err(e),
                 }
             }
         }
