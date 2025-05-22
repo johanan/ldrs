@@ -1,25 +1,27 @@
 pub mod config;
-
+pub mod mvr_config;
+use crate::arrow_access::TypedColumnAccessor;
+use crate::ldrs_arrow::map_arrow_to_abstract;
+use crate::ldrs_arrow::mvr_to_stream;
 use crate::parquet_provider::builder_from_string;
-use crate::pq::{
-    downcast_array, get_fields, get_kv_fields, map_parquet_to_abstract, ArrowArrayRef, ParquetType,
-};
+use crate::pq::get_column_schema;
+use crate::types::{ColumnSchema, MvrColumn};
 use anyhow::Context;
 use arrow::datatypes::ArrowNativeType;
 use arrow_array::RecordBatch;
-use arrow_array::{Array, ArrayAccessor};
 use bigdecimal::FromPrimitive;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
+use futures::StreamExt;
 use futures::TryStreamExt;
+use mvr_config::{load_config, MvrConfig};
 use native_tls::TlsConnector;
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
 use pg_bigdecimal::{BigDecimal, BigInt};
 use postgres_native_tls::MakeTlsConnector;
 use postgres_types::{to_sql_checked, ToSql, Type};
 use serde_json::Value;
-use std::{pin::pin, sync::Arc};
-use tokio::sync::Mutex;
+use std::pin::pin;
+use std::pin::Pin;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tracing::{debug, info};
 
@@ -80,45 +82,49 @@ pub fn build_ddl(load_table: String, fields: &[String]) -> String {
     ddl
 }
 
-pub fn map_parquet_to_ddl(pq: &ParquetType) -> String {
+pub fn map_parquet_to_ddl(pq: &ColumnSchema) -> String {
     match pq {
-        ParquetType::BigInt(name) => format!("{} bigint", name),
-        ParquetType::Boolean(name) => format!("{} boolean", name),
-        ParquetType::Double(name) => format!("{} double precision", name),
-        ParquetType::Integer(name) => format!("{} integer", name),
-        ParquetType::Jsonb(name) => format!("{} jsonb", name),
-        ParquetType::Numeric(name, precision, scale) => {
+        ColumnSchema::SmallInt(name) => format!("{} smallint", name),
+        ColumnSchema::BigInt(name) => format!("{} bigint", name),
+        ColumnSchema::Boolean(name) => format!("{} boolean", name),
+        ColumnSchema::Double(name) => format!("{} double precision", name),
+        ColumnSchema::Integer(name) => format!("{} integer", name),
+        ColumnSchema::Jsonb(name) => format!("{} jsonb", name),
+        ColumnSchema::Numeric(name, precision, scale) => {
             format!("{} numeric({}, {})", name, precision, scale)
         }
-        ParquetType::Timestamp(name, ..) => format!("{} timestamp", name),
-        ParquetType::TimestampTz(name, ..) => format!("{} timestamptz", name),
-        ParquetType::Real(name) => format!("{} real", name),
-        ParquetType::Text(name) => format!("{} text", name),
-        ParquetType::Uuid(name) => format!("{} uuid", name),
-        ParquetType::Varchar(name, size) => format!("{} varchar({})", name, size),
+        ColumnSchema::Timestamp(name, ..) => format!("{} timestamp", name),
+        ColumnSchema::TimestampTz(name, ..) => format!("{} timestamptz", name),
+        ColumnSchema::Date(name) => format!("{} date", name),
+        ColumnSchema::Real(name) => format!("{} real", name),
+        ColumnSchema::Text(name) => format!("{} text", name),
+        ColumnSchema::Uuid(name) => format!("{} uuid", name),
+        ColumnSchema::Varchar(name, size) => format!("{} varchar({})", name, size),
     }
 }
 
-pub fn map_parquet_to_pg_type(pq: &ParquetType) -> postgres_types::Type {
+pub fn map_parquet_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
     match pq {
-        ParquetType::BigInt(_) => postgres_types::Type::INT8,
-        ParquetType::Boolean(_) => postgres_types::Type::BOOL,
-        ParquetType::Double(_) => postgres_types::Type::FLOAT8,
-        ParquetType::Integer(_) => postgres_types::Type::INT4,
-        ParquetType::Jsonb(_) => postgres_types::Type::JSONB,
-        ParquetType::Numeric(_, _, _) => postgres_types::Type::NUMERIC,
-        ParquetType::Timestamp(_, _) => postgres_types::Type::TIMESTAMP,
-        ParquetType::TimestampTz(_, _) => postgres_types::Type::TIMESTAMPTZ,
-        ParquetType::Real(_) => postgres_types::Type::FLOAT4,
-        ParquetType::Text(_) => postgres_types::Type::TEXT,
-        ParquetType::Uuid(_) => postgres_types::Type::UUID,
-        ParquetType::Varchar(_, _) => postgres_types::Type::VARCHAR,
+        ColumnSchema::SmallInt(_) => postgres_types::Type::INT2,
+        ColumnSchema::BigInt(_) => postgres_types::Type::INT8,
+        ColumnSchema::Boolean(_) => postgres_types::Type::BOOL,
+        ColumnSchema::Double(_) => postgres_types::Type::FLOAT8,
+        ColumnSchema::Integer(_) => postgres_types::Type::INT4,
+        ColumnSchema::Jsonb(_) => postgres_types::Type::JSONB,
+        ColumnSchema::Numeric(_, _, _) => postgres_types::Type::NUMERIC,
+        ColumnSchema::Timestamp(_, _) => postgres_types::Type::TIMESTAMP,
+        ColumnSchema::TimestampTz(_, _) => postgres_types::Type::TIMESTAMPTZ,
+        ColumnSchema::Date(_) => postgres_types::Type::DATE,
+        ColumnSchema::Real(_) => postgres_types::Type::FLOAT4,
+        ColumnSchema::Text(_) => postgres_types::Type::TEXT,
+        ColumnSchema::Uuid(_) => postgres_types::Type::UUID,
+        ColumnSchema::Varchar(_, _) => postgres_types::Type::VARCHAR,
     }
 }
 
 pub fn build_definition<'a>(
     full_table: &'a str,
-    types: &[ParquetType<'a>],
+    types: &[ColumnSchema<'a>],
     post_sql: Option<String>,
     role: Option<String>,
 ) -> Result<LoadDefintion, anyhow::Error> {
@@ -167,12 +173,55 @@ pub async fn prepare_to_copy(
     Ok(())
 }
 
-pub async fn execute_binary_copy<'a>(
+pub async fn process_record_batch<'a>(
+    writer: &mut Pin<&mut BinaryCopyInWriter>,
+    batch: &RecordBatch,
+    parquet_types: &[ColumnSchema<'a>],
+) -> Result<(), anyhow::Error> {
+    let num_rows = batch.num_rows();
+    let columns = batch.columns();
+
+    // Create TypedColumnAccessor for each column
+    let accessors: Vec<TypedColumnAccessor> =
+        columns.iter().map(TypedColumnAccessor::new).collect();
+
+    let mut batch_buffer = Vec::<Vec<PgTypedValue>>::with_capacity(num_rows);
+
+    // Process each row
+    for row_idx in 0..num_rows {
+        // Create PgTypedValue for each column in this row
+        let row_values: Vec<PgTypedValue> = accessors
+            .iter()
+            .zip(parquet_types)
+            .map(|(accessor, parquet_type)| PgTypedValue::new(accessor, row_idx, parquet_type))
+            .collect();
+
+        batch_buffer.push(row_values);
+    }
+
+    for row in batch_buffer.iter() {
+        let refs: Vec<&(dyn ToSql + Sync)> =
+            row.iter().map(|val| val as &(dyn ToSql + Sync)).collect();
+        writer
+            .as_mut()
+            .write(&refs)
+            .await
+            .with_context(|| "Failed to write row to PostgreSQL")?;
+    }
+
+    Ok(())
+}
+
+pub async fn execute_binary_copy<'a, S, E>(
     client: &mut tokio_postgres::Client,
     definition: &LoadDefintion,
-    columns: &[ParquetType<'a>],
-    stream: ParquetRecordBatchStream<ParquetObjectReader>,
-) -> Result<(), anyhow::Error> {
+    columns: &[ColumnSchema<'a>],
+    stream: S,
+) -> Result<(), anyhow::Error>
+where
+    S: futures::TryStream<Ok = RecordBatch, Error = E> + Send,
+    E: std::error::Error + Send + Sync + 'static,
+{
     let pg_types = columns
         .iter()
         .map(map_parquet_to_pg_type)
@@ -192,59 +241,26 @@ pub async fn execute_binary_copy<'a>(
         .await
         .with_context(|| "Could not create binary copy")?;
     let writer = BinaryCopyInWriter::new(sink, &pg_types);
-    let pinned_writer = pin!(writer);
-    let pinned_writer = Arc::new(Mutex::new(pinned_writer));
-    let rename_ddl = definition.rename_and_move().clone();
+    let mut pinned_writer = pin!(writer);
 
-    stream
-        .try_for_each_concurrent(4, {
-            |batch: RecordBatch| {
-                let pinned_writer = Arc::clone(&pinned_writer);
-                async move {
-                    let num_rows = batch.num_rows();
-                    let num_cols = batch.num_columns();
-                    debug!("num_rows: {:?}, num_cols: {:?}", num_rows, num_cols);
-                    let mut batch_buffer = Vec::<Vec<PgValue<'_>>>::with_capacity(num_rows);
-                    // iterate over the rows and then the columns
-                    let cols = batch
-                        .columns()
-                        .iter()
-                        .zip(columns)
-                        .map(downcast_array)
-                        .collect::<Vec<_>>();
-                    for row in 0..num_rows {
-                        let vals: Vec<PgValue<'_>> = cols
-                            .iter()
-                            .map(|col| get_value_to_pg_type(col, row))
-                            .collect::<Vec<PgValue<'_>>>();
+    let mut stream = stream.into_stream();
+    let mut stream = pin!(stream);
 
-                        batch_buffer.push(vals);
-                    }
+    while let Some(batch_result) = stream.next().await {
+        let batch = match batch_result {
+            Ok(b) => b,
+            Err(e) => return Err(anyhow::anyhow!("Stream error: {}", e)),
+        };
 
-                    let mut writer_guard = pinned_writer.lock().await;
-                    for row in batch_buffer.iter() {
-                        let refs: Vec<&(dyn ToSql + Sync)> =
-                            row.iter().map(|val| val as &(dyn ToSql + Sync)).collect();
-                        let wrote = writer_guard.as_mut().write(&refs).await;
-                        if wrote.is_err() {
-                            println!("Error writing row: {:?}", wrote);
-                        }
-                    }
+        process_record_batch(&mut pinned_writer, &batch, columns).await?;
+    }
 
-                    Ok(())
-                }
-            }
-        })
-        .await?;
-
-    let mut writer_guard = pinned_writer.lock().await;
-    writer_guard
-        .as_mut()
+    pinned_writer
         .finish()
         .await
         .with_context(|| "Could not finish copy")?;
 
-    sink_tx.batch_execute(&rename_ddl).await?;
+    sink_tx.batch_execute(&definition.rename_and_move()).await?;
     if let Some(sql) = &definition.post_sql {
         sink_tx.batch_execute(sql).await?;
     }
@@ -257,14 +273,18 @@ pub async fn execute_binary_copy<'a>(
     Ok(())
 }
 
-pub async fn load_postgres<'a>(
-    pq_types: &[ParquetType<'a>],
+pub async fn load_postgres<'a, S, E>(
+    pq_types: &[ColumnSchema<'a>],
     table: &str,
     post_sql: Option<String>,
     pg_url: &str,
     role: Option<String>,
-    stream: ParquetRecordBatchStream<ParquetObjectReader>,
-) -> Result<(), anyhow::Error> {
+    stream: S,
+) -> Result<(), anyhow::Error>
+where
+    S: futures::TryStream<Ok = RecordBatch, Error = E> + Send,
+    E: std::error::Error + Send + Sync + 'static,
+{
     let definition = build_definition(table, pq_types, post_sql, role)?;
     info!("PG definition: {:?}", definition);
 
@@ -283,15 +303,9 @@ pub async fn load_postgres_cmd(
 ) -> Result<(), anyhow::Error> {
     let builder = builder_from_string(args.file.clone(), handle).await?;
     let file_md = builder.metadata().file_metadata().clone();
-    let kv = get_kv_fields(&file_md);
-    debug!("kv: {:?}", kv);
     info!("num rows: {:?}", file_md.num_rows());
 
-    let fields = get_fields(&file_md)?;
-    let mapped = fields
-        .iter()
-        .filter_map(|pq| map_parquet_to_abstract(pq, &kv))
-        .collect::<Vec<ParquetType>>();
+    let mapped = get_column_schema(&file_md)?;
 
     let stream = builder.with_batch_size(args.batch_size).build()?;
     load_postgres(
@@ -330,65 +344,167 @@ pub async fn load_from_file(
     Ok(())
 }
 
-#[derive(Debug)]
-pub enum PgValue<'a> {
-    Bool(Option<bool>),
-    Int32(Option<i32>),
-    Int64(Option<i64>),
-    Float32(Option<f32>),
-    Float64(Option<f64>),
-    Decimal128(Option<i128>, (), i8),
-    Jsonb(Option<&'a str>),
-    Text(Option<&'a str>),
-    TimestampMicrosecond(Option<i64>, bool),
-    TimestampNanosecond(Option<i64>, bool),
-    FixedSizeBinaryArray(Option<&'a [u8]>, ()),
+/// Load data into PostgreSQL using MVR configuration file
+///
+/// This function reads an MVR configuration file, processes each configuration item,
+/// executes the SQL query in each, and loads the resulting data into PostgreSQL tables.
+/// It handles the full workflow from MVR config to data loading.
+///
+/// # Arguments
+///
+/// * `args` - MVR configuration including file path and optional overrides
+/// * `pg_url` - PostgreSQL connection URL
+///
+/// # Returns
+///
+/// * `Result<(), anyhow::Error>`
+pub async fn load_from_mvr_config(args: MvrConfig, pg_url: String) -> Result<(), anyhow::Error> {
+    let tables = load_config(&args)?;
+    let total_tasks = tables.len();
+    for (i, config) in tables.iter().enumerate() {
+        let task_start = std::time::Instant::now();
+        info!("Running task: {}/{}", i + 1, total_tasks);
+        let mvr_arrow = mvr_to_stream(&config.sql, &config.columns).await?;
+        let schema = mvr_arrow.schema_stream.await;
+
+        match schema {
+            Some(schema) => {
+                let mapped = schema
+                    .fields()
+                    .iter()
+                    .filter_map(map_arrow_to_abstract)
+                    .collect::<Vec<_>>();
+                load_postgres(
+                    &mapped,
+                    &config.table,
+                    config.post_sql.clone(),
+                    &pg_url,
+                    config.role.clone(),
+                    mvr_arrow.batch_stream,
+                )
+                .await?
+            }
+            None => {
+                info!("No schema found. Most likely mvr failed.");
+            }
+        }
+        match mvr_arrow.command_handle.await {
+            Ok(Ok(())) => (), // Command completed successfully
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Command failed: {}", e)),
+            Err(e) => return Err(anyhow::anyhow!("Command task panicked: {}", e)),
+        }
+        let task_end = std::time::Instant::now();
+        info!("Task time: {:?}", task_end - task_start);
+    }
+    Ok(())
 }
 
-impl ToSql for PgValue<'_> {
+#[derive(Debug)]
+pub struct PgTypedValue<'a> {
+    accessor: &'a TypedColumnAccessor<'a>,
+    row_idx: usize,
+    col_schema: &'a ColumnSchema<'a>,
+}
+
+impl<'a> PgTypedValue<'a> {
+    pub fn new(
+        accessor: &'a TypedColumnAccessor<'a>,
+        row_idx: usize,
+        col_schema: &'a ColumnSchema<'a>,
+    ) -> Self {
+        Self {
+            accessor,
+            row_idx,
+            col_schema,
+        }
+    }
+}
+
+impl<'a> ToSql for PgTypedValue<'a> {
     fn to_sql(
         &self,
         ty: &Type,
         out: &mut tokio_postgres::types::private::BytesMut,
-    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>>
-    where
-        Self: Sized,
-    {
-        match self {
-            PgValue::Int32(i) => i.to_sql(ty, out),
-            PgValue::Int64(i) => i.to_sql(ty, out),
-            PgValue::Float32(f) => f.to_sql(ty, out),
-            PgValue::Float64(f) => f.to_sql(ty, out),
-            PgValue::Decimal128(i, _, scale) => i
-                .map(|d| {
-                    let big_int = BigInt::from_i128(d);
-                    pg_bigdecimal::PgNumeric::new(
-                        big_int
-                            .map(|bi| BigDecimal::new(bi, scale.to_i64().expect("Scale failed"))),
-                    )
-                })
-                .to_sql(ty, out),
-            PgValue::Jsonb(s) => s
-                .map(|j| serde_json::from_str::<Value>(j).expect("Failed to parse json"))
-                .map(tokio_postgres::types::Json)
-                .to_sql(ty, out),
-            PgValue::Text(s) => s.to_sql(ty, out),
-            PgValue::TimestampMicrosecond(ts, true) => ts
-                .map(DateTime::<Utc>::from_timestamp_micros)
-                .to_sql(ty, out),
-            PgValue::TimestampMicrosecond(ts, false) => {
-                ts.map(NaiveDateTime::from_timestamp_micros).to_sql(ty, out)
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        // Use the ParquetType to determine the semantic meaning
+        match self.accessor {
+            TypedColumnAccessor::Int16(_) => self.accessor.Int16(self.row_idx).to_sql(ty, out),
+            TypedColumnAccessor::Int32(_) => self.accessor.Int32(self.row_idx).to_sql(ty, out),
+            TypedColumnAccessor::Int64(_) => self.accessor.Int64(self.row_idx).to_sql(ty, out),
+            TypedColumnAccessor::Float32(_) => self.accessor.Float32(self.row_idx).to_sql(ty, out),
+            TypedColumnAccessor::Float64(_) => self.accessor.Float64(self.row_idx).to_sql(ty, out),
+            TypedColumnAccessor::Boolean(_) => self.accessor.Boolean(self.row_idx).to_sql(ty, out),
+            TypedColumnAccessor::Decimal128(_, _, scale) => {
+                self.accessor
+                    .Decimal128(self.row_idx)
+                    .map(|d| {
+                        let big_int = BigInt::from_i128(d);
+                        pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
+                            BigDecimal::new(bi, (*scale).to_i64().expect("Scale failed"))
+                        }))
+                    })
+                    .to_sql(ty, out)
             }
-            PgValue::TimestampNanosecond(ts, true) => ts
+            TypedColumnAccessor::FixedSizeBinary(_, size) => match self.col_schema {
+                ColumnSchema::Uuid(_) => self
+                    .accessor
+                    .FixedSizeBinary(self.row_idx)
+                    .map(|bytes| uuid::Uuid::from_slice(bytes).expect("Failed to parse UUID"))
+                    .to_sql(ty, out),
+                _ => self.accessor.FixedSizeBinary(self.row_idx).to_sql(ty, out),
+            },
+            // timestamp types
+            // Datetime and NaiveDateTime are different types so they have to be targeted separately
+            TypedColumnAccessor::TimestampMillisecond(_, true) => self
+                .accessor
+                .TimestampMillisecond(self.row_idx)
+                .and_then(DateTime::<Utc>::from_timestamp_millis)
+                .to_sql(ty, out),
+            TypedColumnAccessor::TimestampMillisecond(_, false) => self
+                .accessor
+                .TimestampMillisecond(self.row_idx)
+                .and_then(NaiveDateTime::from_timestamp_millis)
+                .to_sql(ty, out),
+            TypedColumnAccessor::TimestampMicrosecond(_, true) => self
+                .accessor
+                .TimestampMicrosecond(self.row_idx)
+                .and_then(DateTime::<Utc>::from_timestamp_micros)
+                .to_sql(ty, out),
+            TypedColumnAccessor::TimestampMicrosecond(_, false) => self
+                .accessor
+                .TimestampMicrosecond(self.row_idx)
+                .and_then(NaiveDateTime::from_timestamp_micros)
+                .to_sql(ty, out),
+            TypedColumnAccessor::TimestampNanosecond(_, true) => self
+                .accessor
+                .TimestampNanosecond(self.row_idx)
                 .map(DateTime::<Utc>::from_timestamp_nanos)
                 .to_sql(ty, out),
-            PgValue::TimestampNanosecond(ts, false) => {
-                ts.map(NaiveDateTime::from_timestamp_nanos).to_sql(ty, out)
-            }
-            PgValue::FixedSizeBinaryArray(b, _) => b
-                .map(|x| uuid::Uuid::from_slice(x).unwrap())
+            TypedColumnAccessor::TimestampNanosecond(_, false) => self
+                .accessor
+                .TimestampNanosecond(self.row_idx)
+                .and_then(NaiveDateTime::from_timestamp_nanos)
                 .to_sql(ty, out),
-            PgValue::Bool(b) => b.to_sql(ty, out),
+            TypedColumnAccessor::Date32(_) => self
+                .accessor
+                .Date32(self.row_idx)
+                .map(|d| {
+                    //chrono::NaiveDate::from_ymd(1970, 1, 1) + chrono::Duration::days(d.into())
+                    chrono::NaiveDate::from_num_days_from_ce_opt(719163 + d)
+                        .expect("Failed to parse date")
+                })
+                .to_sql(ty, out),
+
+            // string types
+            TypedColumnAccessor::Utf8(_) => match self.col_schema {
+                ColumnSchema::Jsonb(_) => self
+                    .accessor
+                    .Utf8(self.row_idx)
+                    .map(|j| serde_json::from_str::<Value>(j).expect("Failed to parse json"))
+                    .map(tokio_postgres::types::Json)
+                    .to_sql(ty, out),
+                _ => self.accessor.Utf8(self.row_idx).to_sql(ty, out),
+            },
         }
     }
 
@@ -396,108 +512,6 @@ impl ToSql for PgValue<'_> {
 
     fn accepts(_ty: &Type) -> bool {
         true
-    }
-}
-
-fn get_value_to_pg_type<'a>(arrow_array: &ArrowArrayRef<'a>, index: usize) -> PgValue<'a> {
-    match arrow_array {
-        ArrowArrayRef::Int32(int_array) => {
-            let v = if int_array.is_null(index) {
-                None
-            } else {
-                Some(int_array.value(index))
-            };
-            PgValue::Int32(v)
-        }
-        ArrowArrayRef::Int64(int_array) => {
-            let v = if int_array.is_null(index) {
-                None
-            } else {
-                Some(int_array.value(index))
-            };
-            PgValue::Int64(v)
-        }
-        ArrowArrayRef::Float32(float_array) => {
-            let v = if float_array.is_null(index) {
-                None
-            } else {
-                Some(float_array.value(index))
-            };
-            PgValue::Float32(v)
-        }
-        ArrowArrayRef::Float64(float_array) => {
-            let v = if float_array.is_null(index) {
-                None
-            } else {
-                Some(float_array.value(index))
-            };
-            PgValue::Float64(v)
-        }
-        ArrowArrayRef::Decimal128(decimal_array, _precision, scale) => {
-            let v = if decimal_array.is_null(index) {
-                None
-            } else {
-                let value = decimal_array.value(index);
-                Some(value)
-            };
-            PgValue::Decimal128(v, (), *scale)
-        }
-        ArrowArrayRef::Jsonb(string_array) => {
-            let v = if string_array.is_null(index) {
-                None
-            } else {
-                Some(string_array.value(index))
-            };
-            PgValue::Jsonb(v)
-        }
-        ArrowArrayRef::Utf8(string_array) => {
-            let v = if string_array.is_null(index) {
-                None
-            } else {
-                Some(string_array.value(index))
-            };
-            PgValue::Text(v)
-        }
-        ArrowArrayRef::TimestampMillisecond(ts_array, is_utc) => {
-            let v = if ts_array.is_null(index) {
-                None
-            } else {
-                Some(ts_array.value(index))
-            };
-            PgValue::TimestampMicrosecond(v, *is_utc)
-        }
-        ArrowArrayRef::TimestampMicrosecond(ts_array, is_utc) => {
-            let v = if ts_array.is_null(index) {
-                None
-            } else {
-                Some(ts_array.value(index))
-            };
-            PgValue::TimestampMicrosecond(v, *is_utc)
-        }
-        ArrowArrayRef::TimestampNanosecond(ts_array, is_utc) => {
-            let v = if ts_array.is_null(index) {
-                None
-            } else {
-                Some(ts_array.value(index))
-            };
-            PgValue::TimestampNanosecond(v, *is_utc)
-        }
-        ArrowArrayRef::FixedSizeBinaryArray(fixed_size_binary_array, _size) => {
-            let v = if fixed_size_binary_array.is_null(index) {
-                None
-            } else {
-                Some(fixed_size_binary_array.value(index))
-            };
-            PgValue::FixedSizeBinaryArray(v, ())
-        }
-        ArrowArrayRef::Boolean(bool_array) => {
-            let v = if bool_array.is_null(index) {
-                None
-            } else {
-                Some(bool_array.value(index))
-            };
-            PgValue::Bool(v)
-        }
     }
 }
 
@@ -518,9 +532,9 @@ mod tests {
     async fn test_definition_build() {
         let full_table = "public.users";
         let pq_types = [
-            ParquetType::BigInt("id"),
-            ParquetType::Text("name"),
-            ParquetType::Timestamp("created_at", TimeUnit::MILLIS(MilliSeconds {})),
+            ColumnSchema::BigInt("id"),
+            ColumnSchema::Text("name"),
+            ColumnSchema::Timestamp("created_at", TimeUnit::MILLIS(MilliSeconds {})),
         ];
 
         let first_def = build_definition(full_table, &pq_types, None, None).unwrap();
@@ -560,7 +574,7 @@ mod tests {
         let mapped = fields
             .iter()
             .filter_map(|pq| map_parquet_to_abstract(pq, &kv))
-            .collect::<Vec<ParquetType>>();
+            .collect::<Vec<ColumnSchema>>();
 
         let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
         let stream = builder.with_batch_size(1024).build().unwrap();

@@ -1,6 +1,6 @@
 [package]
 name = "ldrs"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 repository = "https://github.com/johanan/ldrs"
 authors = ["Joshua Johanan"]
@@ -43,12 +43,21 @@ tokio-postgres = { version = "0.7.12", features = [
   "with-uuid-1",
   "with-serde_json-1",
 ] }
+tokio-stream = "0.1.17"
+tokio-util = { version = "0.7.14", features = ["io", "io-util"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 url = "2.5.4"
 uuid = "1.12.1"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[[bench]]
+name = "arrow_extraction"
+harness = false

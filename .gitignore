@@ -22,3 +22,5 @@ target/
 
 # delta test
 test_data/delta/
+
+.env
