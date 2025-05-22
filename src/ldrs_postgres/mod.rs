@@ -1,4 +1,5 @@
 pub mod config;
+pub mod mvr_config;
 
 use crate::arrow_access::TypedColumnAccessor;
 use crate::parquet_provider::builder_from_string;
@@ -92,6 +93,7 @@ pub fn map_parquet_to_ddl(pq: &ColumnSchema) -> String {
         }
         ColumnSchema::Timestamp(name, ..) => format!("{} timestamp", name),
         ColumnSchema::TimestampTz(name, ..) => format!("{} timestamptz", name),
+        ColumnSchema::Date(name) => format!("{} date", name),
         ColumnSchema::Real(name) => format!("{} real", name),
         ColumnSchema::Text(name) => format!("{} text", name),
         ColumnSchema::Uuid(name) => format!("{} uuid", name),
@@ -110,6 +112,7 @@ pub fn map_parquet_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
         ColumnSchema::Numeric(_, _, _) => postgres_types::Type::NUMERIC,
         ColumnSchema::Timestamp(_, _) => postgres_types::Type::TIMESTAMP,
         ColumnSchema::TimestampTz(_, _) => postgres_types::Type::TIMESTAMPTZ,
+        ColumnSchema::Date(_) => postgres_types::Type::DATE,
         ColumnSchema::Real(_) => postgres_types::Type::FLOAT4,
         ColumnSchema::Text(_) => postgres_types::Type::TEXT,
         ColumnSchema::Uuid(_) => postgres_types::Type::UUID,
@@ -440,9 +443,17 @@ impl<'a> ToSql for PgTypedValue<'a> {
             TypedColumnAccessor::TimestampNanosecond(_, false) => self
                 .accessor
                 .TimestampNanosecond(self.row_idx)
-                .map(NaiveDateTime::from_timestamp_nanos)
+                .and_then(NaiveDateTime::from_timestamp_nanos)
                 .to_sql(ty, out),
-
+            TypedColumnAccessor::Date32(_) => self
+                .accessor
+                .Date32(self.row_idx)
+                .map(|d| {
+                    //chrono::NaiveDate::from_ymd(1970, 1, 1) + chrono::Duration::days(d.into())
+                    chrono::NaiveDate::from_num_days_from_ce_opt(719163 + d).expect("Failed to parse date")
+                })
+                .to_sql(ty, out),
+            
             // string types
             TypedColumnAccessor::Utf8(_) => match self.col_schema {
                 ColumnSchema::Jsonb(_) => self

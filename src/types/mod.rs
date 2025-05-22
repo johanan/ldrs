@@ -49,12 +49,23 @@ pub enum ColumnSchema<'a> {
     Integer(&'a str),
     BigInt(&'a str),
     Boolean(&'a str),
+    Date(&'a str),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ColumnDefintion {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: String,
     pub length: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct MvrColumn {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub length: Option<i32>,
+    pub precision: Option<i32>,
+    pub scale: Option<i32>,
 }

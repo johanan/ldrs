@@ -174,6 +174,7 @@ fn map_parquet_to_delta(pq_col: &ColumnSchema) -> Result<StructField, anyhow::Er
             Ok(StructField::new(name, DataType::TIMESTAMP_NTZ, true))
         }
         ColumnSchema::TimestampTz(name, _) => Ok(StructField::new(name, DataType::TIMESTAMP, true)),
+        ColumnSchema::Date(name) => Ok(StructField::new(name, DataType::DATE, true)),
         ColumnSchema::Uuid(name) => Ok(StructField::new(name, DataType::STRING, true)
             .with_metadata([("parquet_type", "UUID")])),
         ColumnSchema::Jsonb(name) => Ok(StructField::new(name, DataType::STRING, true)

@@ -1,14 +1,8 @@
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray
 };
 use arrow_schema::{DataType, TimeUnit};
-use futures::TryStream;
-use serde::{Deserialize, Serialize};
-
-use crate::types::ColumnSchema;
 
 macro_rules! define_column_accessor {
     ($(($variant:ident, $array_type:ty, $value_type:ty)),*) => {
@@ -45,7 +39,7 @@ macro_rules! define_column_accessor {
                     DataType::FixedSizeBinary(size) =>
                         Self::FixedSizeBinary(array.as_fixed_size_binary(), *size),
 
-                    _ => panic!("Unsupported data type"),
+                    _ => panic!("Unsupported data type for TypedColumnAccessor: {:?}", array.data_type()),
                 }
             }
 
@@ -73,7 +67,8 @@ define_column_accessor!(
     (Int64, Int64Array, i64),
     (Float32, Float32Array, f32),
     (Float64, Float64Array, f64),
-    (Utf8, StringArray, &'a str)
+    (Utf8, StringArray, &'a str),
+    (Date32, Date32Array, i32)
 );
 
 impl<'a> TypedColumnAccessor<'a> {

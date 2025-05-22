@@ -75,10 +75,7 @@ fn main() -> Result<(), anyhow::Error> {
                         let mapped = schema
                             .fields()
                             .iter()
-                            .filter_map(|field| {
-                                let md = field.metadata();
-                                map_arrow_to_abstract(field, md)
-                            })
+                            .filter_map(map_arrow_to_abstract)
                             .collect::<Vec<_>>();
                         info!("Schema: {:?}", schema);
                         info!("Mapped: {:?}", mapped);

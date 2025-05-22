@@ -19,7 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::SyncIoBridge;
 use tracing::{debug, info};
 
-use crate::types::{ColumnDefintion, ColumnSchema};
+use crate::types::{ColumnDefintion, ColumnSchema, MvrColumn};
 
 #[derive(Args, Debug)]
 pub struct ArrowIpcStreamArgs {
@@ -67,7 +67,8 @@ pub struct MvrStreamResult<B, S> {
 }
 
 pub async fn mvr_to_stream(
-    full_table: &str,
+    sql: &str,
+    columns: Option<Vec<MvrColumn>>,
 ) -> Result<
     MvrStreamResult<
         impl futures::TryStream<Ok = RecordBatch, Error = arrow::error::ArrowError> + Send,
@@ -76,16 +77,20 @@ pub async fn mvr_to_stream(
     anyhow::Error,
 > {
     let mut cmd = Command::new("mvr");
+    let column_json =
+        serde_json::to_string(&columns).with_context(|| "Failed to serialize columns to JSON")?;
     let args = vec![
         "mv",
         "--format",
         "arrow",
-        "--name",
-        full_table,
+        "--sql",
+        sql,
         "-d",
         "--quiet",
         "--batch-size",
         "1024",
+        "--columns",
+        &column_json,
     ];
 
     let cmd = cmd.args(args);
@@ -158,7 +163,6 @@ pub async fn mvr_to_stream(
     let schema_future = async move {
         match schema_rx.await {
             Ok(schema) => {
-                // Return None for empty schemas (error indicator)
                 if schema.fields().is_empty() {
                     None
                 } else {
@@ -176,13 +180,25 @@ pub async fn mvr_to_stream(
     })
 }
 
-pub fn map_arrow_to_abstract<'a>(
-    field: &'a FieldRef,
-    user_defs: &HashMap<String, String>,
-) -> Option<ColumnSchema<'a>> {
+pub fn map_arrow_to_abstract<'a>(field: &'a FieldRef) -> Option<ColumnSchema<'a>> {
     let name = field.name();
+    let metadata = field.metadata();
     match field.data_type() {
-        arrow_schema::DataType::Utf8 => Some(ColumnSchema::Text(name)),
+        arrow_schema::DataType::Utf8 => match metadata.get("type") {
+            Some(typ) if typ == "VARCHAR" => {
+                let length = metadata
+                    .get("length")
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(0);
+                Some(ColumnSchema::Varchar(name, length))
+            }
+            Some(typ) if typ == "OBJECT" || typ == "JSON" || typ == "JSONB" => {
+                Some(ColumnSchema::Jsonb(name))
+            }
+            Some(typ) if typ == "UUID" => Some(ColumnSchema::Uuid(name)),
+            Some(_) => Some(ColumnSchema::Text(name)),
+            None => Some(ColumnSchema::Text(name)),
+        },
         arrow_schema::DataType::Timestamp(time_unit, tz) => match tz {
             Some(_) => Some(ColumnSchema::TimestampTz(
                 name,
@@ -200,7 +216,7 @@ pub fn map_arrow_to_abstract<'a>(
         arrow_schema::DataType::Float32 => Some(ColumnSchema::Real(name)),
         arrow_schema::DataType::Boolean => Some(ColumnSchema::Boolean(name)),
         arrow_schema::DataType::Binary => Some(ColumnSchema::Text(name)),
-        arrow_schema::DataType::Date32 => Some(ColumnSchema::Integer(name)),
+        arrow_schema::DataType::Date32 => Some(ColumnSchema::Date(name)),
         arrow_schema::DataType::FixedSizeBinary(16) => Some(ColumnSchema::Uuid(name)),
         arrow_schema::DataType::Decimal128(precision, scale) => Some(ColumnSchema::Numeric(
             name,
