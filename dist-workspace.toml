@@ -20,4 +20,7 @@ install-updater = false
 global = "ubuntu-22.04"
 
 [dist.github-custom-runners.x86_64-unknown-linux-gnu]
-x86_64-unknown-linux-gnu = "ubuntu-22.04"
+runner = "ubuntu-22.04"
+
+[dist.github-custom-runners.aarch64-unknown-linux-gnu]
+runner = "ubuntu-22.04"
