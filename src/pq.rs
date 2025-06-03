@@ -1,7 +1,6 @@
 use parquet::basic::LogicalType;
 use parquet::file::metadata::FileMetaData;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::types::{ColumnDefintion, ColumnSchema};

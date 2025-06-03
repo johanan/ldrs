@@ -1,16 +1,18 @@
 pub mod config;
 pub mod mvr_config;
+
 use crate::arrow_access::TypedColumnAccessor;
 use crate::ldrs_arrow::map_arrow_to_abstract;
 use crate::ldrs_arrow::mvr_to_stream;
 use crate::parquet_provider::builder_from_string;
 use crate::pq::get_column_schema;
-use crate::types::{ColumnSchema, MvrColumn};
+use crate::types::ColumnSchema;
 use anyhow::Context;
 use arrow::datatypes::ArrowNativeType;
 use arrow_array::RecordBatch;
 use bigdecimal::FromPrimitive;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use clap::Subcommand;
 use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -23,7 +25,17 @@ use serde_json::Value;
 use std::pin::pin;
 use std::pin::Pin;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
-use tracing::{debug, info};
+use tracing::info;
+
+#[derive(Subcommand)]
+pub enum PgCommands {
+    /// Load data into PostgreSQL from a file
+    Load(LoadArgs),
+    /// Load data into PostgreSQL using a configuration file
+    Config(PGFileLoadArgs),
+    /// Load data into PostgreSQL using MVR configuration
+    Mvr(MvrConfig),
+}
 
 #[derive(Debug)]
 pub struct LoadDefintion {

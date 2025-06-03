@@ -5,7 +5,7 @@ use std::{path::Path, sync::Arc};
 use anyhow::Context;
 use arrow_schema::{Schema, SchemaRef};
 use bigdecimal::ToPrimitive;
-use clap::Args;
+use clap::{Args, Subcommand};
 use deltalake::{
     arrow::array::RecordBatch,
     datafusion::{
@@ -31,6 +31,15 @@ use crate::{
     types::ColumnSchema,
 };
 use deltalake::azure::register_handlers;
+
+/// Commands for Delta Lake destination
+#[derive(Subcommand)]
+pub enum DeltaCommands {
+    /// Load data into Delta Lake
+    Load(DeltaLoad),
+    /// Merge data into Delta Lake
+    Merge(DeltaMerge),
+}
 
 #[derive(Args, Deserialize, Debug)]
 pub struct DeltaLoad {

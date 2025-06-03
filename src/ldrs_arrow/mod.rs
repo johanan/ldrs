@@ -1,16 +1,9 @@
-use std::{
-    collections::HashMap,
-    future::Future,
-    pin::{pin, Pin},
-    process::Stdio,
-    vec,
-};
+use std::{future::Future, process::Stdio, vec};
 
 use anyhow::Context;
 use arrow::ipc::reader::StreamReader;
 use arrow_array::RecordBatch;
 use arrow_schema::FieldRef;
-use clap::Args;
 use futures::stream::StreamExt;
 use futures::TryStreamExt;
 use parquet::format::{MicroSeconds, NanoSeconds};
@@ -19,7 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::SyncIoBridge;
 use tracing::{debug, info};
 
-use crate::types::{ColumnDefintion, ColumnSchema, MvrColumn};
+use crate::types::{ColumnSchema, MvrColumn};
 
 pub async fn print_arrow_ipc_batches<S>(stream: S) -> Result<(), anyhow::Error>
 where
