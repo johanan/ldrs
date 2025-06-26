@@ -69,3 +69,12 @@ pub struct MvrColumn {
     pub precision: Option<i32>,
     pub scale: Option<i32>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileLoadData {
+    pub full_url: String,
+    pub database: Option<String>,
+    pub schema: String,
+    pub table: String,
+    pub path_parts: Vec<String>,
+}

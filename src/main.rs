@@ -5,6 +5,7 @@ use ldrs::delta::{delta_merge, delta_run, DeltaCommands};
 use ldrs::ldrs_postgres::load_from_mvr_config;
 use ldrs::ldrs_postgres::PgCommands;
 use ldrs::ldrs_postgres::{load_from_file, load_postgres_cmd};
+use ldrs::lua_logic::{self, LuaArgs};
 use tracing::info;
 
 #[derive(Subcommand)]
@@ -24,6 +25,7 @@ enum Destination {
         #[command(subcommand)]
         command: ldrs::ldrs_snowflake::SnowflakeCommands,
     },
+    Luat(LuaArgs),
 }
 
 #[derive(Parser)]
@@ -93,6 +95,13 @@ fn main() -> Result<(), anyhow::Error> {
                     }
                 }
             },
+            Destination::Luat(args) => {
+                let modules =
+                    tokio::task::spawn_blocking(|| lua_logic::modules_from_args(args)).await??;
+                info!("Lua test result: {:?}", modules);
+
+                Ok(())
+            }
         }
     });
 

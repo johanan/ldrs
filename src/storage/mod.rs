@@ -1,4 +1,4 @@
-mod azure;
+pub mod azure;
 
 use std::sync::Arc;
 
@@ -25,6 +25,7 @@ pub fn base_or_relative_path(path: &str) -> Result<Url, anyhow::Error> {
     }
 }
 
+#[derive(Debug)]
 pub enum StorageProvider {
     Azure(azure::AzureUrl),
     Local(Url, object_store::path::Path),
