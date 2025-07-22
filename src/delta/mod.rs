@@ -213,6 +213,7 @@ fn map_parquet_to_delta(pq_col: &ColumnSchema) -> Result<StructField, anyhow::Er
         ColumnSchema::Real(name) => Ok(StructField::new(name, DataType::FLOAT, true)),
         ColumnSchema::Double(name) => Ok(StructField::new(name, DataType::DOUBLE, true)),
         ColumnSchema::Boolean(name) => Ok(StructField::new(name, DataType::BOOLEAN, true)),
+        ColumnSchema::Custom(name, _) => Ok(StructField::new(name, DataType::STRING, true)),
     }
 }
 

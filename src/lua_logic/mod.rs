@@ -1,13 +1,14 @@
 pub mod nom_pattern;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::storage::{azure::AzureUrl, StorageProvider};
+use crate::types::{parquet_types::ParquetSchema, ColumnSchema, TimeUnit};
+use arrow::datatypes::SchemaRef;
 use clap::Args;
-use mlua::{Lua, LuaSerdeExt};
+use mlua::{FromLua, Lua, LuaSerdeExt};
 use serde::{Deserialize, Serialize};
-use tracing::info;
 use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +33,199 @@ pub struct AzureData {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalData {
+    pub url: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum StorageData {
+    #[serde(rename = "azure")]
+    Azure(AzureData),
+    #[serde(rename = "local")]
+    Local(LocalData),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LuaResult {
+    pub sql: Vec<String>,
+    pub context: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnMapping {
+    pub name: String,
+    pub column_type: String,       // Type name (case-insensitive)
+    pub processor: Option<String>, // Processor for data conversion
+    pub precision: Option<i32>,    // For NUMERIC types
+    pub scale: Option<i32>,        // For NUMERIC types
+    pub length: Option<i32>,       // For VARCHAR types
+    pub time_unit: Option<String>, // For TIMESTAMP types: "millis", "micros", "nanos"
+}
+
+use std::collections::HashMap;
+
+impl ColumnMapping {
+    pub fn to_column_schema<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        let type_map: HashMap<
+            &str,
+            for<'b> fn(&ColumnMapping, &'b str) -> Result<ColumnSchema<'b>, anyhow::Error>,
+        > = [
+            (
+                "varchar",
+                Self::parse_varchar
+                    as for<'b> fn(
+                        &ColumnMapping,
+                        &'b str,
+                    ) -> Result<ColumnSchema<'b>, anyhow::Error>,
+            ),
+            ("text", Self::parse_text),
+            ("jsonb", Self::parse_jsonb),
+            ("numeric", Self::parse_numeric),
+            ("uuid", Self::parse_uuid),
+            ("timestamp", Self::parse_timestamp),
+            ("timestamptz", Self::parse_timestamptz),
+            ("boolean", Self::parse_boolean),
+            ("integer", Self::parse_integer),
+            ("bigint", Self::parse_bigint),
+            ("smallint", Self::parse_smallint),
+            ("real", Self::parse_real),
+            ("double", Self::parse_double),
+            ("date", Self::parse_date),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        // Find matching parser (case-insensitive)
+        let parser = type_map
+            .iter()
+            .find(|(key, _)| self.column_type.eq_ignore_ascii_case(key))
+            .map(|(_, parser)| *parser);
+
+        match parser {
+            Some(parse_fn) => Ok(parse_fn(self, name)?),
+            None => Ok(ColumnSchema::Custom(name, &self.column_type)),
+        }
+    }
+
+    // Individual type parsers that return ColumnSchema directly
+    fn parse_varchar<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        let length = self.length.ok_or_else(|| {
+            anyhow::anyhow!(
+                "VARCHAR requires length parameter for column '{}'",
+                self.name
+            )
+        })?;
+        Ok(ColumnSchema::Varchar(name, length))
+    }
+
+    fn parse_text<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        Ok(ColumnSchema::Text(name))
+    }
+
+    fn parse_jsonb<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        Ok(ColumnSchema::Jsonb(name))
+    }
+
+    fn parse_numeric<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        let precision = self.precision.ok_or_else(|| {
+            anyhow::anyhow!(
+                "NUMERIC requires precision parameter for column '{}'",
+                self.name
+            )
+        })?;
+        let scale = self.scale.ok_or_else(|| {
+            anyhow::anyhow!(
+                "NUMERIC requires scale parameter for column '{}'",
+                self.name
+            )
+        })?;
+        Ok(ColumnSchema::Numeric(name, precision, scale))
+    }
+
+    fn parse_uuid<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        Ok(ColumnSchema::Uuid(name))
+    }
+
+    fn parse_timestamp<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        let time_unit = self.parse_time_unit()?;
+        Ok(ColumnSchema::Timestamp(name, time_unit))
+    }
+
+    fn parse_timestamptz<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        let time_unit = self.parse_time_unit()?;
+        Ok(ColumnSchema::TimestampTz(name, time_unit))
+    }
+
+    fn parse_time_unit(&self) -> Result<TimeUnit, anyhow::Error> {
+        match self.time_unit.as_deref() {
+            Some(unit) if unit.eq_ignore_ascii_case("millis") => Ok(TimeUnit::Millis),
+            Some(unit) if unit.eq_ignore_ascii_case("micros") => Ok(TimeUnit::Micros),
+            Some(unit) if unit.eq_ignore_ascii_case("nanos") => Ok(TimeUnit::Nanos),
+            Some(unit) => Err(anyhow::anyhow!(
+                "Invalid time unit '{}' for column '{}'. Valid options: millis, micros, nanos",
+                unit,
+                self.name
+            )),
+            None => Ok(TimeUnit::Millis), // Default to milliseconds
+        }
+    }
+
+    fn parse_boolean<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        Ok(ColumnSchema::Boolean(name))
+    }
+
+    fn parse_integer<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        Ok(ColumnSchema::Integer(name))
+    }
+
+    fn parse_bigint<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        Ok(ColumnSchema::BigInt(name))
+    }
+
+    fn parse_smallint<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        Ok(ColumnSchema::SmallInt(name))
+    }
+
+    fn parse_real<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        Ok(ColumnSchema::Real(name))
+    }
+
+    fn parse_double<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        Ok(ColumnSchema::Double(name))
+    }
+
+    fn parse_date<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
+        Ok(ColumnSchema::Date(name))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableSchema {
+    pub table_name: String,
+    pub columns: Vec<ColumnMapping>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreExecResult {
+    pub sql: Vec<String>,
+    pub schema: TableSchema,
+    pub context: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecResult<T> {
+    pub sql: Vec<String>,
+    pub load_mode: T,
+    pub context: serde_json::Value,
+}
+
 #[derive(Args, Debug)]
 pub struct LuaArgs {
     /// Lua module paths (can be specified multiple times)
@@ -45,6 +239,10 @@ pub struct LuaArgs {
     /// The file URL to process
     #[arg(long)]
     pub file_url: String,
+
+    /// Pattern for semantic path matching
+    #[arg(long)]
+    pub pattern: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,12 +333,24 @@ impl From<Url> for UrlData {
     }
 }
 
-impl From<&AzureUrl> for AzureData {
-    fn from(azure_url: &AzureUrl) -> Self {
+impl From<AzureUrl> for AzureData {
+    fn from(azure_url: AzureUrl) -> Self {
         AzureData {
             storage_account: azure_url.storage_account.clone(),
             container: azure_url.container.clone(),
             path: azure_url.path.clone(),
+        }
+    }
+}
+
+impl From<StorageProvider> for StorageData {
+    fn from(provider: StorageProvider) -> Self {
+        match provider {
+            StorageProvider::Azure(azure_url) => StorageData::Azure(AzureData::from(azure_url)),
+            StorageProvider::Local(url, path) => StorageData::Local(LocalData {
+                url: url.to_string(),
+                path: path.to_string(),
+            }),
         }
     }
 }
@@ -157,195 +367,93 @@ fn base_name(file_name: &str) -> Option<&str> {
     file_name.find('.').map(|pos| &file_name[..pos])
 }
 
-pub fn get_path_segments(path: &str) -> Vec<&str> {
-    // Split path and filter out empty segments and filename
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-    // Return all segments except the last one (which should be the filename)
-    if segments.is_empty() {
-        vec![]
-    } else {
-        segments[..segments.len() - 1].to_vec()
-    }
-}
-
-fn build_module_file_paths(
-    module_name: &str,
-    function_components: &[&str],
-    path_segments: &[&str],
-    extension: Option<&str>,
+pub fn build_module_path_from_pattern(
+    pattern: &nom_pattern::PathPattern,
+    base_module: &str,
 ) -> Vec<String> {
-    let mut paths = Vec::new();
+    let mut module_components: Vec<String> = vec![base_module.to_string()];
 
-    // Build components with extension if provided
-    let mut components_with_ext = function_components.to_vec();
-    if let Some(ext) = extension {
-        components_with_ext.push(ext);
-    }
-
-    if !path_segments.is_empty() {
-        for segment in path_segments {
-            let mut extended_components = components_with_ext.clone();
-            extended_components.push(segment);
-            let extended_flat_name = extended_components.join("_");
-
-            let extended_base_path: PathBuf = [module_name]
+    // Build module path using segment groups to preserve compound names
+    for segment_group in &pattern.segment_groups {
+        if segment_group.len() == 1 {
+            // Simple segment - can avoid allocation for most cases
+            match &segment_group[0] {
+                nom_pattern::PatternSegment::Named(name) => {
+                    module_components.push(name.to_string());
+                }
+                nom_pattern::PatternSegment::Literal(literal) => {
+                    module_components.push(literal.to_string());
+                }
+                nom_pattern::PatternSegment::Wildcard => {
+                    break;
+                }
+                nom_pattern::PatternSegment::Placeholder => {
+                    // Placeholder segment should be ignored
+                }
+            }
+        } else {
+            // Compound segment - concatenate all parts
+            let compound_parts: Vec<&str> = segment_group
                 .iter()
-                .chain(extended_components.iter())
+                .filter_map(|segment| {
+                    match segment {
+                        nom_pattern::PatternSegment::Named(name) => Some(*name),
+                        nom_pattern::PatternSegment::Literal(literal) => Some(*literal),
+                        _ => None, // Skip wildcards/placeholders in compound segments
+                    }
+                })
                 .collect();
 
-            let mut extended_hierarchical = extended_base_path.clone();
-            extended_hierarchical.push("init.lua");
-            paths.push(extended_hierarchical.to_string_lossy().to_string());
-
-            let mut extended_context = extended_base_path.clone();
-            extended_context.set_extension("lua");
-            paths.push(extended_context.to_string_lossy().to_string());
-
-            let extended_flat_path =
-                PathBuf::from(module_name).join(format!("{}.lua", extended_flat_name));
-            paths.push(extended_flat_path.to_string_lossy().to_string());
+            if !compound_parts.is_empty() {
+                module_components.push(compound_parts.join(""));
+            }
         }
     }
 
-    for i in (1..=components_with_ext.len()).rev() {
-        let components = &components_with_ext[0..i];
-        let flat_name = components.join("_");
+    let mut paths = Vec::new();
 
-        // Build base path using collect()
-        let base_path: PathBuf = [module_name].iter().chain(components.iter()).collect();
+    // Hierarchical: module/schema_table/load_type/init.lua
+    let mut hierarchical = PathBuf::from_iter(&module_components);
+    hierarchical.push("init.lua");
+    paths.push(hierarchical.to_string_lossy().to_string());
 
-        // Hierarchical patterns: module/azure/myaccount/init.lua
-        let mut hierarchical_path = base_path.clone();
-        hierarchical_path.push("init.lua");
-        paths.push(hierarchical_path.to_string_lossy().to_string());
+    // Context-named: module/schema_table/load_type.lua
+    if module_components.len() > 1 {
+        let mut context = PathBuf::from_iter(&module_components);
+        let context_with_extension = format!("{}.lua", context.to_string_lossy());
+        paths.push(context_with_extension);
+    }
 
-        // Context-named patterns: module/azure/myaccount.lua
-        let mut context_path = base_path.clone();
-        context_path.set_extension("lua");
-        paths.push(context_path.to_string_lossy().to_string());
-
-        // Flat patterns: module/azure_myaccount_datacontainer.lua
-        let flat_path = PathBuf::from(module_name).join(format!("{}.lua", flat_name));
-        paths.push(flat_path.to_string_lossy().to_string());
+    // Flat: module/schema_table_load_type.lua
+    if module_components.len() > 1 {
+        let semantic_parts = &module_components[1..];
+        let flat_name = format!("{}.lua", semantic_parts.join("_"));
+        let flat = PathBuf::from(module_components[0].clone()).join(flat_name);
+        paths.push(flat.to_string_lossy().to_string());
     }
 
     paths
 }
 
-pub fn build_module_lookups_for_url<'a>(
-    modules: &'a [String],
-    storage_provider: &'a StorageProvider,
-) -> Vec<String> {
-    let mut all_paths = Vec::new();
-    let storage_url = storage_provider.get_url();
-    let url_data = UrlData::from(storage_url);
-
-    // Build function components based on storage type
-    let (function_components, path_segments, extension): (
-        Vec<&'a str>,
-        Vec<&'a str>,
-        Option<String>,
-    ) = match storage_provider {
-        StorageProvider::Azure(azure_url) => {
-            // Build components directly from azure_url (lives as long as 'a)
-            let components: Vec<&str> =
-                vec!["azure", &azure_url.storage_account, &azure_url.container];
-
-            // Get path segments directly from azure_url
-            let segments = get_path_segments(&azure_url.path);
-
-            (components, segments, url_data.extension.clone())
-        }
-        StorageProvider::Local(_, _) => {
-            let components: Vec<&str> = vec!["local"];
-
-            // Get extension (owned to avoid lifetime issues)
-            let ext = url_data.extension.clone();
-
-            // Local storage doesn't use path segments for now
-            (components, vec![], ext)
-        }
-    };
-
-    // Build file paths for each module (most specific modules first)
-    for module in modules.iter().rev() {
-        // Generate full hierarchy paths (most specific)
-        let file_paths = build_module_file_paths(
-            module,
-            &function_components,
-            &path_segments,
-            extension.as_deref(),
-        );
-        all_paths.extend(file_paths);
-
-        // Generate simpler scheme + extension paths (e.g., azure/parquet/init.lua)
-        if let Some(ext) = &extension {
-            let scheme = match storage_provider {
-                StorageProvider::Azure(_) => "azure",
-                StorageProvider::Local(_, _) => "local",
-            };
-            let simple_components = vec![scheme];
-            let simple_paths = build_module_file_paths(module, &simple_components, &[], Some(ext));
-            all_paths.extend(simple_paths);
-        }
-    }
-
-    all_paths
-}
-
-pub fn build_module_lookups_with_semantic_segments(
-    modules: &[String],
-    semantic_segments: &[String],
-    wildcard_segments: &[String],
-    extension: Option<&str>,
-) -> Vec<String> {
-    let mut all_paths = Vec::new();
-
-    // Convert to string slices for existing function
-    let function_components: Vec<&str> = semantic_segments.iter().map(|s| s.as_str()).collect();
-    let path_segments: Vec<&str> = wildcard_segments.iter().map(|s| s.as_str()).collect();
-
-    // Build file paths for each module (most specific modules first)
-    for module in modules.iter().rev() {
-        let file_paths =
-            build_module_file_paths(module, &function_components, &path_segments, extension);
-        all_paths.extend(file_paths);
-    }
-
-    all_paths
-}
-
-// pub fn extract_semantic_segments(
-//     pattern: &PathPattern,
-//     path: &str,
-// ) -> Result<(Vec<String>, Vec<String>), anyhow::Error> {
-//     let extracted = pattern.extract(path)?;
-
-//     // Build semantic segments in pattern order
-//     let mut semantic_segments = Vec::new();
-//     for segment in &pattern.segments {
-//         if let PatternSegment::Named(name) = segment {
-//             if let Some(value) = extracted.named_segments.get(name) {
-//                 semantic_segments.push(value.clone());
-//             }
-//         }
-//     }
-
-//     Ok((semantic_segments, extracted.wildcard_segments))
-// }
-
 pub fn modules_from_args(args: LuaArgs) -> Result<Vec<String>, anyhow::Error> {
     let file_url = args.file_url.clone();
+    let pattern_str = args.pattern.clone();
     let module_config = ModuleConfig::try_from(args)?;
 
-    // Parse the storage provider from the URL
-    let storage = StorageProvider::try_from_string(file_url.as_str())?;
+    // Parse the pattern
+    let pattern = nom_pattern::PathPattern::new(&pattern_str)?;
 
-    // Build module lookups
-    let file_paths = build_module_lookups_for_url(&module_config.modules, &storage);
+    // Parse the storage provider from the URL (for future use)
+    let _storage = StorageProvider::try_from_string(file_url.as_str())?;
 
-    Ok(file_paths)
+    // Build module lookups for each module using the pattern
+    let mut all_paths = Vec::new();
+    for module in &module_config.modules {
+        let paths = build_module_path_from_pattern(&pattern, module);
+        all_paths.extend(paths);
+    }
+
+    Ok(all_paths)
 }
 
 pub struct LuaFunctionLoader {
@@ -353,321 +461,357 @@ pub struct LuaFunctionLoader {
     loaded_files: HashSet<String>,
 }
 
-// impl LuaFunctionLoader {
-//     pub fn new() -> Result<Self, mlua::Error> {
-//         Ok(LuaFunctionLoader {
-//             lua: Lua::new(),
-//             loaded_files: HashSet::new(),
-//         })
-//     }
+impl LuaFunctionLoader {
+    pub fn new() -> Result<Self, mlua::Error> {
+        Ok(LuaFunctionLoader {
+            lua: Lua::new(),
+            loaded_files: HashSet::new(),
+        })
+    }
 
-//     pub fn find_and_load_function(
-//         &mut self,
-//         module_paths: &[String],
-//         function_name: &str,
-//     ) -> Result<Option<mlua::Function>, anyhow::Error> {
-//         for path in module_paths {
-//             // Check if file exists first (cheap filesystem check)
-//             if !Path::new(path).exists() {
-//                 continue;
-//             }
+    pub fn setup_execution_context<'a>(
+        &'a mut self,
+        parquet_schema: Option<ParquetSchema<'a>>,
+    ) -> Result<(), anyhow::Error> {
+        // Set global parquet_schema value
+        let value = match parquet_schema {
+            Some(schema) => self
+                .lua
+                .to_value(&schema)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize parquet schema: {}", e))?,
+            None => mlua::Value::Nil,
+        };
 
-//             // Load file if not already loaded
-//             if !self.loaded_files.contains(path) {
-//                 let content = std::fs::read_to_string(path)?;
-//                 self.lua.load(&content).exec()?;
-//                 self.loaded_files.insert(path.clone());
-//             }
+        self.lua
+            .globals()
+            .set("parquet_schema", value)
+            .map_err(|e| anyhow::anyhow!("Failed to set parquet_schema global: {}", e))?;
+        Ok(())
+    }
 
-//             // Check if function exists in global scope
-//             if let Ok(func) = self.lua.globals().get::<_, mlua::Function>(function_name) {
-//                 return Ok(Some(func));
-//             }
-//         }
+    pub fn find_and_load_function(
+        &mut self,
+        module_paths: &[String],
+        function_name: &str,
+    ) -> Result<Option<mlua::Function>, anyhow::Error> {
+        // First-wins: check paths in order
+        for path in module_paths {
+            // Check existence first (cheap syscall)
+            if !Path::new(path).exists() {
+                continue;
+            }
 
-//         Ok(None)
-//     }
+            // Load file if not already cached
+            if !self.loaded_files.contains(path) {
+                let content = std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path, e))?;
 
-//     pub fn call_pre_exec(
-//         &mut self,
-//         func: mlua::Function,
-//         url_data: &UrlData,
-//     ) -> Result<Vec<String>, anyhow::Error> {
-//         let result: Vec<String> = func.call(url_data)?;
-//         Ok(result)
-//     }
+                // Fail fast on syntax errors
+                self.lua
+                    .load(&content)
+                    .exec()
+                    .map_err(|e| anyhow::anyhow!("Lua syntax error in {}: {}", path, e))?;
 
-//     pub fn call_exec(
-//         &mut self,
-//         func: mlua::Function,
-//         url_data: &UrlData,
-//     ) -> Result<Vec<String>, anyhow::Error> {
-//         let result: Vec<String> = func.call(url_data)?;
-//         Ok(result)
-//     }
+                self.loaded_files.insert(path.clone());
+            }
 
-//     pub fn call_post_exec(
-//         &mut self,
-//         func: mlua::Function,
-//         url_data: &UrlData,
-//     ) -> Result<Vec<String>, anyhow::Error> {
-//         let result: Vec<String> = func.call(url_data)?;
-//         Ok(result)
-//     }
+            // Check if function exists (first-wins)
+            if let Ok(func) = self.lua.globals().get::<mlua::Function>(function_name) {
+                return Ok(Some(func));
+            }
+        }
 
-//     pub fn load_pre_exec(
-//         &mut self,
-//         module_paths: &[String],
-//     ) -> Result<Option<mlua::Function>, anyhow::Error> {
-//         self.find_and_load_function(module_paths, "pre_exec")
-//     }
+        Ok(None) // Function not found in any file
+    }
 
-//     pub fn load_exec(
-//         &mut self,
-//         module_paths: &[String],
-//     ) -> Result<Option<mlua::Function>, anyhow::Error> {
-//         self.find_and_load_function(module_paths, "exec")
-//     }
+    pub fn call_pre_exec(
+        &mut self,
+        func: mlua::Function,
+        url_data: &UrlData,
+        storage_data: &StorageData,
+        segments_value: &serde_json::Value,
+        schema: &SchemaRef,
+        context: &serde_json::Value,
+    ) -> Result<PreExecResult, anyhow::Error> {
+        let url_value = self
+            .lua
+            .to_value(url_data)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize UrlData: {}", e))?;
+        let storage_value = self
+            .lua
+            .to_value(storage_data)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize StorageData: {}", e))?;
+        let segments_lua_value = self
+            .lua
+            .to_value(segments_value)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize segments: {}", e))?;
+        let schema_value = self
+            .lua
+            .to_value(schema)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize Schema: {}", e))?;
+        let context_value = self
+            .lua
+            .to_value(context)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize context: {}", e))?;
 
-//     pub fn load_post_exec(
-//         &mut self,
-//         module_paths: &[String],
-//     ) -> Result<Option<mlua::Function>, anyhow::Error> {
-//         self.find_and_load_function(module_paths, "post_exec")
-//     }
-// }
+        let lua_result: mlua::Value = func
+            .call((
+                url_value,
+                storage_value,
+                segments_lua_value,
+                schema_value,
+                context_value,
+            ))
+            .map_err(|e| anyhow::anyhow!("Lua call failed: {}", e))?;
+        let result: PreExecResult = self
+            .lua
+            .from_value(lua_result)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize PreExecResult: {}", e))?;
+        Ok(result)
+    }
+
+    pub fn call_exec<T: serde::de::DeserializeOwned>(
+        &mut self,
+        func: mlua::Function,
+        url_data: &UrlData,
+        storage_data: &StorageData,
+        segments_value: &serde_json::Value,
+        schema: &SchemaRef,
+        context: &serde_json::Value,
+    ) -> Result<ExecResult<T>, anyhow::Error> {
+        let url_value = self
+            .lua
+            .to_value(url_data)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize UrlData: {}", e))?;
+        let storage_value = self
+            .lua
+            .to_value(storage_data)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize StorageData: {}", e))?;
+        let segments_lua_value = self
+            .lua
+            .to_value(segments_value)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize segments: {}", e))?;
+        let schema_value = self
+            .lua
+            .to_value(schema)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize Schema: {}", e))?;
+        let context_value = self
+            .lua
+            .to_value(context)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize context: {}", e))?;
+
+        let lua_result: mlua::Value = func
+            .call((
+                url_value,
+                storage_value,
+                segments_lua_value,
+                schema_value,
+                context_value,
+            ))
+            .map_err(|e| anyhow::anyhow!("Lua call failed: {}", e))?;
+        let result: ExecResult<T> = self
+            .lua
+            .from_value(lua_result)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize ExecResult: {}", e))?;
+        Ok(result)
+    }
+
+    pub fn call_post_exec(
+        &mut self,
+        func: mlua::Function,
+        url_data: &UrlData,
+        storage_data: &StorageData,
+        segments_value: &serde_json::Value,
+        schema: &SchemaRef,
+        context: &serde_json::Value,
+    ) -> Result<LuaResult, anyhow::Error> {
+        let url_value = self
+            .lua
+            .to_value(url_data)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize UrlData: {}", e))?;
+        let storage_value = self
+            .lua
+            .to_value(storage_data)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize StorageData: {}", e))?;
+        let segments_lua_value = self
+            .lua
+            .to_value(segments_value)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize segments: {}", e))?;
+        let schema_value = self
+            .lua
+            .to_value(schema)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize Schema: {}", e))?;
+        let context_value = self
+            .lua
+            .to_value(context)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize context: {}", e))?;
+
+        let lua_result: mlua::Value = func
+            .call((
+                url_value,
+                storage_value,
+                segments_lua_value,
+                schema_value,
+                context_value,
+            ))
+            .map_err(|e| anyhow::anyhow!("Lua call failed: {}", e))?;
+        let result: LuaResult = self
+            .lua
+            .from_value(lua_result)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize LuaResult: {}", e))?;
+        Ok(result)
+    }
+
+    pub fn load_pre_exec(
+        &mut self,
+        module_paths: &[String],
+    ) -> Result<Option<mlua::Function>, anyhow::Error> {
+        self.find_and_load_function(module_paths, "pre_exec")
+    }
+
+    pub fn load_exec(
+        &mut self,
+        module_paths: &[String],
+    ) -> Result<Option<mlua::Function>, anyhow::Error> {
+        self.find_and_load_function(module_paths, "exec")
+    }
+
+    pub fn load_post_exec(
+        &mut self,
+        module_paths: &[String],
+    ) -> Result<Option<mlua::Function>, anyhow::Error> {
+        self.find_and_load_function(module_paths, "post_exec")
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_build_module_file_paths_single_component() {
-        let paths = build_module_file_paths("base_azure", &["azure"], &[], None);
+    fn test_build_module_path_from_pattern() {
+        let pattern = nom_pattern::PathPattern::new("{environment}/{dataset}/{format}/*").unwrap();
+        let paths = build_module_path_from_pattern(&pattern, "company_mod");
 
+        // Should generate three variations
         assert_eq!(paths.len(), 3);
-        assert!(paths.contains(&"base_azure/azure/init.lua".to_string()));
-        assert!(paths.contains(&"base_azure/azure.lua".to_string()));
-        assert!(paths.contains(&"base_azure/azure.lua".to_string())); // Flat pattern same as context in this case
+
+        // Check hierarchical path
+        assert!(paths.contains(&"company_mod/environment/dataset/format/init.lua".to_string()));
+
+        // Check context-named path
+        assert!(paths.contains(&"company_mod/environment/dataset/format.lua".to_string()));
+
+        // Check flat path
+        assert!(paths.contains(&"company_mod/environment_dataset_format.lua".to_string()));
     }
 
     #[test]
-    fn test_build_module_file_paths_multiple_components() {
-        let paths = build_module_file_paths(
-            "company_mod",
-            &["azure", "myaccount", "datacontainer"],
-            &[],
-            None,
-        );
+    fn test_build_module_path_from_pattern_with_literal() {
+        let pattern = nom_pattern::PathPattern::new("{environment}/{dataset}/streaming/*").unwrap();
+        let paths = build_module_path_from_pattern(&pattern, "base_mod");
 
-        // Should generate paths in order of specificity (most to least)
-        let expected_paths = vec![
-            "company_mod/azure/myaccount/datacontainer/init.lua",
-            "company_mod/azure/myaccount/datacontainer.lua",
-            "company_mod/azure_myaccount_datacontainer.lua",
-            "company_mod/azure/myaccount/init.lua",
-            "company_mod/azure/myaccount.lua",
-            "company_mod/azure_myaccount.lua",
-            "company_mod/azure/init.lua",
-            "company_mod/azure.lua",
-            "company_mod/azure.lua", // Flat pattern same as context for single component
-        ];
-
-        assert_eq!(paths.len(), expected_paths.len());
-        for expected in expected_paths {
-            assert!(
-                paths.contains(&expected.to_string()),
-                "Missing path: {}",
-                expected
-            );
-        }
+        // Should use literal "streaming" in paths
+        assert!(paths.contains(&"base_mod/environment/dataset/streaming/init.lua".to_string()));
+        assert!(paths.contains(&"base_mod/environment/dataset/streaming.lua".to_string()));
+        assert!(paths.contains(&"base_mod/environment_dataset_streaming.lua".to_string()));
     }
 
     #[test]
-    fn test_build_module_file_paths_with_file_extension() {
-        let paths = build_module_file_paths(
-            "staging_env",
-            &["azure", "myaccount", "datacontainer"],
-            &[],
-            Some("csv"),
-        );
+    fn test_build_module_path_from_pattern_single_segment() {
+        let pattern = nom_pattern::PathPattern::new("{pipeline}/*").unwrap();
+        let paths = build_module_path_from_pattern(&pattern, "test_mod");
 
-        // Check most specific paths are generated
-        assert!(
-            paths.contains(&"staging_env/azure/myaccount/datacontainer/csv/init.lua".to_string())
-        );
-        assert!(paths.contains(&"staging_env/azure/myaccount/datacontainer/csv.lua".to_string()));
-        assert!(paths.contains(&"staging_env/azure_myaccount_datacontainer_csv.lua".to_string()));
-
-        // Check fallback paths are generated
-        assert!(paths.contains(&"staging_env/azure/myaccount/datacontainer/init.lua".to_string()));
-        assert!(paths.contains(&"staging_env/azure/init.lua".to_string()));
+        // Should generate paths for single semantic segment
+        assert!(paths.contains(&"test_mod/pipeline/init.lua".to_string()));
+        assert!(paths.contains(&"test_mod/pipeline.lua".to_string()));
+        assert!(paths.contains(&"test_mod/pipeline.lua".to_string())); // Flat same as context for single
     }
 
     #[test]
-    fn test_build_module_file_paths_empty_components() {
-        let paths = build_module_file_paths("base_mod", &[], &[], None);
+    fn test_call_pre_exec_with_three_parameters() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        use url::Url;
 
-        // Should return empty vec for empty components
-        assert!(paths.is_empty());
-    }
+        // Create test URL data
+        let test_url =
+            Url::parse("https://myaccount.blob.core.windows.net/container/path/file.parquet")
+                .unwrap();
+        let url_data = UrlData::from(test_url);
 
-    #[test]
-    fn test_build_module_file_paths_ordering() {
-        let paths = build_module_file_paths("test_mod", &["azure", "account"], &[], None);
+        // Create test storage data (Azure)
+        let storage_data = StorageData::Azure(AzureData {
+            storage_account: "myaccount".to_string(),
+            container: "container".to_string(),
+            path: "path/file.parquet".to_string(),
+        });
 
-        // Most specific should come first
-        assert_eq!(paths[0], "test_mod/azure/account/init.lua");
-        assert_eq!(paths[1], "test_mod/azure/account.lua");
-        assert_eq!(paths[2], "test_mod/azure_account.lua");
+        // Create test extracted segments
+        let pattern = nom_pattern::PathPattern::new("{environment}/{schema_table}/*").unwrap();
+        let path = "/prod/public.users/2025/06/25/file.parquet";
+        let extracted = pattern.parse_path(path).unwrap();
+        let segments_value = nom_pattern::extracted_segments_to_value(&extracted);
 
-        // Less specific should come after
-        assert!(paths[3].starts_with("test_mod/azure/"));
-        assert!(paths[4].starts_with("test_mod/azure"));
-    }
+        // Create test schema with id column as int
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
 
-    #[test]
-    fn test_build_module_file_paths_with_path_segments() {
-        let paths = build_module_file_paths(
-            "env_mod",
-            &["azure", "myaccount", "datacontainer"],
-            &["staging", "raw"],
-            Some("csv"),
-        );
+        // Create empty context for pre_exec
+        let context = serde_json::json!({});
 
-        // Should include original paths
-        assert!(paths.contains(&"env_mod/azure/myaccount/datacontainer/csv/init.lua".to_string()));
+        // Create Lua loader and load a simple test function
+        let mut loader = LuaFunctionLoader::new().unwrap();
 
-        // Should include path segment extensions
-        assert!(paths
-            .contains(&"env_mod/azure/myaccount/datacontainer/csv/staging/init.lua".to_string()));
-        assert!(
-            paths.contains(&"env_mod/azure/myaccount/datacontainer/csv/staging.lua".to_string())
-        );
-        assert!(
-            paths.contains(&"env_mod/azure_myaccount_datacontainer_csv_staging.lua".to_string())
-        );
+        // Load a simple Lua function that returns PreExecResult
+        let lua_script = r#"
+            function pre_exec(url_data, storage_data, segments, schema, context)
+                return {
+                    sql = {"-- setup SQL"},
+                    schema = {
+                        table_name = "temp_users_123",
+                        columns = {
+                            {name = "id", column_type = "Uuid", conversion = "string_to_uuid"},
+                            {name = "metadata", column_type = "jsonb"}
+                        }
+                    },
+                    context = {temp_table = "temp_users_123"}
+                }
+            end
+        "#;
 
-        assert!(
-            paths.contains(&"env_mod/azure/myaccount/datacontainer/csv/raw/init.lua".to_string())
-        );
-        assert!(paths.contains(&"env_mod/azure/myaccount/datacontainer/csv/raw.lua".to_string()));
-        assert!(paths.contains(&"env_mod/azure_myaccount_datacontainer_csv_raw.lua".to_string()));
+        loader.lua.load(lua_script).exec().unwrap();
+        let func = loader
+            .lua
+            .globals()
+            .get::<mlua::Function>("pre_exec")
+            .unwrap();
 
-        // Most specific (with path segments) should come first
-        assert!(paths[0].contains("staging") || paths[0].contains("raw"));
-    }
+        // Test the call
+        let result = loader
+            .call_pre_exec(
+                func,
+                &url_data,
+                &storage_data,
+                &segments_value,
+                &schema,
+                &context,
+            )
+            .unwrap();
 
-    #[test]
-    fn test_build_module_file_paths_with_empty_path_segments() {
-        let paths = build_module_file_paths("test_mod", &["azure"], &[], None);
-        let paths_with_empty = build_module_file_paths("test_mod", &["azure"], &[], None);
-
-        // Should be identical when path_segments is empty
-        assert_eq!(paths, paths_with_empty);
-    }
-
-    #[test]
-    fn test_build_module_file_paths_with_compound_extension() {
-        let paths = build_module_file_paths(
-            "prod_mod",
-            &["azure", "myaccount", "datacontainer"],
-            &["staging"],
-            Some("csv_gz"),
-        );
-
-        // Should handle compound extensions properly
-        assert!(paths.contains(
-            &"prod_mod/azure/myaccount/datacontainer/csv_gz/staging/init.lua".to_string()
-        ));
-        assert!(paths
-            .contains(&"prod_mod/azure/myaccount/datacontainer/csv_gz/staging.lua".to_string()));
-        assert!(paths
-            .contains(&"prod_mod/azure_myaccount_datacontainer_csv_gz_staging.lua".to_string()));
-
-        // Should also include base compound extension paths
-        assert!(
-            paths.contains(&"prod_mod/azure/myaccount/datacontainer/csv_gz/init.lua".to_string())
-        );
-        assert!(paths.contains(&"prod_mod/azure/myaccount/datacontainer/csv_gz.lua".to_string()));
-        assert!(paths.contains(&"prod_mod/azure_myaccount_datacontainer_csv_gz.lua".to_string()));
-
-        // Verify compound extension comes from function components, not filename parsing
-        assert!(!paths.iter().any(|p| p.contains("csv.gz")));
-    }
-
-    #[test]
-    fn test_build_module_lookups_for_azure_url() {
-        let url_string =
-            "https://myaccount.blob.core.windows.net/datacontainer/staging/raw/data.csv.gz";
-        let storage = StorageProvider::try_from_string(url_string).unwrap();
-        let modules = vec!["base_azure".to_string(), "company_mod".to_string()];
-
-        let paths = build_module_lookups_for_url(&modules, &storage);
-
-        // Should have paths from both modules
-        assert!(paths.iter().any(|p| p.contains("base_azure")));
-        assert!(paths.iter().any(|p| p.contains("company_mod")));
-
-        // Should include path segment extensions (most specific)
-        assert!(paths.iter().any(|p| p.contains("csv_gz_staging")));
-        assert!(paths.iter().any(|p| p.contains("csv_gz_raw")));
-
-        // Should include base paths (less specific)
-        assert!(paths
-            .iter()
-            .any(|p| p.contains("company_mod/azure/myaccount/datacontainer/csv_gz/init.lua")));
-
-        // Most specific (company_mod) should come first since modules are reversed
-        assert!(paths[0].contains("company_mod"));
-    }
-
-    #[test]
-    fn test_build_module_lookups_for_local_url() {
-        let url_string = "file:///home/data/file.csv";
-        let storage = StorageProvider::try_from_string(url_string).unwrap();
-        let modules = vec!["base_local".to_string()];
-
-        let paths = build_module_lookups_for_url(&modules, &storage);
-
-        assert!(paths
-            .iter()
-            .any(|p| p.contains("base_local/local/csv/init.lua")));
-        assert!(paths.iter().any(|p| p.contains("base_local/local_csv.lua")));
-    }
-
-    #[test]
-    fn test_build_module_lookups_from_args() {
-        let args = LuaArgs {
-            lua_modules: Some(vec!["base_azure".to_string(), "company_mod".to_string()]),
-            lua_modules_json: None,
-            file_url: "https://myaccount.blob.core.windows.net/datacontainer/data.csv".to_string(),
-        };
-
-        let paths = modules_from_args(args).unwrap();
-
-        // Should have paths from both modules
-        assert!(paths.iter().any(|p| p.contains("base_azure")));
-        assert!(paths.iter().any(|p| p.contains("company_mod")));
-        assert!(paths.iter().any(|p| p.contains("myaccount")));
-        assert!(paths.iter().any(|p| p.contains("datacontainer")));
-    }
-
-    #[test]
-    fn test_build_module_lookups_from_args_json() {
-        let args = LuaArgs {
-            lua_modules: None,
-            lua_modules_json: Some(r#"["base_azure", "prod_env"]"#.to_string()),
-            file_url: "https://myaccount.blob.core.windows.net/datacontainer/staging/data.csv.gz"
-                .to_string(),
-        };
-
-        let paths = modules_from_args(args).unwrap();
-
-        // Should handle compound extensions and path segments
-        assert!(paths.iter().any(|p| p.contains("base_azure")));
-        assert!(paths.iter().any(|p| p.contains("prod_env")));
-        assert!(paths.iter().any(|p| p.contains("csv.gz")));
-        assert!(paths.iter().any(|p| p.contains("staging")));
+        assert_eq!(result.sql, vec!["-- setup SQL"]);
+        assert_eq!(result.schema.table_name, "temp_users_123");
+        assert_eq!(result.schema.columns.len(), 2);
+        assert_eq!(result.schema.columns[0].name, "id");
+        assert_eq!(result.schema.columns[0].column_type, "Uuid".to_string());
+        // assert_eq!(
+        //     result.schema.columns[0].conversion,
+        //     Some("string_to_uuid".to_string())
+        // );
+        assert_eq!(result.schema.columns[1].name, "metadata");
+        // assert_eq!(
+        //     result.schema.columns[1].override_type,
+        //     Some("jsonb".to_string())
+        // );
+        assert_eq!(result.context["temp_table"], "temp_users_123");
     }
 }

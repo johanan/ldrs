@@ -3,7 +3,7 @@ use parquet::file::metadata::FileMetaData;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use std::sync::Arc;
 
-use crate::types::{ColumnDefintion, ColumnSchema};
+use crate::types::{ColumnDefintion, ColumnSchema, TimeUnit};
 
 pub fn get_fields(
     metadata: &parquet::file::metadata::FileMetaData,
@@ -58,11 +58,11 @@ pub fn map_parquet_to_abstract<'a>(
                         LogicalType::Timestamp {
                             is_adjusted_to_u_t_c: true,
                             unit,
-                        } => ColumnSchema::TimestampTz(name, unit),
+                        } => ColumnSchema::TimestampTz(name, TimeUnit::from(&unit)),
                         LogicalType::Timestamp {
                             is_adjusted_to_u_t_c: false,
                             unit,
-                        } => ColumnSchema::Timestamp(name, unit),
+                        } => ColumnSchema::Timestamp(name, TimeUnit::from(&unit)),
                         LogicalType::Uuid => ColumnSchema::Uuid(name),
                         LogicalType::Json => ColumnSchema::Jsonb(name),
                         LogicalType::Decimal { scale, precision } => {

@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+pub mod parquet_types;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TimeUnit {
+    Millis,
+    Micros,
+    Nanos,
+}
+
+impl From<&parquet::basic::TimeUnit> for TimeUnit {
+    fn from(pq_unit: &parquet::basic::TimeUnit) -> Self {
+        match pq_unit {
+            parquet::basic::TimeUnit::MILLIS(_) => TimeUnit::Millis,
+            parquet::basic::TimeUnit::MICROS(_) => TimeUnit::Micros,
+            parquet::basic::TimeUnit::NANOS(_) => TimeUnit::Nanos,
+        }
+    }
+}
+
 /// Maps a Parquet schema’s type to a corresponding PostgreSQL type. PostgreSQL types are used as
 /// the abstract representation of the Parquet schema.
 ///
@@ -38,8 +57,8 @@ use serde::{Deserialize, Serialize};
 pub enum ColumnSchema<'a> {
     Varchar(&'a str, i32),
     Text(&'a str),
-    TimestampTz(&'a str, parquet::basic::TimeUnit),
-    Timestamp(&'a str, parquet::basic::TimeUnit),
+    TimestampTz(&'a str, TimeUnit),
+    Timestamp(&'a str, TimeUnit),
     Uuid(&'a str),
     Jsonb(&'a str),
     Numeric(&'a str, i32, i32),
@@ -50,6 +69,29 @@ pub enum ColumnSchema<'a> {
     BigInt(&'a str),
     Boolean(&'a str),
     Date(&'a str),
+    Custom(&'a str, &'a str), // (column_name, ddl_type)
+}
+
+impl<'a> ColumnSchema<'a> {
+    pub fn name(&self) -> &'a str {
+        match self {
+            ColumnSchema::Varchar(name, _) => name,
+            ColumnSchema::Text(name) => name,
+            ColumnSchema::TimestampTz(name, _) => name,
+            ColumnSchema::Timestamp(name, _) => name,
+            ColumnSchema::Uuid(name) => name,
+            ColumnSchema::Jsonb(name) => name,
+            ColumnSchema::Numeric(name, _, _) => name,
+            ColumnSchema::Real(name) => name,
+            ColumnSchema::Double(name) => name,
+            ColumnSchema::SmallInt(name) => name,
+            ColumnSchema::Integer(name) => name,
+            ColumnSchema::BigInt(name) => name,
+            ColumnSchema::Boolean(name) => name,
+            ColumnSchema::Date(name) => name,
+            ColumnSchema::Custom(name, _) => name,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

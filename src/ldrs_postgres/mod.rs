@@ -21,11 +21,18 @@ use native_tls::TlsConnector;
 use pg_bigdecimal::{BigDecimal, BigInt};
 use postgres_native_tls::MakeTlsConnector;
 use postgres_types::{to_sql_checked, ToSql, Type};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::pin::pin;
 use std::pin::Pin;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tracing::info;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PostgresLoadMode {
+    Binary,
+    Insert,
+}
 
 #[derive(Subcommand)]
 pub enum PgCommands {
@@ -112,7 +119,12 @@ pub fn map_parquet_to_ddl(pq: &ColumnSchema) -> String {
         ColumnSchema::Text(name) => format!("{} text", name),
         ColumnSchema::Uuid(name) => format!("{} uuid", name),
         ColumnSchema::Varchar(name, size) => format!("{} varchar({})", name, size),
+        ColumnSchema::Custom(name, type_name) => format!("{} {}", name, type_name),
     }
+}
+
+pub fn map_columnschema_to_ddl(column: &ColumnSchema) -> String {
+    map_columnschema_to_ddl(column)
 }
 
 pub fn map_parquet_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
@@ -131,6 +143,7 @@ pub fn map_parquet_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
         ColumnSchema::Text(_) => postgres_types::Type::TEXT,
         ColumnSchema::Uuid(_) => postgres_types::Type::UUID,
         ColumnSchema::Varchar(_, _) => postgres_types::Type::VARCHAR,
+        ColumnSchema::Custom(_, _) => postgres_types::Type::VARCHAR,
     }
 }
 
@@ -529,9 +542,8 @@ impl<'a> ToSql for PgTypedValue<'a> {
 
 #[cfg(test)]
 mod tests {
-    use parquet::{basic::TimeUnit, format::MilliSeconds};
-
     use crate::parquet_provider::builder_from_string;
+    use crate::types::TimeUnit;
     use crate::{
         parquet_provider,
         pq::{self, get_fields, map_parquet_to_abstract},
@@ -546,7 +558,7 @@ mod tests {
         let pq_types = [
             ColumnSchema::BigInt("id"),
             ColumnSchema::Text("name"),
-            ColumnSchema::Timestamp("created_at", TimeUnit::MILLIS(MilliSeconds {})),
+            ColumnSchema::Timestamp("created_at", TimeUnit::Millis),
         ];
 
         let first_def = build_definition(full_table, &pq_types, None, None).unwrap();

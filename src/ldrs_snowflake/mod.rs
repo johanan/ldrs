@@ -1,8 +1,14 @@
 use anyhow::Context;
 use clap::Subcommand;
+use serde::{Deserialize, Serialize};
 use std::process::Command;
 use tracing::info;
 use url::Url;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SnowflakeLoadMode {
+    Copy,
+}
 
 #[derive(Subcommand)]
 pub enum SnowflakeCommands {
@@ -54,4 +60,20 @@ impl SnowflakeConnection {
             Err(anyhow::anyhow!("Command failed: {}", stderr))
         }
     }
+
+    /// Execute multiple SQL statements in a transaction
+    pub fn exec_transaction(&self, sql_statements: &[String]) -> Result<String, anyhow::Error> {
+        if sql_statements.is_empty() {
+            return Ok("No statements to execute".to_string());
+        }
+
+        // Combine all statements into a single transaction
+        let transaction_sql = format!(
+            "BEGIN;\n{}\nCOMMIT;",
+            sql_statements.join(";\n")
+        );
+
+        self.exec(&transaction_sql)
+    }
 }
+
