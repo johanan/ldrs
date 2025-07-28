@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use ldrs::{
-    ldrs_postgres::{build_ddl, create_connection, map_parquet_to_ddl, PostgresLoadMode},
+    ldrs_postgres::{build_ddl, create_connection, map_parquet_to_ddl, PostgresStrategy},
     lua_logic::{
         build_module_path_from_pattern, nom_pattern, LuaFunctionLoader, StorageData, UrlData,
     },
@@ -9,9 +9,16 @@ use ldrs::{
     storage::StorageProvider,
     types::{
         parquet_types::{get_fields, ParquetSchema},
-        ColumnSchema,
+        ColumnSchema, TableSchema,
     },
 };
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TestLuaResult {
+    pub sql: Vec<String>,
+    pub schema: TableSchema,
+}
 
 #[tokio::test]
 async fn test_postgres_integration() {
@@ -55,12 +62,12 @@ async fn test_postgres_integration() {
     let context = serde_json::json!({});
 
     let lua_output = loader
-        .call_pre_exec(
-            func,
+        .call_process::<TestLuaResult>(
+            &module_paths,
             &url_data,
             &storage_data,
             &segments_value,
-            builder.schema(),
+            Some(builder.schema()),
             &context,
         )
         .unwrap();
@@ -120,23 +127,6 @@ async fn test_postgres_integration() {
     tx.execute(&ddl_statement, &[]).await.unwrap();
 
     tx.commit().await.unwrap();
-
-    let exec_func = loader
-        .find_and_load_function(&module_paths, "exec")
-        .unwrap()
-        .unwrap();
-
-    let exec_lua_output = loader
-        .call_exec::<PostgresLoadMode>(
-            exec_func,
-            &url_data,
-            &storage_data,
-            &segments_value,
-            builder.schema(),
-            &context,
-        )
-        .unwrap();
-    println!("exec_lua_output: {:?}", exec_lua_output);
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }

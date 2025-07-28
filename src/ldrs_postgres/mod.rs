@@ -29,7 +29,7 @@ use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PostgresLoadMode {
+pub enum PostgresStrategy {
     Binary,
     Insert,
 }

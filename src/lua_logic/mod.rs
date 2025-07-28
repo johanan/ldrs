@@ -4,7 +4,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::storage::{azure::AzureUrl, StorageProvider};
-use crate::types::{parquet_types::ParquetSchema, ColumnSchema, TimeUnit};
+use crate::types::{
+    parquet_types::ParquetSchema, ColumnMapping, ColumnSchema, TableSchema, TimeUnit,
+};
 use arrow::datatypes::SchemaRef;
 use clap::Args;
 use mlua::{FromLua, Lua, LuaSerdeExt};
@@ -46,184 +48,6 @@ pub enum StorageData {
     Azure(AzureData),
     #[serde(rename = "local")]
     Local(LocalData),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LuaResult {
-    pub sql: Vec<String>,
-    pub context: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColumnMapping {
-    pub name: String,
-    pub column_type: String,       // Type name (case-insensitive)
-    pub processor: Option<String>, // Processor for data conversion
-    pub precision: Option<i32>,    // For NUMERIC types
-    pub scale: Option<i32>,        // For NUMERIC types
-    pub length: Option<i32>,       // For VARCHAR types
-    pub time_unit: Option<String>, // For TIMESTAMP types: "millis", "micros", "nanos"
-}
-
-use std::collections::HashMap;
-
-impl ColumnMapping {
-    pub fn to_column_schema<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        let type_map: HashMap<
-            &str,
-            for<'b> fn(&ColumnMapping, &'b str) -> Result<ColumnSchema<'b>, anyhow::Error>,
-        > = [
-            (
-                "varchar",
-                Self::parse_varchar
-                    as for<'b> fn(
-                        &ColumnMapping,
-                        &'b str,
-                    ) -> Result<ColumnSchema<'b>, anyhow::Error>,
-            ),
-            ("text", Self::parse_text),
-            ("jsonb", Self::parse_jsonb),
-            ("numeric", Self::parse_numeric),
-            ("uuid", Self::parse_uuid),
-            ("timestamp", Self::parse_timestamp),
-            ("timestamptz", Self::parse_timestamptz),
-            ("boolean", Self::parse_boolean),
-            ("integer", Self::parse_integer),
-            ("bigint", Self::parse_bigint),
-            ("smallint", Self::parse_smallint),
-            ("real", Self::parse_real),
-            ("double", Self::parse_double),
-            ("date", Self::parse_date),
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        // Find matching parser (case-insensitive)
-        let parser = type_map
-            .iter()
-            .find(|(key, _)| self.column_type.eq_ignore_ascii_case(key))
-            .map(|(_, parser)| *parser);
-
-        match parser {
-            Some(parse_fn) => Ok(parse_fn(self, name)?),
-            None => Ok(ColumnSchema::Custom(name, &self.column_type)),
-        }
-    }
-
-    // Individual type parsers that return ColumnSchema directly
-    fn parse_varchar<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        let length = self.length.ok_or_else(|| {
-            anyhow::anyhow!(
-                "VARCHAR requires length parameter for column '{}'",
-                self.name
-            )
-        })?;
-        Ok(ColumnSchema::Varchar(name, length))
-    }
-
-    fn parse_text<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Text(name))
-    }
-
-    fn parse_jsonb<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Jsonb(name))
-    }
-
-    fn parse_numeric<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        let precision = self.precision.ok_or_else(|| {
-            anyhow::anyhow!(
-                "NUMERIC requires precision parameter for column '{}'",
-                self.name
-            )
-        })?;
-        let scale = self.scale.ok_or_else(|| {
-            anyhow::anyhow!(
-                "NUMERIC requires scale parameter for column '{}'",
-                self.name
-            )
-        })?;
-        Ok(ColumnSchema::Numeric(name, precision, scale))
-    }
-
-    fn parse_uuid<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Uuid(name))
-    }
-
-    fn parse_timestamp<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        let time_unit = self.parse_time_unit()?;
-        Ok(ColumnSchema::Timestamp(name, time_unit))
-    }
-
-    fn parse_timestamptz<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        let time_unit = self.parse_time_unit()?;
-        Ok(ColumnSchema::TimestampTz(name, time_unit))
-    }
-
-    fn parse_time_unit(&self) -> Result<TimeUnit, anyhow::Error> {
-        match self.time_unit.as_deref() {
-            Some(unit) if unit.eq_ignore_ascii_case("millis") => Ok(TimeUnit::Millis),
-            Some(unit) if unit.eq_ignore_ascii_case("micros") => Ok(TimeUnit::Micros),
-            Some(unit) if unit.eq_ignore_ascii_case("nanos") => Ok(TimeUnit::Nanos),
-            Some(unit) => Err(anyhow::anyhow!(
-                "Invalid time unit '{}' for column '{}'. Valid options: millis, micros, nanos",
-                unit,
-                self.name
-            )),
-            None => Ok(TimeUnit::Millis), // Default to milliseconds
-        }
-    }
-
-    fn parse_boolean<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Boolean(name))
-    }
-
-    fn parse_integer<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Integer(name))
-    }
-
-    fn parse_bigint<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::BigInt(name))
-    }
-
-    fn parse_smallint<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::SmallInt(name))
-    }
-
-    fn parse_real<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Real(name))
-    }
-
-    fn parse_double<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Double(name))
-    }
-
-    fn parse_date<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Date(name))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TableSchema {
-    pub table_name: String,
-    pub columns: Vec<ColumnMapping>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PreExecResult {
-    pub sql: Vec<String>,
-    pub schema: TableSchema,
-    pub context: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecResult<T> {
-    pub sql: Vec<String>,
-    pub load_mode: T,
-    pub context: serde_json::Value,
 }
 
 #[derive(Args, Debug)]
@@ -524,15 +348,15 @@ impl LuaFunctionLoader {
         Ok(None) // Function not found in any file
     }
 
-    pub fn call_pre_exec(
+    pub fn call_lua_function<T: serde::de::DeserializeOwned>(
         &mut self,
         func: mlua::Function,
         url_data: &UrlData,
         storage_data: &StorageData,
         segments_value: &serde_json::Value,
-        schema: &SchemaRef,
+        schema: Option<&SchemaRef>,
         context: &serde_json::Value,
-    ) -> Result<PreExecResult, anyhow::Error> {
+    ) -> Result<T, anyhow::Error> {
         let url_value = self
             .lua
             .to_value(url_data)
@@ -545,10 +369,13 @@ impl LuaFunctionLoader {
             .lua
             .to_value(segments_value)
             .map_err(|e| anyhow::anyhow!("Failed to serialize segments: {}", e))?;
-        let schema_value = self
-            .lua
-            .to_value(schema)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize Schema: {}", e))?;
+        let schema_value = match schema {
+            Some(s) => self
+                .lua
+                .to_value(s)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize Schema: {}", e))?,
+            None => mlua::Value::Nil,
+        };
         let context_value = self
             .lua
             .to_value(context)
@@ -563,130 +390,47 @@ impl LuaFunctionLoader {
                 context_value,
             ))
             .map_err(|e| anyhow::anyhow!("Lua call failed: {}", e))?;
-        let result: PreExecResult = self
+        let result: T = self
             .lua
             .from_value(lua_result)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize PreExecResult: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize result: {}", e))?;
         Ok(result)
     }
 
-    pub fn call_exec<T: serde::de::DeserializeOwned>(
+    pub fn call_process<T: serde::de::DeserializeOwned>(
         &mut self,
-        func: mlua::Function,
+        module_paths: &[String],
         url_data: &UrlData,
         storage_data: &StorageData,
         segments_value: &serde_json::Value,
-        schema: &SchemaRef,
+        schema: Option<&SchemaRef>,
         context: &serde_json::Value,
-    ) -> Result<ExecResult<T>, anyhow::Error> {
-        let url_value = self
-            .lua
-            .to_value(url_data)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize UrlData: {}", e))?;
-        let storage_value = self
-            .lua
-            .to_value(storage_data)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize StorageData: {}", e))?;
-        let segments_lua_value = self
-            .lua
-            .to_value(segments_value)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize segments: {}", e))?;
-        let schema_value = self
-            .lua
-            .to_value(schema)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize Schema: {}", e))?;
-        let context_value = self
-            .lua
-            .to_value(context)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize context: {}", e))?;
+    ) -> Result<T, anyhow::Error> {
+        let func = self
+            .find_and_load_function(module_paths, "process")?
+            .ok_or_else(|| anyhow::anyhow!("Process function not found in any module"))?;
 
-        let lua_result: mlua::Value = func
-            .call((
-                url_value,
-                storage_value,
-                segments_lua_value,
-                schema_value,
-                context_value,
-            ))
-            .map_err(|e| anyhow::anyhow!("Lua call failed: {}", e))?;
-        let result: ExecResult<T> = self
-            .lua
-            .from_value(lua_result)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize ExecResult: {}", e))?;
-        Ok(result)
-    }
-
-    pub fn call_post_exec(
-        &mut self,
-        func: mlua::Function,
-        url_data: &UrlData,
-        storage_data: &StorageData,
-        segments_value: &serde_json::Value,
-        schema: &SchemaRef,
-        context: &serde_json::Value,
-    ) -> Result<LuaResult, anyhow::Error> {
-        let url_value = self
-            .lua
-            .to_value(url_data)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize UrlData: {}", e))?;
-        let storage_value = self
-            .lua
-            .to_value(storage_data)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize StorageData: {}", e))?;
-        let segments_lua_value = self
-            .lua
-            .to_value(segments_value)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize segments: {}", e))?;
-        let schema_value = self
-            .lua
-            .to_value(schema)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize Schema: {}", e))?;
-        let context_value = self
-            .lua
-            .to_value(context)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize context: {}", e))?;
-
-        let lua_result: mlua::Value = func
-            .call((
-                url_value,
-                storage_value,
-                segments_lua_value,
-                schema_value,
-                context_value,
-            ))
-            .map_err(|e| anyhow::anyhow!("Lua call failed: {}", e))?;
-        let result: LuaResult = self
-            .lua
-            .from_value(lua_result)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize LuaResult: {}", e))?;
-        Ok(result)
-    }
-
-    pub fn load_pre_exec(
-        &mut self,
-        module_paths: &[String],
-    ) -> Result<Option<mlua::Function>, anyhow::Error> {
-        self.find_and_load_function(module_paths, "pre_exec")
-    }
-
-    pub fn load_exec(
-        &mut self,
-        module_paths: &[String],
-    ) -> Result<Option<mlua::Function>, anyhow::Error> {
-        self.find_and_load_function(module_paths, "exec")
-    }
-
-    pub fn load_post_exec(
-        &mut self,
-        module_paths: &[String],
-    ) -> Result<Option<mlua::Function>, anyhow::Error> {
-        self.find_and_load_function(module_paths, "post_exec")
+        self.call_lua_function(
+            func,
+            url_data,
+            storage_data,
+            segments_value,
+            schema,
+            context,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Simple test result type for lua_logic tests
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TestResult {
+        pub sql: Vec<String>,
+        pub schema: TableSchema,
+    }
 
     #[test]
     fn test_build_module_path_from_pattern() {
@@ -764,7 +508,7 @@ mod tests {
 
         // Load a simple Lua function that returns PreExecResult
         let lua_script = r#"
-            function pre_exec(url_data, storage_data, segments, schema, context)
+            function process(url_data, storage_data, segments, schema, context)
                 return {
                     sql = {"-- setup SQL"},
                     schema = {
@@ -774,7 +518,6 @@ mod tests {
                             {name = "metadata", column_type = "jsonb"}
                         }
                     },
-                    context = {temp_table = "temp_users_123"}
                 }
             end
         "#;
@@ -783,17 +526,17 @@ mod tests {
         let func = loader
             .lua
             .globals()
-            .get::<mlua::Function>("pre_exec")
+            .get::<mlua::Function>("process")
             .unwrap();
 
         // Test the call
         let result = loader
-            .call_pre_exec(
+            .call_lua_function::<TestResult>(
                 func,
                 &url_data,
                 &storage_data,
                 &segments_value,
-                &schema,
+                Some(&schema),
                 &context,
             )
             .unwrap();
@@ -812,6 +555,5 @@ mod tests {
         //     result.schema.columns[1].override_type,
         //     Some("jsonb".to_string())
         // );
-        assert_eq!(result.context["temp_table"], "temp_users_123");
     }
 }

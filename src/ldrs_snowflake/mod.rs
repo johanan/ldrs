@@ -5,9 +5,20 @@ use std::process::Command;
 use tracing::info;
 use url::Url;
 
+use crate::types::TableSchema;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SnowflakeLoadMode {
-    Copy,
+pub enum SnowflakeStrategy {
+    Sql(Vec<String>),
+    Ingest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnowflakeResult {
+    pub pre_sql: Vec<String>,
+    pub schema: Option<TableSchema>,
+    pub strategy: SnowflakeStrategy,
+    pub post_sql: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -68,12 +79,8 @@ impl SnowflakeConnection {
         }
 
         // Combine all statements into a single transaction
-        let transaction_sql = format!(
-            "BEGIN;\n{}\nCOMMIT;",
-            sql_statements.join(";\n")
-        );
+        let transaction_sql = format!("BEGIN;\n{}\nCOMMIT;", sql_statements.join(";\n"));
 
         self.exec(&transaction_sql)
     }
 }
-

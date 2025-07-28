@@ -1,4 +1,4 @@
-function pre_exec(url_data, storage_data, segments, schema, context)
+function process(url_data, storage_data, segments, schema, context)
     print("Executing pre-execution logic")
     local table_name = segments["table"]
     local schema_name = segments["schema"]
@@ -20,14 +20,5 @@ function pre_exec(url_data, storage_data, segments, schema, context)
                 { name = "varchar_value", column_type = "VARCHAR(255)", length = 255 }
             }
         },
-        context = {}
-    }
-end
-
-function exec(url_data, storage_data, segments, schema, context)
-    return {
-        sql = {},
-        load_mode = "Binary",
-        context = {}
     }
 end
