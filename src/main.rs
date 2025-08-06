@@ -1,29 +1,40 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
-use ldrs::delta::{delta_merge, delta_run, DeltaLoad, DeltaMerge};
-use ldrs::ldrs_arrow::{map_arrow_to_abstract, mvr_to_stream};
+use ldrs::delta::{delta_merge, delta_run, DeltaCommands};
 use ldrs::ldrs_postgres::load_from_mvr_config;
-use ldrs::ldrs_postgres::mvr_config::MvrConfig;
-use ldrs::ldrs_postgres::{
-    config::{LoadArgs, PGFileLoadArgs},
-    load_from_file, load_postgres_cmd,
-};
+use ldrs::ldrs_postgres::PgCommands;
+use ldrs::ldrs_postgres::{load_from_file, load_postgres_cmd};
+use ldrs::ldrs_snowflake::{SnowflakeResult, SnowflakeStrategy};
+use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
+use ldrs::path_pattern;
+use ldrs::types::lua_args::modules_from_args;
 use tracing::info;
 
 #[derive(Subcommand)]
-enum Commands {
-    Load(LoadArgs),
-    PGConfig(PGFileLoadArgs),
-    Delta(DeltaLoad),
-    Merge(DeltaMerge),
-    Mvr(MvrConfig),
+enum Destination {
+    /// PostgreSQL destination
+    Pg {
+        #[command(subcommand)]
+        command: PgCommands,
+    },
+    /// Delta Lake destination
+    Delta {
+        #[command(subcommand)]
+        command: DeltaCommands,
+    },
+    /// Snowflake destination
+    Sf {
+        #[command(subcommand)]
+        command: ldrs::ldrs_snowflake::SnowflakeCommands,
+    },
 }
 
 #[derive(Parser)]
+#[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    destination: Destination,
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -48,27 +59,99 @@ fn main() -> Result<(), anyhow::Error> {
         .with_context(|| "Unable to create cloud io tokio runtime")?;
 
     let command_exec = main_rt.block_on(async {
-        match cli.command {
-            Commands::Load(args) => {
-                match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
-                    Ok(pg_url) => load_postgres_cmd(&args, pg_url, rt.handle().clone()).await,
-                    Err(e) => Err(e),
+        match cli.destination {
+            Destination::Pg { command } => match command {
+                PgCommands::Load(args) => {
+                    match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
+                        Ok(pg_url) => load_postgres_cmd(&args, pg_url, rt.handle().clone()).await,
+                        Err(e) => Err(e),
+                    }
                 }
-            }
-            Commands::PGConfig(args) => {
-                match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
-                    Ok(pg_url) => load_from_file(args, pg_url, rt.handle().clone()).await,
-                    Err(e) => Err(e),
+                PgCommands::Config(args) => {
+                    match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
+                        Ok(pg_url) => load_from_file(args, pg_url, rt.handle().clone()).await,
+                        Err(e) => Err(e),
+                    }
                 }
-            }
-            Commands::Delta(args) => delta_run(&args, rt.handle().clone()).await,
-            Commands::Merge(args) => delta_merge(&args, rt.handle().clone()).await,
-            Commands::Mvr(args) => {
-                match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
-                    Ok(pg_url) => load_from_mvr_config(args, pg_url).await,
-                    Err(e) => Err(e),
+                PgCommands::Mvr(args) => {
+                    match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
+                        Ok(pg_url) => load_from_mvr_config(args, pg_url).await,
+                        Err(e) => Err(e),
+                    }
                 }
-            }
+            },
+            Destination::Delta { command } => match command {
+                DeltaCommands::Load(args) => delta_run(&args, rt.handle().clone()).await,
+                DeltaCommands::Merge(args) => delta_merge(&args, rt.handle().clone()).await,
+            },
+            Destination::Sf { command } => match command {
+                ldrs::ldrs_snowflake::SnowflakeCommands::Exec { sql } => {
+                    match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
+                        Ok(sf_url) => {
+                            let conn =
+                                ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
+                                    &sf_url,
+                                )?;
+                            let message = conn.exec(&sql)?;
+                            info!("Snowflake exec result: {}", message);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                ldrs::ldrs_snowflake::SnowflakeCommands::Ingest {
+                    file_url,
+                    pattern,
+                    lua_args,
+                } => match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
+                    Ok(sf_url) => {
+                        let (pattern, storage, modules) =
+                            modules_from_args(lua_args, file_url.as_str(), pattern.as_str())?;
+
+                        let (_, file_path) = storage.get_store_and_path()?;
+                        let file_path = file_path.to_string();
+                        let extracted = pattern.parse_path(&file_path)?;
+                        let segments_value = path_pattern::extracted_segments_to_value(&extracted);
+
+                        let url_data: UrlData = storage.get_url().into();
+                        let storage_data: StorageData = storage.into();
+                        let context = serde_json::json!({});
+
+                        let mut loader = LuaFunctionLoader::new().unwrap();
+                        let process_result = loader.call_process::<SnowflakeResult>(
+                            &modules,
+                            &url_data,
+                            &storage_data,
+                            &segments_value,
+                            None,
+                            &context,
+                        )?;
+                        let conn =
+                            ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(&sf_url)?;
+
+                        if matches!(process_result.strategy, SnowflakeStrategy::Ingest) {
+                            Err(anyhow::anyhow!("Ingest is not implemented"))?
+                        }
+
+                        let pre_sql = conn.exec_each_statement(&process_result.pre_sql)?;
+                        info!("Pre SQL {:?} executed successfully", pre_sql);
+                        let _sql = match process_result.strategy {
+                            SnowflakeStrategy::Sql(sql) => {
+                                let sql_result = conn.exec_each_statement(&sql)?;
+                                info!("SQL {:?} executed successfully", sql_result);
+                                Ok(())
+                            }
+                            SnowflakeStrategy::Ingest => {
+                                Err(anyhow::anyhow!("Ingest is not implemented"))
+                            }
+                        }?;
+                        let post_sql = conn.exec_each_statement(&process_result.post_sql)?;
+                        info!("Post SQL {:?} executed successfully", post_sql);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                },
+            },
         }
     });
 

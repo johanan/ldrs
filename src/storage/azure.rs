@@ -4,11 +4,12 @@ use anyhow::Context;
 use object_store::azure::MicrosoftAzureBuilder;
 use url::Url;
 
+#[derive(Debug)]
 pub struct AzureUrl {
-    storage_account: String,
-    container: String,
-    path: String,
-    url: Url,
+    pub storage_account: String,
+    pub container: String,
+    pub path: String,
+    pub url: Url,
 }
 
 impl TryFrom<Url> for AzureUrl {

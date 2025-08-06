@@ -2,9 +2,12 @@ pub mod arrow_access;
 pub mod delta;
 pub mod ldrs_arrow;
 pub mod ldrs_postgres;
-mod parquet_provider;
+pub mod ldrs_snowflake;
+pub mod lua_logic;
+pub mod parquet_provider;
+pub mod path_pattern;
 pub mod pq;
-mod storage;
+pub mod storage;
 pub mod types;
 
 #[cfg(test)]
