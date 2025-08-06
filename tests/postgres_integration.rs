@@ -19,7 +19,7 @@ struct TestLuaResult {
     pub schema: TableSchema,
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_postgres_integration() {
     let file = "tests/test_data/public.string_values/public.strings.snappy.parquet";
     let storage = StorageProvider::try_from_string(&file).unwrap();

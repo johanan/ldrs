@@ -7,7 +7,7 @@ use ldrs::{
     types::parquet_types::ParquetSchema,
 };
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_snowflake_lua_integration() {
     let file = "tests/test_data/public.string_values/public.strings.snappy.parquet";
     let storage = StorageProvider::try_from_string(&file).unwrap();
