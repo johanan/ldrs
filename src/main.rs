@@ -108,7 +108,9 @@ fn main() -> Result<(), anyhow::Error> {
                         let (pattern, storage, modules) =
                             modules_from_args(lua_args, file_url.as_str(), pattern.as_str())?;
 
-                        let extracted = pattern.parse_path(&file_url)?;
+                        let (_, file_path) = storage.get_store_and_path()?;
+                        let file_path = file_path.to_string();
+                        let extracted = pattern.parse_path(&file_path)?;
                         let segments_value = path_pattern::extracted_segments_to_value(&extracted);
 
                         let url_data: UrlData = storage.get_url().into();

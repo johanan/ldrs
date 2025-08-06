@@ -51,11 +51,6 @@ async fn test_postgres_integration() {
 
     loader.setup_execution_context(Some(lua_schema)).unwrap();
 
-    let func = loader
-        .find_and_load_function(&module_paths, "pre_exec")
-        .unwrap()
-        .unwrap();
-    println!("func: {:?}", func);
     let url_data: UrlData = storage.get_url().into();
     let storage_data: StorageData = storage.into();
     let context = serde_json::json!({});
