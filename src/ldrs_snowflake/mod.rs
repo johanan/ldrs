@@ -5,9 +5,10 @@ use std::process::Command;
 use tracing::info;
 use url::Url;
 
-use crate::types::TableSchema;
+use crate::types::{lua_args::LuaArgs, TableSchema};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SnowflakeStrategy {
     Sql(Vec<String>),
     Ingest,
@@ -25,6 +26,16 @@ pub struct SnowflakeResult {
 pub enum SnowflakeCommands {
     /// Execute a SQL statement (non-data retrieval)
     Exec { sql: String },
+    Ingest {
+        #[arg(long, short)]
+        file_url: String,
+
+        #[arg(long, short)]
+        pattern: String,
+
+        #[clap(flatten)]
+        lua_args: LuaArgs,
+    },
 }
 
 #[derive(Clone)]
@@ -33,22 +44,22 @@ pub struct SnowflakeConnection {
     pub raw_conn_url: String,
 }
 
-pub fn create_connection(conn_url: &str) -> Result<SnowflakeConnection, anyhow::Error> {
-    let parsed_url = Url::parse(conn_url).with_context(|| "Failed to parse connection URL")?;
+impl SnowflakeConnection {
+    pub fn create_connection(conn_url: &str) -> Result<SnowflakeConnection, anyhow::Error> {
+        let parsed_url = Url::parse(conn_url).with_context(|| "Failed to parse connection URL")?;
 
-    if parsed_url.scheme() != "snowflake" {
-        return Err(anyhow::anyhow!(
-            "Invalid scheme in connection URL: expected 'snowflake'"
-        ));
+        if parsed_url.scheme() != "snowflake" {
+            return Err(anyhow::anyhow!(
+                "Invalid scheme in connection URL: expected 'snowflake'"
+            ));
+        }
+
+        return Ok(SnowflakeConnection {
+            conn_url: parsed_url,
+            raw_conn_url: conn_url.to_string(),
+        });
     }
 
-    return Ok(SnowflakeConnection {
-        conn_url: parsed_url,
-        raw_conn_url: conn_url.to_string(),
-    });
-}
-
-impl SnowflakeConnection {
     /// Execute a SQL statement (typically DDL) and return success/failure
     pub fn exec(&self, sql: &str) -> Result<String, anyhow::Error> {
         let mut cmd = Command::new("mvr");
@@ -79,8 +90,20 @@ impl SnowflakeConnection {
         }
 
         // Combine all statements into a single transaction
-        let transaction_sql = format!("BEGIN;\n{}\nCOMMIT;", sql_statements.join(";\n"));
+        let transaction_sql = format!("BEGIN;\n{};\nCOMMIT;", sql_statements.join(";\n"));
 
         self.exec(&transaction_sql)
+    }
+
+    pub fn exec_each_statement(
+        &self,
+        sql_statements: &[String],
+    ) -> Result<Vec<String>, anyhow::Error> {
+        let mut results = Vec::new();
+        for sql in sql_statements {
+            let result = self.exec(sql)?;
+            results.push(result);
+        }
+        Ok(results)
     }
 }

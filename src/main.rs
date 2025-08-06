@@ -5,7 +5,10 @@ use ldrs::delta::{delta_merge, delta_run, DeltaCommands};
 use ldrs::ldrs_postgres::load_from_mvr_config;
 use ldrs::ldrs_postgres::PgCommands;
 use ldrs::ldrs_postgres::{load_from_file, load_postgres_cmd};
-use ldrs::lua_logic::{self, LuaArgs};
+use ldrs::ldrs_snowflake::{SnowflakeResult, SnowflakeStrategy};
+use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
+use ldrs::path_pattern;
+use ldrs::types::lua_args::modules_from_args;
 use tracing::info;
 
 #[derive(Subcommand)]
@@ -25,7 +28,6 @@ enum Destination {
         #[command(subcommand)]
         command: ldrs::ldrs_snowflake::SnowflakeCommands,
     },
-    Luat(LuaArgs),
 }
 
 #[derive(Parser)]
@@ -86,7 +88,10 @@ fn main() -> Result<(), anyhow::Error> {
                 ldrs::ldrs_snowflake::SnowflakeCommands::Exec { sql } => {
                     match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
                         Ok(sf_url) => {
-                            let conn = ldrs::ldrs_snowflake::create_connection(&sf_url)?;
+                            let conn =
+                                ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
+                                    &sf_url,
+                                )?;
                             let message = conn.exec(&sql)?;
                             info!("Snowflake exec result: {}", message);
                             Ok(())
@@ -94,14 +99,57 @@ fn main() -> Result<(), anyhow::Error> {
                         Err(e) => Err(e),
                     }
                 }
-            },
-            Destination::Luat(args) => {
-                let modules =
-                    tokio::task::spawn_blocking(|| lua_logic::modules_from_args(args)).await??;
-                info!("Lua test result: {:?}", modules);
+                ldrs::ldrs_snowflake::SnowflakeCommands::Ingest {
+                    file_url,
+                    pattern,
+                    lua_args,
+                } => match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
+                    Ok(sf_url) => {
+                        let (pattern, storage, modules) =
+                            modules_from_args(lua_args, file_url.as_str(), pattern.as_str())?;
 
-                Ok(())
-            }
+                        let extracted = pattern.parse_path(&file_url)?;
+                        let segments_value = path_pattern::extracted_segments_to_value(&extracted);
+
+                        let url_data: UrlData = storage.get_url().into();
+                        let storage_data: StorageData = storage.into();
+                        let context = serde_json::json!({});
+
+                        let mut loader = LuaFunctionLoader::new().unwrap();
+                        let process_result = loader.call_process::<SnowflakeResult>(
+                            &modules,
+                            &url_data,
+                            &storage_data,
+                            &segments_value,
+                            None,
+                            &context,
+                        )?;
+                        let conn =
+                            ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(&sf_url)?;
+
+                        if matches!(process_result.strategy, SnowflakeStrategy::Ingest) {
+                            Err(anyhow::anyhow!("Ingest is not implemented"))?
+                        }
+
+                        let pre_sql = conn.exec_each_statement(&process_result.pre_sql)?;
+                        info!("Pre SQL {:?} executed successfully", pre_sql);
+                        let _sql = match process_result.strategy {
+                            SnowflakeStrategy::Sql(sql) => {
+                                let sql_result = conn.exec_each_statement(&sql)?;
+                                info!("SQL {:?} executed successfully", sql_result);
+                                Ok(())
+                            }
+                            SnowflakeStrategy::Ingest => {
+                                Err(anyhow::anyhow!("Ingest is not implemented"))
+                            }
+                        }?;
+                        let post_sql = conn.exec_each_statement(&process_result.post_sql)?;
+                        info!("Post SQL {:?} executed successfully", post_sql);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                },
+            },
         }
     });
 

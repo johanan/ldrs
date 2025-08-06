@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_until, take_while1},
@@ -264,6 +266,71 @@ pub fn extracted_segments_to_value(segments: &[ExtractedSegment]) -> Value {
     result
 }
 
+pub fn build_module_path_from_pattern(pattern: &PathPattern, base_module: &str) -> Vec<String> {
+    let mut module_components: Vec<String> = vec![base_module.to_string()];
+
+    // Build module path using segment groups to preserve compound names
+    for segment_group in &pattern.segment_groups {
+        if segment_group.len() == 1 {
+            // Simple segment - can avoid allocation for most cases
+            match &segment_group[0] {
+                PatternSegment::Named(name) => {
+                    module_components.push(name.to_string());
+                }
+                PatternSegment::Literal(literal) => {
+                    module_components.push(literal.to_string());
+                }
+                PatternSegment::Wildcard => {
+                    break;
+                }
+                PatternSegment::Placeholder => {
+                    // Placeholder segment should be ignored
+                }
+            }
+        } else {
+            // Compound segment - concatenate all parts
+            let compound_parts: Vec<&str> = segment_group
+                .iter()
+                .filter_map(|segment| {
+                    match segment {
+                        PatternSegment::Named(name) => Some(*name),
+                        PatternSegment::Literal(literal) => Some(*literal),
+                        _ => None, // Skip wildcards/placeholders in compound segments
+                    }
+                })
+                .collect();
+
+            if !compound_parts.is_empty() {
+                module_components.push(compound_parts.join(""));
+            }
+        }
+    }
+
+    let mut paths = Vec::new();
+
+    // Hierarchical: module/schema_table/load_type/init.lua
+    let mut hierarchical = PathBuf::from_iter(&module_components);
+    hierarchical.push("init.lua");
+    paths.push(hierarchical.to_string_lossy().to_string());
+
+    // Context-named: module/schema_table/load_type.lua
+    if module_components.len() > 1 {
+        let context = PathBuf::from_iter(&module_components);
+        let context_with_extension = format!("{}.lua", context.to_string_lossy());
+        paths.push(context_with_extension);
+    }
+
+    // Flat: module/schema_table_load_type.lua
+    if module_components.len() > 1 {
+        let semantic_parts = &module_components[1..];
+        let flat_name = format!("{}.lua", semantic_parts.join("_"));
+        let flat = PathBuf::from(module_components[0].clone()).join(flat_name);
+        paths.push(flat.to_string_lossy().to_string());
+    }
+
+    paths
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +505,45 @@ mod tests {
 
         // Should have exactly 3 keys (environment, data, table)
         assert_eq!(value.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_build_module_path_from_pattern() {
+        let pattern = PathPattern::new("{environment}/{dataset}/{format}/*").unwrap();
+        let paths = build_module_path_from_pattern(&pattern, "company_mod");
+
+        // Should generate three variations
+        assert_eq!(paths.len(), 3);
+
+        // Check hierarchical path
+        assert!(paths.contains(&"company_mod/environment/dataset/format/init.lua".to_string()));
+
+        // Check context-named path
+        assert!(paths.contains(&"company_mod/environment/dataset/format.lua".to_string()));
+
+        // Check flat path
+        assert!(paths.contains(&"company_mod/environment_dataset_format.lua".to_string()));
+    }
+
+    #[test]
+    fn test_build_module_path_from_pattern_with_literal() {
+        let pattern = PathPattern::new("{environment}/{dataset}/streaming/*").unwrap();
+        let paths = build_module_path_from_pattern(&pattern, "base_mod");
+
+        // Should use literal "streaming" in paths
+        assert!(paths.contains(&"base_mod/environment/dataset/streaming/init.lua".to_string()));
+        assert!(paths.contains(&"base_mod/environment/dataset/streaming.lua".to_string()));
+        assert!(paths.contains(&"base_mod/environment_dataset_streaming.lua".to_string()));
+    }
+
+    #[test]
+    fn test_build_module_path_from_pattern_single_segment() {
+        let pattern = PathPattern::new("{pipeline}/*").unwrap();
+        let paths = build_module_path_from_pattern(&pattern, "test_mod");
+
+        // Should generate paths for single semantic segment
+        assert!(paths.contains(&"test_mod/pipeline/init.lua".to_string()));
+        assert!(paths.contains(&"test_mod/pipeline.lua".to_string()));
+        assert!(paths.contains(&"test_mod/pipeline.lua".to_string())); // Flat same as context for single
     }
 }

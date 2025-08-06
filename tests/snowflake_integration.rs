@@ -1,11 +1,8 @@
-use std::path::Path;
-
 use ldrs::{
-    ldrs_snowflake::{SnowflakeResult, SnowflakeStrategy},
-    lua_logic::{
-        build_module_path_from_pattern, nom_pattern, LuaFunctionLoader, StorageData, UrlData,
-    },
+    ldrs_snowflake::SnowflakeResult,
+    lua_logic::{LuaFunctionLoader, StorageData, UrlData},
     parquet_provider::builder_from_string,
+    path_pattern::{self, build_module_path_from_pattern},
     storage::StorageProvider,
     types::parquet_types::ParquetSchema,
 };
@@ -15,11 +12,11 @@ async fn test_snowflake_lua_integration() {
     let file = "tests/test_data/public.string_values/public.strings.snappy.parquet";
     let storage = StorageProvider::try_from_string(&file).unwrap();
     let pattern_string = "{_}/{_}/{_}/{_}/tests/test_data/{schema}.{table}/*";
-    let pattern = nom_pattern::PathPattern::new(pattern_string).unwrap();
+    let pattern = path_pattern::PathPattern::new(pattern_string).unwrap();
     let (_, file_path) = storage.get_store_and_path().unwrap();
     let file_path = file_path.to_string();
     let extracted = pattern.parse_path(&file_path).unwrap();
-    let segments_value = nom_pattern::extracted_segments_to_value(&extracted);
+    let segments_value = path_pattern::extracted_segments_to_value(&extracted);
     println!("segments_value: {:?}", segments_value);
 
     let rt = tokio::runtime::Builder::new_multi_thread()

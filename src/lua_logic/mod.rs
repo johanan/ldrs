@@ -1,16 +1,12 @@
-pub mod nom_pattern;
-
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::storage::{azure::AzureUrl, StorageProvider};
-use crate::types::{
-    parquet_types::ParquetSchema, ColumnMapping, ColumnSchema, TableSchema, TimeUnit,
-};
+use crate::types::parquet_types::ParquetSchema;
 use arrow::datatypes::SchemaRef;
-use clap::Args;
-use mlua::{FromLua, Lua, LuaSerdeExt};
+use mlua::{Lua, LuaSerdeExt};
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,73 +44,6 @@ pub enum StorageData {
     Azure(AzureData),
     #[serde(rename = "local")]
     Local(LocalData),
-}
-
-#[derive(Args, Debug)]
-pub struct LuaArgs {
-    /// Lua module paths (can be specified multiple times)
-    #[arg(long = "lua-module", action = clap::ArgAction::Append)]
-    pub lua_modules: Option<Vec<String>>,
-
-    /// Lua modules as JSON array (alternative to --lua-module)
-    #[arg(long = "lua-modules-json")]
-    pub lua_modules_json: Option<String>,
-
-    /// The file URL to process
-    #[arg(long)]
-    pub file_url: String,
-
-    /// Pattern for semantic path matching
-    #[arg(long)]
-    pub pattern: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModuleConfig {
-    pub modules: Vec<String>,
-}
-
-impl TryFrom<LuaArgs> for ModuleConfig {
-    type Error = anyhow::Error;
-
-    fn try_from(args: LuaArgs) -> Result<Self, Self::Error> {
-        let modules = match (args.lua_modules, args.lua_modules_json) {
-            // Both specified - error
-            (Some(_), Some(_)) => {
-                return Err(anyhow::anyhow!(
-                    "Cannot specify both --lua-module and --lua-modules-json"
-                ));
-            }
-
-            // Repeating --lua-module args
-            (Some(modules), None) => {
-                if modules.is_empty() {
-                    return Err(anyhow::anyhow!("No lua modules specified"));
-                }
-                modules
-            }
-
-            // JSON array
-            (None, Some(json_str)) => {
-                let parsed: Vec<String> = serde_json::from_str(&json_str)
-                    .map_err(|e| anyhow::anyhow!("Invalid JSON in --lua-modules-json: {}", e))?;
-
-                if parsed.is_empty() {
-                    return Err(anyhow::anyhow!("Empty module list in JSON"));
-                }
-                parsed
-            }
-
-            // Neither specified - use default
-            (None, None) => {
-                return Err(anyhow::anyhow!(
-                    "No Lua modules specified. Use --lua-module or --lua-modules-json"
-                ));
-            }
-        };
-
-        Ok(ModuleConfig { modules })
-    }
 }
 
 impl From<Url> for UrlData {
@@ -189,95 +118,6 @@ fn full_extension(file_name: &str) -> Option<&str> {
 
 fn base_name(file_name: &str) -> Option<&str> {
     file_name.find('.').map(|pos| &file_name[..pos])
-}
-
-pub fn build_module_path_from_pattern(
-    pattern: &nom_pattern::PathPattern,
-    base_module: &str,
-) -> Vec<String> {
-    let mut module_components: Vec<String> = vec![base_module.to_string()];
-
-    // Build module path using segment groups to preserve compound names
-    for segment_group in &pattern.segment_groups {
-        if segment_group.len() == 1 {
-            // Simple segment - can avoid allocation for most cases
-            match &segment_group[0] {
-                nom_pattern::PatternSegment::Named(name) => {
-                    module_components.push(name.to_string());
-                }
-                nom_pattern::PatternSegment::Literal(literal) => {
-                    module_components.push(literal.to_string());
-                }
-                nom_pattern::PatternSegment::Wildcard => {
-                    break;
-                }
-                nom_pattern::PatternSegment::Placeholder => {
-                    // Placeholder segment should be ignored
-                }
-            }
-        } else {
-            // Compound segment - concatenate all parts
-            let compound_parts: Vec<&str> = segment_group
-                .iter()
-                .filter_map(|segment| {
-                    match segment {
-                        nom_pattern::PatternSegment::Named(name) => Some(*name),
-                        nom_pattern::PatternSegment::Literal(literal) => Some(*literal),
-                        _ => None, // Skip wildcards/placeholders in compound segments
-                    }
-                })
-                .collect();
-
-            if !compound_parts.is_empty() {
-                module_components.push(compound_parts.join(""));
-            }
-        }
-    }
-
-    let mut paths = Vec::new();
-
-    // Hierarchical: module/schema_table/load_type/init.lua
-    let mut hierarchical = PathBuf::from_iter(&module_components);
-    hierarchical.push("init.lua");
-    paths.push(hierarchical.to_string_lossy().to_string());
-
-    // Context-named: module/schema_table/load_type.lua
-    if module_components.len() > 1 {
-        let mut context = PathBuf::from_iter(&module_components);
-        let context_with_extension = format!("{}.lua", context.to_string_lossy());
-        paths.push(context_with_extension);
-    }
-
-    // Flat: module/schema_table_load_type.lua
-    if module_components.len() > 1 {
-        let semantic_parts = &module_components[1..];
-        let flat_name = format!("{}.lua", semantic_parts.join("_"));
-        let flat = PathBuf::from(module_components[0].clone()).join(flat_name);
-        paths.push(flat.to_string_lossy().to_string());
-    }
-
-    paths
-}
-
-pub fn modules_from_args(args: LuaArgs) -> Result<Vec<String>, anyhow::Error> {
-    let file_url = args.file_url.clone();
-    let pattern_str = args.pattern.clone();
-    let module_config = ModuleConfig::try_from(args)?;
-
-    // Parse the pattern
-    let pattern = nom_pattern::PathPattern::new(&pattern_str)?;
-
-    // Parse the storage provider from the URL (for future use)
-    let _storage = StorageProvider::try_from_string(file_url.as_str())?;
-
-    // Build module lookups for each module using the pattern
-    let mut all_paths = Vec::new();
-    for module in &module_config.modules {
-        let paths = build_module_path_from_pattern(&pattern, module);
-        all_paths.extend(paths);
-    }
-
-    Ok(all_paths)
 }
 
 pub struct LuaFunctionLoader {
@@ -406,6 +246,10 @@ impl LuaFunctionLoader {
         schema: Option<&SchemaRef>,
         context: &serde_json::Value,
     ) -> Result<T, anyhow::Error> {
+        debug!(
+            "Calling process function with module paths: {:?}",
+            module_paths
+        );
         let func = self
             .find_and_load_function(module_paths, "process")?
             .ok_or_else(|| anyhow::anyhow!("Process function not found in any module"))?;
@@ -424,6 +268,7 @@ impl LuaFunctionLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{path_pattern, types::TableSchema};
 
     // Simple test result type for lua_logic tests
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -433,47 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_module_path_from_pattern() {
-        let pattern = nom_pattern::PathPattern::new("{environment}/{dataset}/{format}/*").unwrap();
-        let paths = build_module_path_from_pattern(&pattern, "company_mod");
-
-        // Should generate three variations
-        assert_eq!(paths.len(), 3);
-
-        // Check hierarchical path
-        assert!(paths.contains(&"company_mod/environment/dataset/format/init.lua".to_string()));
-
-        // Check context-named path
-        assert!(paths.contains(&"company_mod/environment/dataset/format.lua".to_string()));
-
-        // Check flat path
-        assert!(paths.contains(&"company_mod/environment_dataset_format.lua".to_string()));
-    }
-
-    #[test]
-    fn test_build_module_path_from_pattern_with_literal() {
-        let pattern = nom_pattern::PathPattern::new("{environment}/{dataset}/streaming/*").unwrap();
-        let paths = build_module_path_from_pattern(&pattern, "base_mod");
-
-        // Should use literal "streaming" in paths
-        assert!(paths.contains(&"base_mod/environment/dataset/streaming/init.lua".to_string()));
-        assert!(paths.contains(&"base_mod/environment/dataset/streaming.lua".to_string()));
-        assert!(paths.contains(&"base_mod/environment_dataset_streaming.lua".to_string()));
-    }
-
-    #[test]
-    fn test_build_module_path_from_pattern_single_segment() {
-        let pattern = nom_pattern::PathPattern::new("{pipeline}/*").unwrap();
-        let paths = build_module_path_from_pattern(&pattern, "test_mod");
-
-        // Should generate paths for single semantic segment
-        assert!(paths.contains(&"test_mod/pipeline/init.lua".to_string()));
-        assert!(paths.contains(&"test_mod/pipeline.lua".to_string()));
-        assert!(paths.contains(&"test_mod/pipeline.lua".to_string())); // Flat same as context for single
-    }
-
-    #[test]
-    fn test_call_pre_exec_with_three_parameters() {
+    fn test_call_process_with_three_parameters() {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
         use url::Url;
@@ -492,10 +297,10 @@ mod tests {
         });
 
         // Create test extracted segments
-        let pattern = nom_pattern::PathPattern::new("{environment}/{schema_table}/*").unwrap();
+        let pattern = path_pattern::PathPattern::new("{environment}/{schema_table}/*").unwrap();
         let path = "/prod/public.users/2025/06/25/file.parquet";
         let extracted = pattern.parse_path(path).unwrap();
-        let segments_value = nom_pattern::extracted_segments_to_value(&extracted);
+        let segments_value = path_pattern::extracted_segments_to_value(&extracted);
 
         // Create test schema with id column as int
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
