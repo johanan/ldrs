@@ -42,7 +42,7 @@ on:
   pull_request:
   push:
     tags:
-      - "**[0-9]+.[0-9]+.[0-9]+*"
+      - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -127,6 +127,14 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Set up Go"
+        uses: "actions/setup-go@v5"
+        with:
+          "go-version": "stable"
+      - name: "Run go tidy"
+        run: |
+          cd go/ldrs-sf
+          go mod tidy
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
@@ -139,28 +147,6 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: stable
-      - name: Run go tidy
-        run: |
-          cd go/ldrs-sf
-          go mod tidy
-      - name: Build ldrs-sf binary
-        shell: bash
-        run: |
-          case "${{ join(matrix.targets, '-') }}" in
-            x86_64-unknown-linux-gnu) GOOS=linux GOARCH=amd64 ;;
-            aarch64-unknown-linux-gnu) GOOS=linux GOARCH=arm64 ;;
-            x86_64-apple-darwin) GOOS=darwin GOARCH=amd64 ;;
-            aarch64-apple-darwin) GOOS=darwin GOARCH=arm64 ;;
-            *) echo "Skipping Go build for unsupported target: ${{ join(matrix.targets, '-') }}" >&2; exit 0 ;;
-          esac
-
-          cd go/ldrs-sf
-          GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 \
-            go build -trimpath -ldflags="-s -w" -o ldrs-sf .
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot
