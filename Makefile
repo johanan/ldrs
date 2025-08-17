@@ -1,13 +1,31 @@
 # Makefile to mirror the CI pipeline locally
 # Builds both Go and Rust components using the same commands as release.yml
 
-.PHONY: all build build-go build-rust clean install-dist help
+.PHONY: all build build-go build-rust ci clean install-dist help
 
 # Default target
 all: build
 
 # Build everything (Go + Rust)
 build: build-go build-rust
+
+# CI build target that mirrors the CI pipeline
+ci: build-go-ci build-rust
+
+# Build Go binary based on CARGO_DIST_TARGET environment variable
+build-go-ci:
+	@echo "Building Go binary for CI target: $(CARGO_DIST_TARGET)"
+	@if [ -z "$(CARGO_DIST_TARGET)" ]; then \
+		echo "Error: CARGO_DIST_TARGET not set"; \
+		exit 1; \
+	fi
+	@case "$(CARGO_DIST_TARGET)" in \
+		x86_64-unknown-linux-gnu) $(MAKE) build-go-linux-amd64 ;; \
+		aarch64-unknown-linux-gnu) $(MAKE) build-go-linux-arm64 ;; \
+		x86_64-apple-darwin) $(MAKE) build-go-darwin-amd64 ;; \
+		aarch64-apple-darwin) $(MAKE) build-go-darwin-arm64 ;; \
+		*) echo "Skipping Go build for unsupported target: $(CARGO_DIST_TARGET)" >&2; exit 0 ;; \
+	esac
 
 # Build the Go binary (ldrs-sf)
 build-go:
@@ -90,6 +108,7 @@ help:
 	@echo "  build-go         - Build Go binary for current platform"
 	@echo "  build-go-*       - Build Go binary for specific platform"
 	@echo "  build-rust       - Build Rust components with cargo-dist"
+	@echo "  ci               - Build for CI (uses CARGO_DIST_TARGET)"
 	@echo "  install-dist     - Install cargo-dist tool"
 	@echo "  plan             - Show what dist would build"
 	@echo "  test             - Run tests for both Go and Rust"

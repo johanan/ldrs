@@ -1,0 +1,8 @@
+- name: Set up Go
+  uses: actions/setup-go@v5
+  with:
+    go-version: stable
+- name: Run go tidy
+  run: |
+    cd go/ldrs-sf
+    go mod tidy
