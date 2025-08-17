@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/johanan/ldrs/go/ldrs-go/cmd"
+	"github.com/johanan/ldrs/go/ldrs-sf/cmd"
 )
 
 func main() {

@@ -1,4 +1,4 @@
-module github.com/johanan/ldrs/go/ldrs-go
+module github.com/johanan/ldrs/go/ldrs-sf
 
 go 1.24.5
 
