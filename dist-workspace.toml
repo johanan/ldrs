@@ -20,7 +20,7 @@ targets = [
 install-path = "~/.local/bin"
 # Whether to install an updater program
 install-updater = false
-github-build-setup = "../build-setup.yml"
+github-build-setup = "build-setup.yml"
 
 [[dist.extra-artifacts]]
 artifacts = ["go/ldrs-sf/ldrs-sf"]
