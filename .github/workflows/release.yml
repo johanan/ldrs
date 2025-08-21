@@ -135,6 +135,13 @@ jobs:
         run: |
           cd go/ldrs-sf
           go mod tidy
+      - name: "Run go make"
+        run: "make build-go-ci"
+      - name: "Upload ldrs-sf artifacts"
+        uses: "actions/upload-artifact@v4"
+        with:
+          "name": "artifacts-ldrs-sf-${{ join(matrix.targets, '_') }}"
+          "path": "target/ldrs_sf/"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

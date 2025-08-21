@@ -20,12 +20,20 @@ build-go-ci:
 		exit 1; \
 	fi
 	@case "$(CARGO_DIST_TARGET)" in \
-		x86_64-unknown-linux-gnu) $(MAKE) build-go-linux-amd64 ;; \
-		aarch64-unknown-linux-gnu) $(MAKE) build-go-linux-arm64 ;; \
-		x86_64-apple-darwin) $(MAKE) build-go-darwin-amd64 ;; \
-		aarch64-apple-darwin) $(MAKE) build-go-darwin-arm64 ;; \
+		x86_64-unknown-linux-gnu) $(MAKE) build-go-linux-amd64 && $(MAKE) tar-go ;; \
+		aarch64-unknown-linux-gnu) $(MAKE) build-go-linux-arm64 && $(MAKE) tar-go ;; \
+		x86_64-apple-darwin) $(MAKE) build-go-darwin-amd64 && $(MAKE) tar-go ;; \
+		aarch64-apple-darwin) $(MAKE) build-go-darwin-arm64 && $(MAKE) tar-go ;; \
 		*) echo "Skipping Go build for unsupported target: $(CARGO_DIST_TARGET)" >&2; exit 0 ;; \
 	esac
+	@# Move tar to target directory and cleanup
+	@mkdir -p target/ldrs_sf
+	@if [ -f "go/ldrs-sf/ldrs-sf-$(CARGO_DIST_TARGET).tar.gz" ]; then \
+		mv go/ldrs-sf/ldrs-sf-$(CARGO_DIST_TARGET).tar.gz target/ldrs_sf/ && \
+		echo "Moved tar to target/ldrs_sf/"; \
+	fi
+	@rm -f go/ldrs-sf/ldrs-sf
+	@echo "Cleaned up binary and tar from go/ldrs-sf/"
 
 # Build the Go binary (ldrs-sf)
 build-go:
@@ -63,6 +71,12 @@ build-go-darwin-arm64:
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
 	go build -trimpath -ldflags="-s -w" -o ldrs-sf .
 
+# Create tar archive of Go binary with target triple naming
+tar-go:
+	@echo "Creating tar archive for $(CARGO_DIST_TARGET)..."
+	cd go/ldrs-sf && \
+	tar -czf ldrs-sf-$(CARGO_DIST_TARGET).tar.gz ldrs-sf
+
 # Install cargo-dist if not present
 install-dist:
 	@if ! command -v dist >/dev/null 2>&1; then \
@@ -87,7 +101,9 @@ clean:
 	@echo "Cleaning build artifacts..."
 	cargo clean
 	rm -f go/ldrs-sf/ldrs-sf
+	rm -f go/ldrs-sf/ldrs-sf-*.tar.gz
 	rm -rf target/distrib/
+	rm -rf target/ldrs_sf/
 
 # Test the builds
 test-go:

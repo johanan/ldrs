@@ -2,10 +2,14 @@
 set -euo pipefail
 
 # Simple installer for ldrs-sf binary
-# Downloads and installs to ~/.local/bin/ldrs-sf
+# Downloads tar archive and installs to ~/.local/bin/ldrs-sf
 
 APP_NAME="ldrs-sf"
-DOWNLOAD_URL="${LDRS_SF_DOWNLOAD_URL:-https://github.com/johanan/ldrs/releases/latest/download/ldrs-sf}"
+
+# Determine platform (default to x86_64-unknown-linux-gnu)
+PLATFORM="${LDRS_SF_PLATFORM:-x86_64-unknown-linux-gnu}"
+TAR_NAME="$APP_NAME-$PLATFORM.tar.gz"
+DOWNLOAD_URL="${LDRS_SF_DOWNLOAD_URL:-https://github.com/johanan/ldrs/releases/latest/download/$TAR_NAME}"
 
 # Ensure HOME is set
 if [ -z "${HOME:-}" ]; then
@@ -15,25 +19,43 @@ fi
 
 INSTALL_DIR="$HOME/.local/bin"
 INSTALL_PATH="$INSTALL_DIR/$APP_NAME"
+TEMP_DIR=$(mktemp -d)
 
-echo "Installing $APP_NAME to $INSTALL_PATH"
+echo "Installing $APP_NAME ($PLATFORM) to $INSTALL_PATH"
+
+# Cleanup function
+cleanup() {
+    rm -rf "$TEMP_DIR"
+}
+trap cleanup EXIT
 
 # Create install directory
 mkdir -p "$INSTALL_DIR"
 
-# Download binary
-echo "Downloading $APP_NAME from $DOWNLOAD_URL"
+# Download tar archive
+echo "Downloading $TAR_NAME from $DOWNLOAD_URL"
 if command -v curl >/dev/null 2>&1; then
-    curl -sSfL "$DOWNLOAD_URL" -o "$INSTALL_PATH"
+    curl -sSfL "$DOWNLOAD_URL" -o "$TEMP_DIR/$TAR_NAME"
 elif command -v wget >/dev/null 2>&1; then
-    wget -q "$DOWNLOAD_URL" -O "$INSTALL_PATH"
+    wget -q "$DOWNLOAD_URL" -O "$TEMP_DIR/$TAR_NAME"
 else
     echo "ERROR: Neither curl nor wget found. Please install one of them." >&2
     exit 1
 fi
 
-# Make executable
-chmod +x "$INSTALL_PATH"
+# Extract tar and install binary
+echo "Extracting $TAR_NAME"
+cd "$TEMP_DIR"
+tar -xzf "$TAR_NAME"
+
+# Find and copy the binary
+if [ -f "$APP_NAME" ]; then
+    cp "$APP_NAME" "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
+else
+    echo "ERROR: Binary $APP_NAME not found in tar archive" >&2
+    exit 1
+fi
 
 echo "✓ $APP_NAME installed successfully to $INSTALL_PATH"
 

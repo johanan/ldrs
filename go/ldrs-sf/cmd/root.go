@@ -14,6 +14,10 @@ var rootCmd = &cobra.Command{
 	},
 }
 
+func init() {
+	rootCmd.AddCommand(execCmd)
+}
+
 func Execute(ctx context.Context) error {
 	rootCmd.SetContext(ctx)
 	return rootCmd.Execute()
