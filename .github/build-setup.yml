@@ -7,6 +7,8 @@
     cd go/ldrs-sf
     go mod tidy
 - name: Run go make
+  env:
+    CARGO_DIST_TARGET: ${{ join(matrix.targets, '-') }}
   run: make build-go-ci
 - name: Upload ldrs-sf artifacts
   uses: actions/upload-artifact@v4
