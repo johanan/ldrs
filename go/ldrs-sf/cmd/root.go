@@ -16,6 +16,7 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(execCmd)
+	rootCmd.AddCommand(queryCmd)
 }
 
 func Execute(ctx context.Context) error {
