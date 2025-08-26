@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
@@ -12,6 +13,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/snowflakedb/gosnowflake"
 )
 
@@ -81,6 +85,59 @@ func (sf *SnowflakeConn) ExecuteCommands(ctx context.Context, sql_commands []str
 		results = append(results, status)
 	}
 	return results, nil
+}
+
+func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string) error {
+	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	sf_ctx := gosnowflake.WithArrowBatchesTimestampOption(
+		gosnowflake.WithArrowAllocator(
+			gosnowflake.WithArrowBatches(
+				gosnowflake.WithHigherPrecision(ctx)), pool), gosnowflake.UseNanosecondTimestamp)
+
+	conn, err := sf.Snowflake.Conn(sf_ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var rows driver.Rows
+	err = conn.Raw(func(x any) error {
+		rows, err = x.(driver.QueryerContext).QueryContext(sf_ctx, query, nil)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	batches, err := rows.(gosnowflake.SnowflakeRows).GetArrowBatches()
+	if err != nil {
+		return err
+	}
+
+	var ipcWriter *ipc.Writer
+	var schema *arrow.Schema
+
+	for i, batch := range batches {
+		records, err := batch.WithContext(sf_ctx).Fetch()
+		if err != nil {
+			return err
+		}
+
+		for j, record := range *records {
+			if i == 0 && j == 0 {
+				schema = record.Schema()
+				ipcWriter = ipc.NewWriter(os.Stdout, ipc.WithSchema(schema), ipc.WithAllocator(pool))
+				defer ipcWriter.Close()
+			}
+			if err := ipcWriter.Write(record); err != nil {
+				return err
+			}
+			record.Release()
+		}
+	}
+
+	return nil
 }
 
 func ParsePEMPrivateKey(pemKey string) (*rsa.PrivateKey, error) {
