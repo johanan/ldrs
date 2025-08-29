@@ -43,7 +43,7 @@ tokio-postgres = { version = "0.7.12", features = [
 tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.14", features = ["io", "io-util"] }
 tracing = "0.1.41"
-tracing-subscriber = "0.3.19"
+tracing-subscriber = "0.3.20"
 url = "2.5.4"
 uuid = "1.12.1"
 nom = { version = "7.1" }
