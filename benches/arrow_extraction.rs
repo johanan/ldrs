@@ -1,5 +1,3 @@
-//extern crate ldrs;
-
 use arrow::array::{Decimal128Builder, GenericStringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -9,7 +7,6 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use ldrs::arrow_access::TypedColumnAccessor;
 use ldrs::ldrs_postgres::PgTypedValue;
 use ldrs::types::ColumnSchema;
-use parquet::format::{MicroSeconds, MilliSeconds};
 use postgres_types::ToSql;
 use postgres_types::Type;
 use std::sync::Arc;
@@ -31,6 +28,7 @@ fn create_test_batch(size: usize) -> RecordBatch {
             true,
         ),
         Field::new("decimal_col", DataType::Decimal128(10, 2), true),
+        Field::new("json_col", DataType::Utf8, true),
     ]);
 
     // Create arrays
@@ -40,6 +38,7 @@ fn create_test_batch(size: usize) -> RecordBatch {
     let mut ts_micro_builder = TimestampMicrosecondArray::builder(size);
     let mut decimal_builder =
         Decimal128Builder::with_capacity(size).with_data_type(DataType::Decimal128(10, 2));
+    let mut json_builder = GenericStringBuilder::<i32>::new();
 
     let now = chrono::Utc::now();
     let now_millis = now.timestamp_millis();
@@ -52,6 +51,7 @@ fn create_test_batch(size: usize) -> RecordBatch {
             ts_ms_builder.append_null();
             ts_micro_builder.append_null();
             decimal_builder.append_null();
+            json_builder.append_null();
         } else {
             int_builder.append_value(i as i32);
             str_builder.append_value(format!("value_{}", i));
@@ -63,6 +63,7 @@ fn create_test_batch(size: usize) -> RecordBatch {
             // Decimal values (price-like data with 2 decimal places)
             let decimal_val = (i as i128) * 100 + 99; // e.g., 1.99, 2.99, etc.
             decimal_builder.append_value(decimal_val);
+            json_builder.append_value(format!(r#"{{"key":"value_{}"}}"#, i));
         }
     }
 
@@ -71,6 +72,7 @@ fn create_test_batch(size: usize) -> RecordBatch {
     let ts_ms_array = ts_ms_builder.finish();
     let ts_micro_array = ts_micro_builder.finish();
     let decimal_array = decimal_builder.finish();
+    let json_array = json_builder.finish();
 
     // Create record batch
     RecordBatch::try_new(
@@ -81,6 +83,7 @@ fn create_test_batch(size: usize) -> RecordBatch {
             Arc::new(ts_ms_array),
             Arc::new(ts_micro_array),
             Arc::new(decimal_array),
+            Arc::new(json_array),
         ],
     )
     .unwrap()
@@ -91,9 +94,16 @@ enum UnionType<'a> {
     Utf8(Option<&'a str>),
     Int64(Option<i64>),
     Decimal128(Option<i128>),
+    Default,
 }
 
-fn typed_accessor_approach(batch: &RecordBatch) -> Vec<Vec<UnionType<'_>>> {
+impl<'a> Default for UnionType<'a> {
+    fn default() -> Self {
+        UnionType::Default
+    }
+}
+
+unsafe fn typed_accessor_approach(batch: &RecordBatch) -> Vec<Vec<UnionType<'_>>> {
     let columns = batch.columns();
     let num_rows = batch.num_rows();
 
@@ -119,6 +129,12 @@ fn typed_accessor_approach(batch: &RecordBatch) -> Vec<Vec<UnionType<'_>>> {
                 TypedColumnAccessor::Decimal128(arr, _, _) => {
                     UnionType::Decimal128(accessor.Decimal128(row))
                 }
+                TypedColumnAccessor::FixedSizeBinary(arr, _) => {
+                    // For simplicity, treat FixedSizeBinary as Utf8 (e.g., UUID as string)
+                    let bytes_opt = accessor.FixedSizeBinary(row);
+                    let str_opt = bytes_opt.and_then(|b| std::str::from_utf8(b).ok());
+                    UnionType::Utf8(str_opt)
+                }
                 _ => continue,
             };
             row_values.push(value);
@@ -140,15 +156,10 @@ fn new_pg_types(batch: &RecordBatch) -> BytesMut {
     let parquet_types = vec![
         ColumnSchema::Integer("int32_col"),
         ColumnSchema::Text("string_col"),
-        ColumnSchema::TimestampTz(
-            "timestamp_ms_col",
-            parquet::basic::TimeUnit::MILLIS(MilliSeconds {}),
-        ),
-        ColumnSchema::Timestamp(
-            "timestamp_no_tz_col",
-            parquet::basic::TimeUnit::MICROS(MicroSeconds {}),
-        ),
+        ColumnSchema::TimestampTz("timestamp_ms_col", ldrs::types::TimeUnit::Millis),
+        ColumnSchema::Timestamp("timestamp_no_tz_col", ldrs::types::TimeUnit::Micros),
         ColumnSchema::Numeric("decimal_col", 10, 2),
+        ColumnSchema::Jsonb("json_col"),
     ];
 
     // Create PostgreSQL types
@@ -158,6 +169,7 @@ fn new_pg_types(batch: &RecordBatch) -> BytesMut {
         Type::TIMESTAMPTZ,
         Type::TIMESTAMP,
         Type::NUMERIC,
+        Type::JSONB,
     ];
 
     for row in 0..num_rows {
@@ -182,14 +194,18 @@ fn bench_arrow_extraction(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("TypedAccessor", size),
             &batch,
-            |b, batch| {
+            |b, batch| unsafe {
                 b.iter(|| typed_accessor_approach(black_box(batch)));
             },
         );
 
-        group.bench_with_input(BenchmarkId::new("NewPgTypes", size), &batch, |b, batch| {
-            b.iter(|| new_pg_types(black_box(batch)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("TypedAccessorBatch", size),
+            &batch,
+            |b, batch| unsafe {
+                b.iter(|| typed_accessor_batch(black_box(batch)));
+            },
+        );
     }
 
     group.finish();

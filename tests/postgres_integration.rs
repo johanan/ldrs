@@ -8,7 +8,7 @@ use ldrs::{
     storage::StorageProvider,
     types::{
         parquet_types::{get_fields, ParquetSchema},
-        ColumnSchema, TableSchema,
+        ColumnSchema, ColumnSpec,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TestLuaResult {
     pub sql: Vec<String>,
-    pub schema: TableSchema,
+    pub schema: Vec<ColumnSpec>,
 }
 
 //#[tokio::test]
@@ -66,61 +66,9 @@ async fn test_postgres_integration() {
         )
         .unwrap();
     println!("lua_output: {:?}", lua_output);
-    let lua_output_schema_columns = lua_output
-        .schema
-        .columns
-        .iter()
-        .map(|column| column.to_column_schema(&column.name))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    println!("lua_output_schema_columns: {:?}", lua_output_schema_columns);
-
-    let default_schema = get_fields(builder.metadata().file_metadata())
-        .unwrap()
-        .iter()
-        .map(|c| ColumnSchema::try_from(c))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    println!("default_schema: {:?}", default_schema);
 
     let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
     let mut conn = create_connection(pg_url).await.unwrap();
-
-    let tx = conn.transaction().await.unwrap();
-    for statement in lua_output.sql {
-        tx.execute(&statement, &[]).await.unwrap();
-    }
-
-    // Merge default schema with lua overrides
-    use std::collections::HashMap;
-    let lua_overrides: HashMap<&str, &ColumnSchema> = lua_output_schema_columns
-        .iter()
-        .map(|col| (col.name(), col))
-        .collect();
-
-    let merged_columns: Vec<&ColumnSchema> = default_schema
-        .iter()
-        .map(|default_col| {
-            lua_overrides
-                .get(default_col.name())
-                .map(|&override_col| override_col)
-                .unwrap_or(default_col)
-        })
-        .collect();
-
-    println!("merged_columns: {:?}", merged_columns);
-
-    let ddl_columns = merged_columns
-        .into_iter()
-        .map(map_parquet_to_ddl)
-        .collect::<Vec<String>>();
-
-    let ddl_statement = build_ddl(lua_output.schema.table_name, &ddl_columns);
-    println!("{}", ddl_statement);
-
-    tx.execute(&ddl_statement, &[]).await.unwrap();
-
-    tx.commit().await.unwrap();
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }

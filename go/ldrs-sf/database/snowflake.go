@@ -1,6 +1,7 @@
 package database
 
 import (
+	"bufio"
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
@@ -92,7 +94,7 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string) error {
 	sf_ctx := gosnowflake.WithArrowBatchesTimestampOption(
 		gosnowflake.WithArrowAllocator(
 			gosnowflake.WithArrowBatches(
-				gosnowflake.WithHigherPrecision(ctx)), pool), gosnowflake.UseNanosecondTimestamp)
+				gosnowflake.WithHigherPrecision(ctx)), pool), gosnowflake.UseMillisecondTimestamp)
 
 	conn, err := sf.Snowflake.Conn(sf_ctx)
 	if err != nil {
@@ -115,28 +117,127 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string) error {
 		return err
 	}
 
-	var ipcWriter *ipc.Writer
-	var schema *arrow.Schema
+	batchCh := make(chan int, 10)
+	recordCh := make(chan arrow.Record, 1024)
+	errorCh := make(chan error, 1)
 
-	for i, batch := range batches {
-		records, err := batch.WithContext(sf_ctx).Fetch()
-		if err != nil {
-			return err
+	ctx, cancel := context.WithCancel(sf_ctx)
+	defer cancel()
+
+	schemaReady := make(chan *arrow.Schema, 1)
+
+	// waitgroups
+	var readersWG sync.WaitGroup
+	var writerWG sync.WaitGroup
+
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+
+		select {
+		case schema := <-schemaReady:
+			bufWriter := bufio.NewWriter(os.Stdout)
+			ipcWriter := ipc.NewWriter(bufWriter, ipc.WithSchema(schema), ipc.WithAllocator(pool))
+			defer func() {
+				ipcWriter.Close()
+				bufWriter.Flush()
+			}()
+
+			for {
+				select {
+				case record, ok := <-recordCh:
+					if !ok {
+						return
+					}
+					if err := ipcWriter.Write(record); err != nil {
+						bufWriter.Flush()
+						select {
+						case errorCh <- err:
+						default:
+						}
+						return
+					}
+					record.Release()
+				case <-ctx.Done():
+					return
+				}
+			}
+		case <-ctx.Done():
+			return
 		}
+	}()
 
-		for j, record := range *records {
-			if i == 0 && j == 0 {
-				schema = record.Schema()
-				ipcWriter = ipc.NewWriter(os.Stdout, ipc.WithSchema(schema), ipc.WithAllocator(pool))
-				defer ipcWriter.Close()
+	readerWorker := func() {
+		defer readersWG.Done()
+
+		for {
+			select {
+			case i, ok := <-batchCh:
+				if !ok {
+					return
+				}
+
+				records, err := batches[i].WithContext(sf_ctx).Fetch()
+				if err != nil {
+					select {
+					case errorCh <- err:
+					default:
+					}
+					return
+				}
+
+				for j, record := range *records {
+					if i == 0 && j == 0 {
+						schemaReady <- record.Schema()
+						close(schemaReady)
+					}
+
+					select {
+					case recordCh <- record:
+					case <-ctx.Done():
+						record.Release()
+						return
+					}
+				}
+
+			case <-ctx.Done():
+				return
 			}
-			if err := ipcWriter.Write(record); err != nil {
-				return err
-			}
-			record.Release()
 		}
 	}
 
+	readersWG.Add(2)
+	go readerWorker()
+	go readerWorker()
+
+	go func() {
+		defer close(batchCh)
+		for i := range batches {
+			select {
+			case batchCh <- i:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		readersWG.Wait()
+		close(recordCh)
+	}()
+
+	select {
+	case err := <-errorCh:
+		cancel()
+		writerWG.Wait()
+		return err
+	case <-ctx.Done():
+		writerWG.Wait()
+		return ctx.Err()
+	default:
+	}
+
+	writerWG.Wait()
 	return nil
 }
 

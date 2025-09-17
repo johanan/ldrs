@@ -133,11 +133,11 @@ fn main() -> Result<(), anyhow::Error> {
                             Err(anyhow::anyhow!("Ingest is not implemented"))?
                         }
 
-                        let pre_sql = conn.exec_each_statement(&process_result.pre_sql)?;
+                        let pre_sql = conn.exec_transaction(&process_result.pre_sql)?;
                         info!("Pre SQL {:?} executed successfully", pre_sql);
                         let _sql = match process_result.strategy {
                             SnowflakeStrategy::Sql(sql) => {
-                                let sql_result = conn.exec_each_statement(&sql)?;
+                                let sql_result = conn.exec_transaction(&sql)?;
                                 info!("SQL {:?} executed successfully", sql_result);
                                 Ok(())
                             }
@@ -145,7 +145,7 @@ fn main() -> Result<(), anyhow::Error> {
                                 Err(anyhow::anyhow!("Ingest is not implemented"))
                             }
                         }?;
-                        let post_sql = conn.exec_each_statement(&process_result.post_sql)?;
+                        let post_sql = conn.exec_transaction(&process_result.post_sql)?;
                         info!("Post SQL {:?} executed successfully", post_sql);
                         Ok(())
                     }
