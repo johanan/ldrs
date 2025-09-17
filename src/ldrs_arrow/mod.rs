@@ -1,30 +1,16 @@
-use std::{future::Future, process::Stdio, vec};
+use std::{future::Future, iter::Zip, process::Stdio, sync::Arc, vec::IntoIter};
 
 use anyhow::Context;
 use arrow::ipc::reader::StreamReader;
 use arrow_array::RecordBatch;
-use arrow_schema::FieldRef;
+use arrow_schema::{Field, FieldRef};
 use futures::stream::StreamExt;
-use futures::TryStreamExt;
 use tokio::{process::Command, task};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::SyncIoBridge;
 use tracing::{debug, info};
 
-use crate::types::{ColumnSchema, MvrColumn, TimeUnit};
-
-pub async fn print_arrow_ipc_batches<S>(stream: S) -> Result<(), anyhow::Error>
-where
-    S: futures::TryStream<Ok = RecordBatch, Error = arrow::error::ArrowError> + Send,
-{
-    stream
-        .try_for_each(|batch| async move {
-            println!("{:?}", batch);
-            Ok(())
-        })
-        .await
-        .with_context(|| "Failed to process Arrow IPC stream")
-}
+use crate::types::{ColumnSchema, ColumnType, TimeUnit};
 
 fn map_arrow_time_to_pq_time(time_unit: &arrow_schema::TimeUnit) -> TimeUnit {
     match time_unit {
@@ -50,7 +36,6 @@ pub struct MvrStreamResult<B, S> {
 
 pub async fn mvr_to_stream(
     sql: &str,
-    columns: &Vec<MvrColumn>,
 ) -> Result<
     MvrStreamResult<
         impl futures::TryStream<Ok = RecordBatch, Error = arrow::error::ArrowError> + Send,
@@ -58,28 +43,12 @@ pub async fn mvr_to_stream(
     >,
     anyhow::Error,
 > {
-    let mut cmd = Command::new("mvr");
-    let column_json =
-        serde_json::to_string(columns).with_context(|| "Failed to serialize columns to JSON")?;
-    let args = vec![
-        "mv",
-        "--format",
-        "arrow",
-        "--sql",
-        sql,
-        "-d",
-        "--quiet",
-        "--batch-size",
-        "1024",
-        "--columns",
-        &column_json,
-    ];
+    let mut cmd = Command::new("ldrs-sf");
+    let args = vec!["query", "--sql", sql];
 
     let cmd = cmd.args(args);
     // log the command for debugging
     info!("Running command: {:?}", cmd);
-
-    cmd.env("MVR_DEST", "stdout://");
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -148,6 +117,7 @@ pub async fn mvr_to_stream(
                 if schema.fields().is_empty() {
                     None
                 } else {
+                    debug!("Schema: {:?}", schema);
                     Some(schema)
                 }
             }
@@ -162,25 +132,74 @@ pub async fn mvr_to_stream(
     })
 }
 
+pub fn fill_vec_with_none<'a>(
+    fields: &[Arc<Field>],
+    mut schemas: Vec<ColumnSchema<'a>>,
+) -> Vec<Option<ColumnSchema<'a>>> {
+    fields
+        .iter()
+        .map(|field| {
+            let maybe_index = schemas
+                .iter()
+                .position(|s| s.name().to_lowercase() == field.name().to_lowercase());
+            match maybe_index {
+                Some(index) => Some(schemas.swap_remove(index)),
+                None => None,
+            }
+        })
+        .collect()
+}
+
+pub fn get_sf_arrow_schema<'a>(field: &'a FieldRef) -> Option<ColumnSchema<'a>> {
+    let name = field.name();
+    // get other fields to help parse the type
+    let precision = field
+        .metadata()
+        .get("precision")
+        .and_then(|p| p.parse::<i32>().ok());
+    let scale = field
+        .metadata()
+        .get("scale")
+        .and_then(|s| s.parse::<i32>().ok());
+    let precision_scale = precision.zip(scale);
+
+    let char_length = field
+        .metadata()
+        .get("charLength")
+        .and_then(|l| l.parse::<i32>().ok());
+
+    // finally match on the logical type
+    field
+        .metadata()
+        .get("logicalType")
+        .and_then(|log_type| match log_type.as_str() {
+            "FIXED" => match precision_scale {
+                Some((p, s)) => Some(ColumnSchema::Numeric(name, p, s)),
+                None => None,
+            },
+            "TEXT" => match char_length {
+                // this is the max length for text in Snowflake so we treat it as full text
+                Some(len) if len == 16777216 => Some(ColumnSchema::Text(name)),
+                // this is a postgres limit for varchar, so we treat it as text
+                Some(len) if len > 10485760 => Some(ColumnSchema::Text(name)),
+                Some(len) => Some(ColumnSchema::Varchar(name, len)),
+                None => Some(ColumnSchema::Text(name)),
+            },
+            "TIMESTAMP_TZ" => match field.data_type() {
+                arrow_schema::DataType::Timestamp(time_unit, _) => Some(ColumnSchema::TimestampTz(
+                    name,
+                    map_arrow_time_to_pq_time(time_unit),
+                )),
+                _ => None,
+            },
+            _ => None,
+        })
+}
+
 pub fn map_arrow_to_abstract<'a>(field: &'a FieldRef) -> Option<ColumnSchema<'a>> {
     let name = field.name();
-    let metadata = field.metadata();
     match field.data_type() {
-        arrow_schema::DataType::Utf8 => match metadata.get("type") {
-            Some(typ) if typ == "VARCHAR" => {
-                let length = metadata
-                    .get("length")
-                    .and_then(|v| v.parse::<i32>().ok())
-                    .unwrap_or(0);
-                Some(ColumnSchema::Varchar(name, length))
-            }
-            Some(typ) if typ == "OBJECT" || typ == "JSON" || typ == "JSONB" => {
-                Some(ColumnSchema::Jsonb(name))
-            }
-            Some(typ) if typ == "UUID" => Some(ColumnSchema::Uuid(name)),
-            Some(_) => Some(ColumnSchema::Text(name)),
-            None => Some(ColumnSchema::Text(name)),
-        },
+        arrow_schema::DataType::Utf8 => Some(ColumnSchema::Text(name)),
         arrow_schema::DataType::Timestamp(time_unit, tz) => match tz {
             Some(_) => Some(ColumnSchema::TimestampTz(
                 name,
@@ -191,15 +210,16 @@ pub fn map_arrow_to_abstract<'a>(field: &'a FieldRef) -> Option<ColumnSchema<'a>
                 map_arrow_time_to_pq_time(time_unit),
             )),
         },
+        arrow_schema::DataType::Int8 => Some(ColumnSchema::SmallInt(name)),
         arrow_schema::DataType::Int16 => Some(ColumnSchema::SmallInt(name)),
         arrow_schema::DataType::Int64 => Some(ColumnSchema::BigInt(name)),
         arrow_schema::DataType::Int32 => Some(ColumnSchema::Integer(name)),
-        arrow_schema::DataType::Float64 => Some(ColumnSchema::Double(name)),
+        arrow_schema::DataType::Float64 => Some(ColumnSchema::Double(name, None)),
         arrow_schema::DataType::Float32 => Some(ColumnSchema::Real(name)),
         arrow_schema::DataType::Boolean => Some(ColumnSchema::Boolean(name)),
         arrow_schema::DataType::Binary => Some(ColumnSchema::Text(name)),
         arrow_schema::DataType::Date32 => Some(ColumnSchema::Date(name)),
-        arrow_schema::DataType::FixedSizeBinary(16) => Some(ColumnSchema::Uuid(name)),
+        arrow_schema::DataType::FixedSizeBinary(_) => Some(ColumnSchema::Bytea(name)),
         arrow_schema::DataType::Decimal128(precision, scale) => Some(ColumnSchema::Numeric(
             name,
             (*precision).into(),
@@ -207,4 +227,55 @@ pub fn map_arrow_to_abstract<'a>(field: &'a FieldRef) -> Option<ColumnSchema<'a>
         )),
         _ => None,
     }
+}
+
+pub fn flatten_arrow_transforms_zip(
+    zip: Zip<IntoIter<ColumnType>, IntoIter<ColumnType>>,
+) -> Vec<Option<ColumnType>> {
+    zip.map(|(arr_source, out_col)| match (arr_source, out_col) {
+        (a, b) if a == b => None,
+        (ColumnType::Text, ColumnType::Varchar(_)) => None,
+        // no uuid type in arrow so we always override to uuid
+        (_, ColumnType::Uuid) => Some(ColumnType::Uuid),
+        (_, ColumnType::Jsonb) => Some(ColumnType::Jsonb),
+        (_, b) => Some(b),
+    })
+    .collect::<Vec<_>>()
+}
+
+/*
+*
+*
+*
+(Some(ColumnSchema::Numeric(_, precision, scale)), Some(ColumnSchema::Integer(name))) => {
+    anyhow::ensure!(scale == 0, "Cannot map numeric with scale to integer");
+    anyhow::ensure!(
+        precision <= 9,
+        "Cannot map numeric with precision > 9 to integer for {}",
+        name
+    );
+    Ok(Some(ColumnSchema::Integer(name)))
+}
+(Some(ColumnSchema::Numeric(_, precision, scale)), Some(ColumnSchema::BigInt(name))) => {
+    anyhow::ensure!(scale == 0, "Cannot map numeric with scale to integer");
+    Ok(Some(ColumnSchema::BigInt(name)))
+}
+*/
+
+pub fn flatten_schema_zip<'a>(
+    zip: Zip<IntoIter<Option<ColumnSchema<'a>>>, IntoIter<Option<ColumnSchema<'a>>>>,
+) -> IntoIter<Option<ColumnSchema<'a>>> {
+    // special combination rules
+    zip.map(|(a, b)| match (a, b) {
+        // we can output a double, but the underlying type is an integer so we need the scale
+        (Some(ColumnSchema::Numeric(_, _, scale)), Some(ColumnSchema::Double(name, None))) => {
+            Some(ColumnSchema::Double(name, Some(scale)))
+        }
+        (Some(_), Some(b)) => Some(b),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    })
+    .collect::<Vec<_>>()
+    .into_iter()
 }

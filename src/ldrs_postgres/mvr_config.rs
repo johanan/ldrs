@@ -1,4 +1,4 @@
-use crate::types::MvrColumn;
+use crate::types::ColumnSpec;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde::Deserialize;
@@ -11,7 +11,7 @@ pub struct MvrToPGItemParsed {
     pub select_all: Option<String>,
     pub sql: Option<String>,
     #[serde(default)]
-    pub columns: Vec<MvrColumn>,
+    pub columns: Vec<ColumnSpec>,
     pub table: Option<String>,
     pub post_sql: Option<String>,
     pub role: Option<String>,
@@ -28,7 +28,7 @@ pub struct MvrToPGParsed {
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct MvrToPGConfig {
     pub sql: String,
-    pub columns: Vec<MvrColumn>,
+    pub columns: Vec<ColumnSpec>,
     pub table: String,
     pub post_sql: Option<String>,
     pub role: Option<String>,
@@ -141,7 +141,7 @@ mod tests {
                 table: destination_table
                 columns:
                   - name: id
-                    type: int4
+                    type: integer
         "#;
 
         let configs = process_yaml_with_overrides(yaml, None, None).unwrap();
@@ -150,8 +150,10 @@ mod tests {
         assert_eq!(configs[0].sql, "SELECT * FROM source_table");
         assert_eq!(configs[0].table, "destination_table");
         assert_eq!(configs[0].columns.len(), 1);
-        assert_eq!(configs[0].columns[0].name, "id");
-        assert_eq!(configs[0].columns[0].ty, "int4");
+        match &configs[0].columns[0] {
+            ColumnSpec::Integer { name, .. } => assert_eq!(name, "id"),
+            _ => panic!("Expected Integer column type"),
+        }
         assert_eq!(configs[0].role, Some("global_role".to_string()));
         assert_eq!(configs[0].batch_size, Some(500));
     }

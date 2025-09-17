@@ -268,13 +268,12 @@ impl LuaFunctionLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{path_pattern, types::TableSchema};
+    use crate::path_pattern;
 
     // Simple test result type for lua_logic tests
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestResult {
         pub sql: Vec<String>,
-        pub schema: TableSchema,
     }
 
     #[test]
@@ -347,15 +346,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.sql, vec!["-- setup SQL"]);
-        assert_eq!(result.schema.table_name, "temp_users_123");
-        assert_eq!(result.schema.columns.len(), 2);
-        assert_eq!(result.schema.columns[0].name, "id");
-        assert_eq!(result.schema.columns[0].column_type, "Uuid".to_string());
         // assert_eq!(
         //     result.schema.columns[0].conversion,
         //     Some("string_to_uuid".to_string())
         // );
-        assert_eq!(result.schema.columns[1].name, "metadata");
         // assert_eq!(
         //     result.schema.columns[1].override_type,
         //     Some("jsonb".to_string())

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod lua_args;
 pub mod parquet_types;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TimeUnit {
     Millis,
     Micros,
@@ -54,7 +54,7 @@ impl From<&parquet::basic::TimeUnit> for TimeUnit {
 /// // Later, you can use `pg_type` to help generate your PostgreSQL DDL statement.
 /// ```
 ///
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnSchema<'a> {
     Varchar(&'a str, i32),
     Text(&'a str),
@@ -64,13 +64,17 @@ pub enum ColumnSchema<'a> {
     Jsonb(&'a str),
     Numeric(&'a str, i32, i32),
     Real(&'a str),
-    Double(&'a str),
+    // I know doubles do not have scale, but there are situations
+    // where we want a double and the underlying arrow is an integer
+    // we need the source scale to properly convert it to double
+    Double(&'a str, Option<i32>),
     SmallInt(&'a str),
     Integer(&'a str),
     BigInt(&'a str),
     Boolean(&'a str),
     Date(&'a str),
-    Custom(&'a str, &'a str), // (column_name, ddl_type)
+    Custom(&'a str, String), // (column_name, ddl_type)
+    Bytea(&'a str),
 }
 
 impl<'a> ColumnSchema<'a> {
@@ -84,13 +88,57 @@ impl<'a> ColumnSchema<'a> {
             ColumnSchema::Jsonb(name) => name,
             ColumnSchema::Numeric(name, _, _) => name,
             ColumnSchema::Real(name) => name,
-            ColumnSchema::Double(name) => name,
+            ColumnSchema::Double(name, _) => name,
             ColumnSchema::SmallInt(name) => name,
             ColumnSchema::Integer(name) => name,
             ColumnSchema::BigInt(name) => name,
             ColumnSchema::Boolean(name) => name,
             ColumnSchema::Date(name) => name,
             ColumnSchema::Custom(name, _) => name,
+            ColumnSchema::Bytea(name) => name,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum ColumnType {
+    Varchar(i32),
+    Text,
+    TimestampTz(TimeUnit),
+    Timestamp(TimeUnit),
+    Uuid,
+    Jsonb,
+    Numeric(i32, i32),
+    Real,
+    Double(Option<i32>),
+    SmallInt,
+    Integer,
+    BigInt,
+    Boolean,
+    Date,
+    Custom(String), // ddl_type
+    Bytea,
+}
+
+impl From<&ColumnSchema<'_>> for ColumnType {
+    fn from(col: &ColumnSchema) -> Self {
+        match col {
+            ColumnSchema::Varchar(_, i) => ColumnType::Varchar(*i),
+            ColumnSchema::Text(_) => ColumnType::Text,
+            ColumnSchema::TimestampTz(_, tu) => ColumnType::TimestampTz(tu.clone()),
+            ColumnSchema::Timestamp(_, tu) => ColumnType::Timestamp(tu.clone()),
+            ColumnSchema::Uuid(_) => ColumnType::Uuid,
+            ColumnSchema::Jsonb(_) => ColumnType::Jsonb,
+            ColumnSchema::Numeric(_, p, s) => ColumnType::Numeric(*p, *s),
+            ColumnSchema::Real(_) => ColumnType::Real,
+            ColumnSchema::Double(_, scale) => ColumnType::Double(*scale),
+            ColumnSchema::SmallInt(_) => ColumnType::SmallInt,
+            ColumnSchema::Integer(_) => ColumnType::Integer,
+            ColumnSchema::BigInt(_) => ColumnType::BigInt,
+            ColumnSchema::Boolean(_) => ColumnType::Boolean,
+            ColumnSchema::Date(_) => ColumnType::Date,
+            ColumnSchema::Custom(_, ddl_type) => ColumnType::Custom(ddl_type.clone()),
+            ColumnSchema::Bytea(_) => ColumnType::Bytea,
         }
     }
 }
@@ -103,16 +151,6 @@ pub struct ColumnDefintion {
     pub length: i32,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct MvrColumn {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub ty: String,
-    pub length: Option<i32>,
-    pub precision: Option<i32>,
-    pub scale: Option<i32>,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileLoadData {
     pub full_url: String,
@@ -122,160 +160,90 @@ pub struct FileLoadData {
     pub path_parts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColumnMapping {
-    pub name: String,
-    pub column_type: String,       // Type name (case-insensitive)
-    pub processor: Option<String>, // Processor for data conversion
-    pub precision: Option<i32>,    // For NUMERIC types
-    pub scale: Option<i32>,        // For NUMERIC types
-    pub length: Option<i32>,       // For VARCHAR types
-    pub time_unit: Option<String>, // For TIMESTAMP types: "millis", "micros", "nanos"
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum ColumnSpec {
+    #[serde(rename = "varchar", alias = "VARCHAR")]
+    Varchar { name: String, length: i32 },
+    #[serde(rename = "text", alias = "TEXT")]
+    Text { name: String },
+    #[serde(rename = "timestamptz", alias = "TIMESTAMPTZ")]
+    TimestampTz { name: String, time_unit: TimeUnit },
+    #[serde(rename = "timestamp", alias = "TIMESTAMP")]
+    Timestamp { name: String, time_unit: TimeUnit },
+    #[serde(rename = "uuid", alias = "UUID")]
+    Uuid { name: String },
+    #[serde(rename = "jsonb", alias = "JSONB")]
+    Jsonb { name: String },
+    #[serde(rename = "numeric", alias = "NUMERIC")]
+    Numeric {
+        name: String,
+        precision: i32,
+        scale: i32,
+    },
+    #[serde(rename = "real", alias = "REAL")]
+    Real { name: String },
+    #[serde(
+        rename = "double",
+        alias = "DOUBLE",
+        alias = "float8",
+        alias = "FLOAT8"
+    )]
+    Double { name: String },
+    #[serde(rename = "smallint", alias = "SMALLINT")]
+    SmallInt { name: String },
+    #[serde(
+        rename = "integer",
+        alias = "INTEGER",
+        alias = "int4",
+        alias = "INT4",
+        alias = "int",
+        alias = "INT"
+    )]
+    Integer { name: String },
+    #[serde(rename = "bigint", alias = "BIGINT", alias = "int8", alias = "INT8")]
+    BigInt { name: String },
+    #[serde(rename = "boolean", alias = "BOOLEAN")]
+    Boolean { name: String },
+    #[serde(rename = "date", alias = "DATE")]
+    Date { name: String },
+    #[serde(rename = "custom", alias = "CUSTOM")]
+    Custom { name: String, ddl_type: String },
+    #[serde(rename = "bytea", alias = "BYTEA")]
+    Bytea { name: String },
 }
 
-use std::collections::HashMap;
+impl<'a> TryFrom<&'a ColumnSpec> for ColumnSchema<'a> {
+    type Error = anyhow::Error;
 
-impl ColumnMapping {
-    pub fn to_column_schema<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        let type_map: HashMap<
-            &str,
-            for<'b> fn(&ColumnMapping, &'b str) -> Result<ColumnSchema<'b>, anyhow::Error>,
-        > = [
-            (
-                "varchar",
-                Self::parse_varchar
-                    as for<'b> fn(
-                        &ColumnMapping,
-                        &'b str,
-                    ) -> Result<ColumnSchema<'b>, anyhow::Error>,
-            ),
-            ("text", Self::parse_text),
-            ("jsonb", Self::parse_jsonb),
-            ("numeric", Self::parse_numeric),
-            ("uuid", Self::parse_uuid),
-            ("timestamp", Self::parse_timestamp),
-            ("timestamptz", Self::parse_timestamptz),
-            ("boolean", Self::parse_boolean),
-            ("integer", Self::parse_integer),
-            ("bigint", Self::parse_bigint),
-            ("smallint", Self::parse_smallint),
-            ("real", Self::parse_real),
-            ("double", Self::parse_double),
-            ("date", Self::parse_date),
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        // Find matching parser (case-insensitive)
-        let parser = type_map
-            .iter()
-            .find(|(key, _)| self.column_type.eq_ignore_ascii_case(key))
-            .map(|(_, parser)| *parser);
-
-        match parser {
-            Some(parse_fn) => Ok(parse_fn(self, name)?),
-            None => Ok(ColumnSchema::Custom(name, &self.column_type)),
+    fn try_from(spec: &'a ColumnSpec) -> Result<Self, Self::Error> {
+        match spec {
+            ColumnSpec::Varchar { name, length } => Ok(ColumnSchema::Varchar(name, *length)),
+            ColumnSpec::Text { name } => Ok(ColumnSchema::Text(name)),
+            ColumnSpec::Numeric {
+                name,
+                precision,
+                scale,
+            } => Ok(ColumnSchema::Numeric(name, *precision, *scale)),
+            ColumnSpec::Uuid { name } => Ok(ColumnSchema::Uuid(name)),
+            ColumnSpec::Timestamp { name, time_unit } => {
+                Ok(ColumnSchema::Timestamp(name, time_unit.clone()))
+            }
+            ColumnSpec::TimestampTz { name, time_unit } => {
+                Ok(ColumnSchema::TimestampTz(name, time_unit.clone()))
+            }
+            ColumnSpec::Boolean { name } => Ok(ColumnSchema::Boolean(name)),
+            ColumnSpec::Integer { name } => Ok(ColumnSchema::Integer(name)),
+            ColumnSpec::BigInt { name } => Ok(ColumnSchema::BigInt(name)),
+            ColumnSpec::SmallInt { name } => Ok(ColumnSchema::SmallInt(name)),
+            ColumnSpec::Real { name } => Ok(ColumnSchema::Real(name)),
+            ColumnSpec::Double { name } => Ok(ColumnSchema::Double(name, None)),
+            ColumnSpec::Date { name } => Ok(ColumnSchema::Date(name)),
+            ColumnSpec::Jsonb { name } => Ok(ColumnSchema::Jsonb(name)),
+            ColumnSpec::Custom { name, ddl_type } => {
+                Ok(ColumnSchema::Custom(name, ddl_type.clone()))
+            }
+            ColumnSpec::Bytea { name } => Ok(ColumnSchema::Bytea(name)),
         }
     }
-
-    // Individual type parsers that return ColumnSchema directly
-    fn parse_varchar<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        let length = self.length.ok_or_else(|| {
-            anyhow::anyhow!(
-                "VARCHAR requires length parameter for column '{}'",
-                self.name
-            )
-        })?;
-        Ok(ColumnSchema::Varchar(name, length))
-    }
-
-    fn parse_text<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Text(name))
-    }
-
-    fn parse_jsonb<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Jsonb(name))
-    }
-
-    fn parse_numeric<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        let precision = self.precision.ok_or_else(|| {
-            anyhow::anyhow!(
-                "NUMERIC requires precision parameter for column '{}'",
-                self.name
-            )
-        })?;
-        let scale = self.scale.ok_or_else(|| {
-            anyhow::anyhow!(
-                "NUMERIC requires scale parameter for column '{}'",
-                self.name
-            )
-        })?;
-        Ok(ColumnSchema::Numeric(name, precision, scale))
-    }
-
-    fn parse_uuid<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Uuid(name))
-    }
-
-    fn parse_timestamp<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        let time_unit = self.parse_time_unit()?;
-        Ok(ColumnSchema::Timestamp(name, time_unit))
-    }
-
-    fn parse_timestamptz<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        let time_unit = self.parse_time_unit()?;
-        Ok(ColumnSchema::TimestampTz(name, time_unit))
-    }
-
-    fn parse_time_unit(&self) -> Result<TimeUnit, anyhow::Error> {
-        match self.time_unit.as_deref() {
-            Some(unit) if unit.eq_ignore_ascii_case("millis") => Ok(TimeUnit::Millis),
-            Some(unit) if unit.eq_ignore_ascii_case("micros") => Ok(TimeUnit::Micros),
-            Some(unit) if unit.eq_ignore_ascii_case("nanos") => Ok(TimeUnit::Nanos),
-            Some(unit) => Err(anyhow::anyhow!(
-                "Invalid time unit '{}' for column '{}'. Valid options: millis, micros, nanos",
-                unit,
-                self.name
-            )),
-            None => Ok(TimeUnit::Millis), // Default to milliseconds
-        }
-    }
-
-    fn parse_boolean<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Boolean(name))
-    }
-
-    fn parse_integer<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Integer(name))
-    }
-
-    fn parse_bigint<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::BigInt(name))
-    }
-
-    fn parse_smallint<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::SmallInt(name))
-    }
-
-    fn parse_real<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Real(name))
-    }
-
-    fn parse_double<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Double(name))
-    }
-
-    fn parse_date<'a>(&self, name: &'a str) -> Result<ColumnSchema<'a>, anyhow::Error> {
-        Ok(ColumnSchema::Date(name))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TableSchema {
-    pub table_name: String,
-    pub columns: Vec<ColumnMapping>,
 }

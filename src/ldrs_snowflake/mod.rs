@@ -5,7 +5,7 @@ use std::process::Command;
 use tracing::info;
 use url::Url;
 
-use crate::types::{lua_args::LuaArgs, TableSchema};
+use crate::types::lua_args::LuaArgs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -17,7 +17,6 @@ pub enum SnowflakeStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnowflakeResult {
     pub pre_sql: Vec<String>,
-    pub schema: Option<TableSchema>,
     pub strategy: SnowflakeStrategy,
     pub post_sql: Vec<String>,
 }
@@ -62,17 +61,16 @@ impl SnowflakeConnection {
 
     /// Execute a SQL statement (typically DDL) and return success/failure
     pub fn exec(&self, sql: &str) -> Result<String, anyhow::Error> {
-        let mut cmd = Command::new("mvr");
+        let mut cmd = Command::new("ldrs-sf");
         let args = vec!["exec", "--sql", sql];
 
-        info!("Running command: mvr {:?}", args);
+        info!("Running command: ldrs-sf {:?}", args);
 
         let output = cmd
             .args(args)
-            .env("MVR_DEST", "stdout://")
-            .env("MVR_SOURCE", &self.raw_conn_url)
+            .env("LDRS_SF_SOURCE", &self.raw_conn_url)
             .output()
-            .with_context(|| "Failed to execute mvr command")?;
+            .with_context(|| "Failed to execute ldrs-sf command")?;
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);

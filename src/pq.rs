@@ -73,7 +73,7 @@ pub fn map_parquet_to_abstract<'a>(
                 }
                 _ => match pq.get_physical_type() {
                     parquet::basic::Type::FLOAT => ColumnSchema::Real(name),
-                    parquet::basic::Type::DOUBLE => ColumnSchema::Double(name),
+                    parquet::basic::Type::DOUBLE => ColumnSchema::Double(name, None),
                     parquet::basic::Type::INT32 => ColumnSchema::Integer(name),
                     parquet::basic::Type::INT64 => ColumnSchema::BigInt(name),
                     parquet::basic::Type::BOOLEAN => ColumnSchema::Boolean(name),

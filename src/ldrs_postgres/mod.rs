@@ -2,15 +2,18 @@ pub mod config;
 pub mod mvr_config;
 
 use crate::arrow_access::TypedColumnAccessor;
+use crate::ldrs_arrow::fill_vec_with_none;
+use crate::ldrs_arrow::flatten_arrow_transforms_zip;
+use crate::ldrs_arrow::flatten_schema_zip;
+use crate::ldrs_arrow::get_sf_arrow_schema;
 use crate::ldrs_arrow::map_arrow_to_abstract;
 use crate::ldrs_arrow::mvr_to_stream;
 use crate::parquet_provider::builder_from_string;
 use crate::pq::get_column_schema;
 use crate::types::ColumnSchema;
+use crate::types::ColumnType;
 use anyhow::Context;
-use arrow::datatypes::ArrowNativeType;
 use arrow_array::RecordBatch;
-use bigdecimal::FromPrimitive;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::Subcommand;
 use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
@@ -18,11 +21,12 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use mvr_config::{load_config, MvrConfig};
 use native_tls::TlsConnector;
-use pg_bigdecimal::{BigDecimal, BigInt};
+use pg_bigdecimal::PgNumeric;
 use postgres_native_tls::MakeTlsConnector;
 use postgres_types::{to_sql_checked, ToSql, Type};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::iter::zip;
 use std::pin::pin;
 use std::pin::Pin;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
@@ -106,7 +110,7 @@ pub fn map_parquet_to_ddl(pq: &ColumnSchema) -> String {
         ColumnSchema::SmallInt(name) => format!("{} smallint", name),
         ColumnSchema::BigInt(name) => format!("{} bigint", name),
         ColumnSchema::Boolean(name) => format!("{} boolean", name),
-        ColumnSchema::Double(name) => format!("{} double precision", name),
+        ColumnSchema::Double(name, _) => format!("{} double precision", name),
         ColumnSchema::Integer(name) => format!("{} integer", name),
         ColumnSchema::Jsonb(name) => format!("{} jsonb", name),
         ColumnSchema::Numeric(name, precision, scale) => {
@@ -120,11 +124,8 @@ pub fn map_parquet_to_ddl(pq: &ColumnSchema) -> String {
         ColumnSchema::Uuid(name) => format!("{} uuid", name),
         ColumnSchema::Varchar(name, size) => format!("{} varchar({})", name, size),
         ColumnSchema::Custom(name, type_name) => format!("{} {}", name, type_name),
+        ColumnSchema::Bytea(name) => format!("{} bytea", name),
     }
-}
-
-pub fn map_columnschema_to_ddl(column: &ColumnSchema) -> String {
-    map_columnschema_to_ddl(column)
 }
 
 pub fn map_parquet_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
@@ -132,7 +133,7 @@ pub fn map_parquet_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
         ColumnSchema::SmallInt(_) => postgres_types::Type::INT2,
         ColumnSchema::BigInt(_) => postgres_types::Type::INT8,
         ColumnSchema::Boolean(_) => postgres_types::Type::BOOL,
-        ColumnSchema::Double(_) => postgres_types::Type::FLOAT8,
+        ColumnSchema::Double(_, _) => postgres_types::Type::FLOAT8,
         ColumnSchema::Integer(_) => postgres_types::Type::INT4,
         ColumnSchema::Jsonb(_) => postgres_types::Type::JSONB,
         ColumnSchema::Numeric(_, _, _) => postgres_types::Type::NUMERIC,
@@ -144,6 +145,7 @@ pub fn map_parquet_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
         ColumnSchema::Uuid(_) => postgres_types::Type::UUID,
         ColumnSchema::Varchar(_, _) => postgres_types::Type::VARCHAR,
         ColumnSchema::Custom(_, _) => postgres_types::Type::VARCHAR,
+        ColumnSchema::Bytea(_) => postgres_types::Type::BYTEA,
     }
 }
 
@@ -202,6 +204,7 @@ pub async fn process_record_batch<'a>(
     writer: &mut Pin<&mut BinaryCopyInWriter>,
     batch: &RecordBatch,
     parquet_types: &[ColumnSchema<'a>],
+    transforms: &[Option<ColumnType>],
 ) -> Result<(), anyhow::Error> {
     let num_rows = batch.num_rows();
     let columns = batch.columns();
@@ -210,26 +213,30 @@ pub async fn process_record_batch<'a>(
     let accessors: Vec<TypedColumnAccessor> =
         columns.iter().map(TypedColumnAccessor::new).collect();
 
-    let mut batch_buffer = Vec::<Vec<PgTypedValue>>::with_capacity(num_rows);
+    let converters = accessors
+        .iter()
+        .zip(parquet_types.iter().zip(transforms.iter()))
+        .map(|(accessor, (col_schema, transform))| {
+            ColumnConverter::new(accessor, col_schema, transform.as_ref())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut batch_buffer = Vec::<Vec<ExtractedValue>>::with_capacity(num_rows);
 
     // Process each row
     for row_idx in 0..num_rows {
-        // Create PgTypedValue for each column in this row
-        let row_values: Vec<PgTypedValue> = accessors
+        let row_values: Vec<ExtractedValue> = converters
             .iter()
-            .zip(parquet_types)
-            .map(|(accessor, parquet_type)| PgTypedValue::new(accessor, row_idx, parquet_type))
+            .map(|converter| converter.extract_value(row_idx))
             .collect();
 
         batch_buffer.push(row_values);
     }
 
     for row in batch_buffer.iter() {
-        let refs: Vec<&(dyn ToSql + Sync)> =
-            row.iter().map(|val| val as &(dyn ToSql + Sync)).collect();
         writer
             .as_mut()
-            .write(&refs)
+            .write_raw(row)
             .await
             .with_context(|| "Failed to write row to PostgreSQL")?;
     }
@@ -241,6 +248,7 @@ pub async fn execute_binary_copy<'a, S, E>(
     client: &mut tokio_postgres::Client,
     definition: &LoadDefintion,
     columns: &[ColumnSchema<'a>],
+    transforms: &[Option<ColumnType>],
     stream: S,
 ) -> Result<(), anyhow::Error>
 where
@@ -277,7 +285,7 @@ where
             Err(e) => return Err(anyhow::anyhow!("Stream error: {}", e)),
         };
 
-        process_record_batch(&mut pinned_writer, &batch, columns).await?;
+        process_record_batch(&mut pinned_writer, &batch, columns, transforms).await?;
     }
 
     pinned_writer
@@ -300,6 +308,7 @@ where
 
 pub async fn load_postgres<'a, S, E>(
     pq_types: &[ColumnSchema<'a>],
+    transforms: &[Option<ColumnType>],
     table: &str,
     post_sql: Option<String>,
     pg_url: &str,
@@ -316,7 +325,7 @@ where
     let mut client = create_connection(pg_url).await?;
     prepare_to_copy(&mut client, &definition).await?;
 
-    execute_binary_copy(&mut client, &definition, pq_types, stream).await?;
+    execute_binary_copy(&mut client, &definition, pq_types, transforms, stream).await?;
 
     Ok(())
 }
@@ -331,10 +340,12 @@ pub async fn load_postgres_cmd(
     info!("num rows: {:?}", file_md.num_rows());
 
     let mapped = get_column_schema(&file_md)?;
+    let transforms = vec![None; mapped.len()];
 
     let stream = builder.with_batch_size(args.batch_size).build()?;
     load_postgres(
         &mapped,
+        &transforms,
         &args.table,
         args.post_sql.clone(),
         &pg_url,
@@ -389,18 +400,60 @@ pub async fn load_from_mvr_config(args: MvrConfig, pg_url: String) -> Result<(),
     for (i, config) in tables.iter().enumerate() {
         let task_start = std::time::Instant::now();
         info!("Running task: {}/{}", i + 1, total_tasks);
-        let mvr_arrow = mvr_to_stream(&config.sql, &config.columns).await?;
+        let mvr_arrow = mvr_to_stream(&config.sql).await?;
         let schema = mvr_arrow.schema_stream.await;
+        //info!("Schema: {:?}", schema);
+        let config_cols = config
+            .columns
+            .iter()
+            .map(ColumnSchema::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
 
         match schema {
             Some(schema) => {
+                let filled_cols = fill_vec_with_none(&schema.fields, config_cols);
+                info!("Filled cols: {:?}", filled_cols);
+
+                let sf_schema = schema
+                    .fields()
+                    .iter()
+                    .map(get_sf_arrow_schema)
+                    .collect::<Vec<_>>();
+                info!("SF Schema: {:?}", sf_schema);
+
                 let mapped = schema
                     .fields()
                     .iter()
                     .filter_map(map_arrow_to_abstract)
                     .collect::<Vec<_>>();
+                info!("Mapped cols: {:?}", mapped);
+                let source_types = mapped.iter().map(ColumnType::from).collect::<Vec<_>>();
+                // let's start zipping, returning early if any columns do not work together
+                let mapped_option = mapped.into_iter().map(Some).collect::<Vec<_>>();
+                let override_cols = flatten_schema_zip(zip(
+                    flatten_schema_zip(zip(mapped_option, sf_schema)),
+                    filled_cols,
+                ))
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                info!("Override cols: {:?}", override_cols);
+                // see if we need to translate any columns
+                let final_types = override_cols
+                    .iter()
+                    .map(ColumnType::from)
+                    .collect::<Vec<_>>();
+                let transforms = flatten_arrow_transforms_zip(zip(source_types, final_types));
+                info!("Transforms: {:?}", transforms);
+
+                anyhow::ensure!(
+                    override_cols.len() == schema.fields().len(),
+                    "Final columns length does not match schema fields length"
+                );
+
                 load_postgres(
-                    &mapped,
+                    &override_cols,
+                    &transforms,
                     &config.table,
                     config.post_sql.clone(),
                     &pg_url,
@@ -425,111 +478,208 @@ pub async fn load_from_mvr_config(args: MvrConfig, pg_url: String) -> Result<(),
 }
 
 #[derive(Debug)]
-pub struct PgTypedValue<'a> {
-    accessor: &'a TypedColumnAccessor<'a>,
-    row_idx: usize,
-    col_schema: &'a ColumnSchema<'a>,
+pub enum ExtractedValue<'a> {
+    Boolean(Option<bool>),
+    Int64(Option<i64>),
+    Int32(Option<i32>),
+    Double(Option<f64>),
+    Real(Option<f32>),
+    Decimal(Option<PgNumeric>),
+    Uuid(Option<uuid::Uuid>),
+    Utf8(Option<&'a str>),
+    TimestampMillis(Option<NaiveDateTime>),
+    TimestampMicros(Option<NaiveDateTime>),
+    TimestampNanos(Option<NaiveDateTime>),
+    TimestampTzMillis(Option<DateTime<Utc>>),
+    TimestampTzMicros(Option<DateTime<Utc>>),
+    TimestampTzNanos(Option<DateTime<Utc>>),
+    Jsonb(Option<Value>),
 }
 
-impl<'a> PgTypedValue<'a> {
-    pub fn new(
+#[derive(Debug)]
+enum ConversionStrategy {
+    Boolean,
+    BigInt,
+    Integer,
+    Double { scale: Option<i32> },
+    Real,
+    Text,
+    Numeric { precision: i32, scale: i32 },
+    TimestampMillis,
+    TimestampMicros,
+    TimestampNanos,
+    TimestampTzMillis,
+    TimestampTzMicros,
+    TimestampTzNanos,
+    TransformBigInt,
+    TransformInteger,
+    TransformUuid,
+    TransformJsonb,
+    TransformNumeric { precision: i32, scale: i32 },
+    TransformDouble { scale: Option<i32> },
+}
+
+#[derive(Debug)]
+struct ColumnConverter<'a> {
+    accessor: &'a TypedColumnAccessor<'a>,
+    strategy: ConversionStrategy,
+}
+
+impl<'a> ColumnConverter<'a> {
+    fn new(
         accessor: &'a TypedColumnAccessor<'a>,
-        row_idx: usize,
-        col_schema: &'a ColumnSchema<'a>,
-    ) -> Self {
-        Self {
-            accessor,
-            row_idx,
-            col_schema,
+        col_schema: &ColumnSchema,
+        transform: Option<&ColumnType>,
+    ) -> Result<Self, anyhow::Error> {
+        let strategy = match transform {
+            // all of these have an output type that is not the same as the arrow array type
+            Some(ColumnType::BigInt) => ConversionStrategy::TransformBigInt,
+            Some(ColumnType::Integer) => ConversionStrategy::TransformInteger,
+            // I know doubles do not have scale, but this could be a different type underneath
+            Some(ColumnType::Double(precision)) => {
+                ConversionStrategy::TransformDouble { scale: *precision }
+            }
+            Some(ColumnType::Numeric(precision, scale)) => ConversionStrategy::TransformNumeric {
+                precision: *precision,
+                scale: *scale,
+            },
+            Some(ColumnType::Uuid) => ConversionStrategy::TransformUuid,
+            Some(ColumnType::Jsonb) => ConversionStrategy::TransformJsonb,
+            Some(ColumnType::TimestampTz(time_unit)) => match time_unit {
+                crate::types::TimeUnit::Millis => ConversionStrategy::TimestampTzMillis,
+                crate::types::TimeUnit::Micros => ConversionStrategy::TimestampTzMicros,
+                crate::types::TimeUnit::Nanos => ConversionStrategy::TimestampTzNanos,
+            },
+            None => match col_schema {
+                // these all have the same output as arrow array type
+                ColumnSchema::Boolean(_) => ConversionStrategy::Boolean,
+                ColumnSchema::BigInt(_) => ConversionStrategy::BigInt,
+                ColumnSchema::Integer(_) => ConversionStrategy::Integer,
+                ColumnSchema::Double(_, scale) => ConversionStrategy::Double {
+                    scale: scale.clone(),
+                },
+                ColumnSchema::Text(_) | ColumnSchema::Varchar(_, _) => ConversionStrategy::Text,
+                ColumnSchema::Numeric(_, precision, scale) => ConversionStrategy::Numeric {
+                    precision: *precision,
+                    scale: *scale,
+                },
+                ColumnSchema::Timestamp(_, crate::types::TimeUnit::Millis) => {
+                    ConversionStrategy::TimestampMillis
+                }
+                ColumnSchema::Timestamp(_, crate::types::TimeUnit::Micros) => {
+                    ConversionStrategy::TimestampMicros
+                }
+                ColumnSchema::Timestamp(_, crate::types::TimeUnit::Nanos) => {
+                    ConversionStrategy::TimestampNanos
+                }
+                ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Millis) => {
+                    ConversionStrategy::TimestampTzMillis
+                }
+                ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Micros) => {
+                    ConversionStrategy::TimestampTzMicros
+                }
+                ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Nanos) => {
+                    ConversionStrategy::TimestampTzNanos
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported column schema: {:?}",
+                        col_schema
+                    ))
+                }
+            },
+            _ => return Err(anyhow::anyhow!("Unsupported transform: {:?}", transform)),
+        };
+
+        Ok(ColumnConverter { accessor, strategy })
+    }
+
+    #[inline]
+    fn extract_value(&self, row_idx: usize) -> ExtractedValue<'_> {
+        match &self.strategy {
+            ConversionStrategy::Boolean => unsafe {
+                ExtractedValue::Boolean(self.accessor.Boolean(row_idx))
+            },
+            ConversionStrategy::BigInt => unsafe {
+                ExtractedValue::Int64(self.accessor.Int64(row_idx))
+            },
+            ConversionStrategy::Integer => unsafe {
+                ExtractedValue::Int32(self.accessor.Int32(row_idx))
+            },
+            ConversionStrategy::Double { scale: _ } => unsafe {
+                ExtractedValue::Double(self.accessor.Float64(row_idx))
+            },
+            ConversionStrategy::Text => unsafe {
+                ExtractedValue::Utf8(self.accessor.Utf8(row_idx))
+            },
+            ConversionStrategy::Numeric { precision, scale } => {
+                ExtractedValue::Decimal(self.accessor.as_pg_numeric(row_idx, *scale))
+            }
+            ConversionStrategy::TransformBigInt => {
+                ExtractedValue::Int64(self.accessor.as_int64(row_idx))
+            }
+            ConversionStrategy::TransformInteger => {
+                ExtractedValue::Int32(self.accessor.as_int32(row_idx))
+            }
+            ConversionStrategy::TransformUuid => unsafe {
+                ExtractedValue::Uuid(self.accessor.as_uuid(row_idx))
+            },
+            ConversionStrategy::TransformJsonb => {
+                ExtractedValue::Jsonb(self.accessor.as_serde(row_idx))
+            }
+            ConversionStrategy::TransformNumeric { precision, scale } => {
+                ExtractedValue::Decimal(self.accessor.as_pg_numeric(row_idx, *scale))
+            }
+            ConversionStrategy::TransformDouble { scale } => {
+                ExtractedValue::Double(self.accessor.as_float64(row_idx, *scale))
+            }
+            ConversionStrategy::TimestampMillis => {
+                ExtractedValue::TimestampMillis(self.accessor.as_chrono_naive(row_idx))
+            }
+            ConversionStrategy::TimestampMicros => {
+                ExtractedValue::TimestampMicros(self.accessor.as_chrono_naive(row_idx))
+            }
+            ConversionStrategy::TimestampNanos => {
+                ExtractedValue::TimestampNanos(self.accessor.as_chrono_naive(row_idx))
+            }
+            ConversionStrategy::TimestampTzMillis => unsafe {
+                ExtractedValue::TimestampTzMillis(self.accessor.as_chrono_tz(row_idx))
+            },
+            ConversionStrategy::TimestampTzMicros => unsafe {
+                ExtractedValue::TimestampTzMicros(self.accessor.as_chrono_tz(row_idx))
+            },
+            ConversionStrategy::TimestampTzNanos => unsafe {
+                ExtractedValue::TimestampTzNanos(self.accessor.as_chrono_tz(row_idx))
+            },
+            _ => panic!("Unsupported conversion strategy: {:?}", self.strategy),
         }
     }
 }
 
-impl<'a> ToSql for PgTypedValue<'a> {
+impl<'a> ToSql for ExtractedValue<'a> {
+    #[inline]
     fn to_sql(
         &self,
         ty: &Type,
         out: &mut tokio_postgres::types::private::BytesMut,
     ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        // Use the ParquetType to determine the semantic meaning
-        match self.accessor {
-            TypedColumnAccessor::Int16(_) => self.accessor.Int16(self.row_idx).to_sql(ty, out),
-            TypedColumnAccessor::Int32(_) => self.accessor.Int32(self.row_idx).to_sql(ty, out),
-            TypedColumnAccessor::Int64(_) => self.accessor.Int64(self.row_idx).to_sql(ty, out),
-            TypedColumnAccessor::Float32(_) => self.accessor.Float32(self.row_idx).to_sql(ty, out),
-            TypedColumnAccessor::Float64(_) => self.accessor.Float64(self.row_idx).to_sql(ty, out),
-            TypedColumnAccessor::Boolean(_) => self.accessor.Boolean(self.row_idx).to_sql(ty, out),
-            TypedColumnAccessor::Decimal128(_, _, scale) => {
-                self.accessor
-                    .Decimal128(self.row_idx)
-                    .map(|d| {
-                        let big_int = BigInt::from_i128(d);
-                        pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
-                            BigDecimal::new(bi, (*scale).to_i64().expect("Scale failed"))
-                        }))
-                    })
-                    .to_sql(ty, out)
-            }
-            TypedColumnAccessor::FixedSizeBinary(_, size) => match self.col_schema {
-                ColumnSchema::Uuid(_) => self
-                    .accessor
-                    .FixedSizeBinary(self.row_idx)
-                    .map(|bytes| uuid::Uuid::from_slice(bytes).expect("Failed to parse UUID"))
-                    .to_sql(ty, out),
-                _ => self.accessor.FixedSizeBinary(self.row_idx).to_sql(ty, out),
-            },
-            // timestamp types
-            // Datetime and NaiveDateTime are different types so they have to be targeted separately
-            TypedColumnAccessor::TimestampMillisecond(_, true) => self
-                .accessor
-                .TimestampMillisecond(self.row_idx)
-                .and_then(DateTime::<Utc>::from_timestamp_millis)
-                .to_sql(ty, out),
-            TypedColumnAccessor::TimestampMillisecond(_, false) => self
-                .accessor
-                .TimestampMillisecond(self.row_idx)
-                .and_then(NaiveDateTime::from_timestamp_millis)
-                .to_sql(ty, out),
-            TypedColumnAccessor::TimestampMicrosecond(_, true) => self
-                .accessor
-                .TimestampMicrosecond(self.row_idx)
-                .and_then(DateTime::<Utc>::from_timestamp_micros)
-                .to_sql(ty, out),
-            TypedColumnAccessor::TimestampMicrosecond(_, false) => self
-                .accessor
-                .TimestampMicrosecond(self.row_idx)
-                .and_then(NaiveDateTime::from_timestamp_micros)
-                .to_sql(ty, out),
-            TypedColumnAccessor::TimestampNanosecond(_, true) => self
-                .accessor
-                .TimestampNanosecond(self.row_idx)
-                .map(DateTime::<Utc>::from_timestamp_nanos)
-                .to_sql(ty, out),
-            TypedColumnAccessor::TimestampNanosecond(_, false) => self
-                .accessor
-                .TimestampNanosecond(self.row_idx)
-                .and_then(NaiveDateTime::from_timestamp_nanos)
-                .to_sql(ty, out),
-            TypedColumnAccessor::Date32(_) => self
-                .accessor
-                .Date32(self.row_idx)
-                .map(|d| {
-                    //chrono::NaiveDate::from_ymd(1970, 1, 1) + chrono::Duration::days(d.into())
-                    chrono::NaiveDate::from_num_days_from_ce_opt(719163 + d)
-                        .expect("Failed to parse date")
-                })
-                .to_sql(ty, out),
-
-            // string types
-            TypedColumnAccessor::Utf8(_) => match self.col_schema {
-                ColumnSchema::Jsonb(_) => self
-                    .accessor
-                    .Utf8(self.row_idx)
-                    .map(|j| serde_json::from_str::<Value>(j).expect("Failed to parse json"))
-                    .map(tokio_postgres::types::Json)
-                    .to_sql(ty, out),
-                _ => self.accessor.Utf8(self.row_idx).to_sql(ty, out),
-            },
+        match self {
+            ExtractedValue::Boolean(v) => v.to_sql(ty, out),
+            ExtractedValue::Int64(v) => v.to_sql(ty, out),
+            ExtractedValue::Int32(v) => v.to_sql(ty, out),
+            ExtractedValue::Double(v) => v.to_sql(ty, out),
+            ExtractedValue::Uuid(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampMillis(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampMicros(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampNanos(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampTzMillis(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampTzMicros(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampTzNanos(v) => v.to_sql(ty, out),
+            ExtractedValue::Real(v) => v.to_sql(ty, out),
+            ExtractedValue::Decimal(v) => v.to_sql(ty, out),
+            ExtractedValue::Utf8(v) => v.to_sql(ty, out),
+            ExtractedValue::Jsonb(v) => v.to_sql(ty, out),
+            _ => Err(format!("Unsupported ExtractedValue variant: {:?}", self).into()),
         }
     }
 
@@ -599,12 +749,20 @@ mod tests {
             .iter()
             .filter_map(|pq| map_parquet_to_abstract(pq, &kv))
             .collect::<Vec<ColumnSchema>>();
-
+        let transforms = vec![
+            None,
+            None,
+            None,
+            Some(ColumnType::Uuid),
+            Some(ColumnType::Uuid),
+            None,
+        ];
         let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
         let stream = builder.with_batch_size(1024).build().unwrap();
 
         load_postgres(
             &mapped,
+            &transforms,
             "not_public.users_test",
             None,
             pg_url,
@@ -630,6 +788,7 @@ mod tests {
         let stream = builder.with_batch_size(1024).build().unwrap();
         load_postgres(
             &mapped,
+            &transforms,
             "not_public.users_test",
             Some(post_sql.to_string()),
             pg_url,
