@@ -1,5 +1,7 @@
+pub mod client;
 pub mod config;
 pub mod mvr_config;
+pub mod schema;
 
 use crate::arrow_access::TypedColumnAccessor;
 use crate::ldrs_arrow::fill_vec_with_none;
@@ -16,6 +18,7 @@ use anyhow::Context;
 use arrow_array::RecordBatch;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::Subcommand;
+use client::create_connection;
 use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -71,18 +74,6 @@ impl LoadDefintion {
             self.drop_target_ddl, self.set_search_ddl, self.rename_ddl
         )
     }
-}
-
-pub async fn create_connection(conn_url: &str) -> Result<tokio_postgres::Client, anyhow::Error> {
-    let connector = TlsConnector::new().with_context(|| "Could not create TLS connector")?;
-    let connector = MakeTlsConnector::new(connector);
-    let (client, connection) = tokio_postgres::connect(conn_url, connector).await?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
-        }
-    });
-    Ok(client)
 }
 
 pub fn load_table_name<'a>(schema: &'a str, table: &'a str) -> String {
