@@ -18,9 +18,9 @@ jobs:
       - name: Set up Rust
         uses: actions/setup-go@v5
       - name: Setup Postegres
-        run: test_data/setup_test.sh
+        run: scripts/setup_test.sh
         shell: bash
       - run: cargo test
       - name: Shutdown Postgres
-        run: test_data/shutdown_test.sh
+        run: scripts/shutdown_test.sh
         shell: bash

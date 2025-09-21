@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod lua_args;
 pub mod parquet_types;
+pub mod schema;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TimeUnit {
