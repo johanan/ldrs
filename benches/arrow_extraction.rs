@@ -5,9 +5,7 @@ use arrow_array::{Int32Array, TimestampMicrosecondArray, TimestampMillisecondArr
 use arrow_schema::TimeUnit;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use ldrs::arrow_access::TypedColumnAccessor;
-use ldrs::ldrs_postgres::PgTypedValue;
 use ldrs::types::ColumnSchema;
-use postgres_types::ToSql;
 use postgres_types::Type;
 use std::sync::Arc;
 use tokio_util::bytes::BytesMut;

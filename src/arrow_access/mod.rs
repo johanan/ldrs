@@ -11,7 +11,6 @@ use arrow_schema::{DataType, TimeUnit};
 use bigdecimal::FromPrimitive;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use pg_bigdecimal::{BigDecimal, BigInt, PgNumeric};
-use postgres_types::Date;
 use serde_json::Value;
 
 pub fn fast_pow10(exp: i32) -> f64 {
