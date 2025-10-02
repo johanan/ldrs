@@ -1,5 +1,6 @@
 #!/bin/bash
-set -euo pipefail
+set -eu
+set -o pipefail 2>/dev/null || true
 
 # Simple installer for ldrs-sf binary
 # Downloads tar archive and installs to ~/.local/bin/ldrs-sf
@@ -60,13 +61,18 @@ fi
 echo "✓ $APP_NAME installed successfully to $INSTALL_PATH"
 
 # Check if ~/.local/bin is in PATH
-if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    echo ""
-    echo "NOTE: $INSTALL_DIR is not in your PATH."
-    echo "Add this to your shell profile (.bashrc, .zshrc, etc.):"
-    echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-    echo ""
-    echo "Or restart your shell if it's already configured."
-fi
+case ":$PATH:" in
+    *":$INSTALL_DIR:"*)
+        # Already in PATH, do nothing
+        ;;
+    *)
+        echo ""
+        echo "NOTE: $INSTALL_DIR is not in your PATH."
+        echo "Add this to your shell profile (.bashrc, .zshrc, etc.):"
+        echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo ""
+        echo "Or restart your shell if it's already configured."
+        ;;
+esac
 
 echo "Run '$APP_NAME --help' to get started."
