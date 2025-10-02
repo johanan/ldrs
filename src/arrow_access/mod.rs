@@ -341,6 +341,15 @@ impl<'a> TypedColumnAccessor<'a> {
                     Some(value as f64 / fast_pow10(*scale as i32))
                 }
             }
+            Self::Int64(arr) => {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    scale
+                        .map(|s| arr.value(row) as f64 / fast_pow10(s))
+                        .or_else(|| Some(arr.value(row) as f64))
+                }
+            }
             Self::Int32(arr) => {
                 if arr.is_null(row) {
                     None
@@ -580,5 +589,27 @@ impl<'a> TypedColumnAccessor<'a> {
             Self::FixedSizeBinary(_, size) => Some(*size),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn test_bigint_to_float() {
+        let arr = Arc::new(Int64Array::from(vec![100, 200, 300])) as Arc<dyn Array>;
+        let typed = TypedColumnAccessor::new(&arr);
+        assert_eq!(Some(1.00), typed.as_float64(0, Some(2)));
+        assert_eq!(Some(10.0), typed.as_float64(0, Some(1)));
+        assert_eq!(Some(100.0), typed.as_float64(0, Some(0)));
+        assert_eq!(Some(2.00), typed.as_float64(1, Some(2)));
+        assert_eq!(Some(3.00), typed.as_float64(2, Some(2)));
+
+        assert_eq!(Some(100), typed.as_int64(0));
+        assert_eq!(Some(200), typed.as_int64(1));
+        assert_eq!(Some(300), typed.as_int64(2));
     }
 }
