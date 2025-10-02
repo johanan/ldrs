@@ -1,7 +1,9 @@
 pub mod client;
 pub mod config;
+pub mod drop_replace;
 pub mod mvr_config;
 pub mod schema;
+pub mod schema_change;
 
 use crate::arrow_access::TypedColumnAccessor;
 use crate::ldrs_arrow::fill_vec_with_none;
@@ -10,6 +12,7 @@ use crate::ldrs_arrow::flatten_schema_zip;
 use crate::ldrs_arrow::get_sf_arrow_schema;
 use crate::ldrs_arrow::map_arrow_to_abstract;
 use crate::ldrs_arrow::mvr_to_stream;
+use crate::ldrs_schema::SchemaChange;
 use crate::parquet_provider::builder_from_string;
 use crate::pq::get_column_schema;
 use crate::types::ColumnSchema;
@@ -23,23 +26,14 @@ use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
 use futures::StreamExt;
 use futures::TryStreamExt;
 use mvr_config::{load_config, MvrConfig};
-use native_tls::TlsConnector;
 use pg_bigdecimal::PgNumeric;
-use postgres_native_tls::MakeTlsConnector;
 use postgres_types::{to_sql_checked, ToSql, Type};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::iter::zip;
 use std::pin::pin;
 use std::pin::Pin;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tracing::info;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PostgresStrategy {
-    Binary,
-    Insert,
-}
 
 #[derive(Subcommand)]
 pub enum PgCommands {
@@ -96,30 +90,7 @@ pub fn build_ddl(load_table: String, fields: &[String]) -> String {
     ddl
 }
 
-pub fn map_parquet_to_ddl(pq: &ColumnSchema) -> String {
-    match pq {
-        ColumnSchema::SmallInt(name) => format!("{} smallint", name),
-        ColumnSchema::BigInt(name) => format!("{} bigint", name),
-        ColumnSchema::Boolean(name) => format!("{} boolean", name),
-        ColumnSchema::Double(name, _) => format!("{} double precision", name),
-        ColumnSchema::Integer(name) => format!("{} integer", name),
-        ColumnSchema::Jsonb(name) => format!("{} jsonb", name),
-        ColumnSchema::Numeric(name, precision, scale) => {
-            format!("{} numeric({}, {})", name, precision, scale)
-        }
-        ColumnSchema::Timestamp(name, ..) => format!("{} timestamp", name),
-        ColumnSchema::TimestampTz(name, ..) => format!("{} timestamptz", name),
-        ColumnSchema::Date(name) => format!("{} date", name),
-        ColumnSchema::Real(name) => format!("{} real", name),
-        ColumnSchema::Text(name) => format!("{} text", name),
-        ColumnSchema::Uuid(name) => format!("{} uuid", name),
-        ColumnSchema::Varchar(name, size) => format!("{} varchar({})", name, size),
-        ColumnSchema::Custom(name, type_name) => format!("{} {}", name, type_name),
-        ColumnSchema::Bytea(name) => format!("{} bytea", name),
-    }
-}
-
-pub fn map_parquet_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
+pub fn map_col_schema_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
     match pq {
         ColumnSchema::SmallInt(_) => postgres_types::Type::INT2,
         ColumnSchema::BigInt(_) => postgres_types::Type::INT8,
@@ -150,7 +121,8 @@ pub fn build_definition<'a>(
     let load_table = load_table_name(schema, table);
     let schema_ddl = format!("CREATE SCHEMA IF NOT EXISTS {};", schema);
     let drop_ddl = format!("DROP TABLE IF EXISTS {};", load_table);
-    let fields_ddl: Vec<String> = types.iter().map(map_parquet_to_ddl).collect();
+    let schema_change = SchemaChange::build_from_columns(&[], &types);
+    let fields_ddl: Vec<String> = schema_change.to_postgres_final_column_ddl();
     let create_ddl = build_ddl(load_table.clone(), &fields_ddl);
     let drop_target_ddl = format!("DROP TABLE IF EXISTS {}.{};", schema, table);
     let set_search_ddl = format!("SET search_path TO {};", schema);
@@ -248,7 +220,7 @@ where
 {
     let pg_types = columns
         .iter()
-        .map(map_parquet_to_pg_type)
+        .map(map_col_schema_to_pg_type)
         .collect::<Vec<_>>();
 
     let sink_tx = client

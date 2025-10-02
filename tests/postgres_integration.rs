@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use ldrs::{
-    ldrs_postgres::{build_ddl, client::create_connection, map_parquet_to_ddl},
+    ldrs_postgres::{build_ddl, client::create_connection},
     lua_logic::{LuaFunctionLoader, StorageData, UrlData},
     parquet_provider::builder_from_string,
     path_pattern::{self, build_module_path_from_pattern},
