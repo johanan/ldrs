@@ -1,3 +1,5 @@
+pub mod snowflake_source;
+
 use anyhow::Context;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};

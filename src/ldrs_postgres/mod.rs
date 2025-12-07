@@ -1,7 +1,7 @@
 pub mod client;
 pub mod config;
-pub mod drop_replace;
 pub mod mvr_config;
+pub mod postgres_destination;
 pub mod schema;
 pub mod schema_change;
 
