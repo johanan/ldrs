@@ -100,7 +100,7 @@ impl<'a> ColumnSchema<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 pub enum ColumnType {
     Varchar(i32),
     Text,
