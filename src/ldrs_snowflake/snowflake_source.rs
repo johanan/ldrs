@@ -45,7 +45,7 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<SFSource, anyh
         (Some(name), Some(sql)) => {
             // Both present - must be a query
             match tag {
-                Some("sf.query") | None => Ok(SFSource::Query(SFQuery {
+                Some("sf.query") | Some("sf") | None => Ok(SFSource::Query(SFQuery {
                     sql: sql.to_string(),
                     name: name.to_string(),
                     bind_vars: Vec::new(),
@@ -57,7 +57,7 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<SFSource, anyh
         (Some(name), None) => {
             // Only name - must be a table
             match tag {
-                Some("sf.table") | None => Ok(SFSource::Table(SFTable {
+                Some("sf.table") | Some("sf") | None => Ok(SFSource::Table(SFTable {
                     name: name.to_string(),
                 })),
                 Some("sf.query") => Err(anyhow::Error::msg("Tag 'sf.query' but sql is missing")),

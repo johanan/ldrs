@@ -85,7 +85,7 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
     match (merge_keys, delete_keys) {
         (Some(_), Some(_)) => Err(anyhow::anyhow!("Both merge_keys and delete_keys are set")),
         (Some(merge_keys), None) => match tag {
-            Some("pg.merge") | None => Ok(PgDestination::Merge(PgMerge {
+            Some("pg.merge") | Some("pg") | None => Ok(PgDestination::Merge(PgMerge {
                 name,
                 pre_sql,
                 post_sql,
@@ -96,15 +96,17 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
             _ => Err(anyhow::anyhow!("Invalid tag for merge destination")),
         },
         (None, Some(delete_keys)) => match tag {
-            Some("pg.delete_insert") | None => Ok(PgDestination::DeleteInsert(PgDeleteInsert {
-                name,
-                pre_sql,
-                post_sql,
-                role,
-                columns,
-                delete_keys,
-                on_conflict,
-            })),
+            Some("pg.delete_insert") | Some("pg") | None => {
+                Ok(PgDestination::DeleteInsert(PgDeleteInsert {
+                    name,
+                    pre_sql,
+                    post_sql,
+                    role,
+                    columns,
+                    delete_keys,
+                    on_conflict,
+                }))
+            }
             _ => Err(anyhow::anyhow!("Invalid tag for delete_insert destination")),
         },
         (None, None) => match tag {
