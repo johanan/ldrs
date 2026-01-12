@@ -11,6 +11,7 @@ pub enum ColumnChange<'a> {
     Removed,
 }
 
+#[derive(Debug)]
 pub struct SchemaChange<'a> {
     pub columns: Vec<&'a ColumnSchema<'a>>,
     pub additions: Vec<&'a ColumnSchema<'a>>,

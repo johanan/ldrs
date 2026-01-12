@@ -1,4 +1,10 @@
-use std::{future::Future, iter::Zip, process::Stdio, sync::Arc, vec::IntoIter};
+use std::{
+    future::Future,
+    iter::{zip, Zip},
+    process::Stdio,
+    sync::Arc,
+    vec::IntoIter,
+};
 
 use anyhow::Context;
 use arrow::ipc::reader::StreamReader;
@@ -196,6 +202,15 @@ pub fn get_sf_arrow_schema<'a>(field: &'a FieldRef) -> Option<ColumnSchema<'a>> 
         })
 }
 
+impl<'a> TryFrom<&'a FieldRef> for ColumnSchema<'a> {
+    type Error = anyhow::Error;
+
+    fn try_from(field: &'a FieldRef) -> Result<Self, Self::Error> {
+        let mapping = map_arrow_to_abstract(field);
+        mapping.ok_or_else(|| anyhow::anyhow!("Failed to map arrow field to abstract schema"))
+    }
+}
+
 pub fn map_arrow_to_abstract<'a>(field: &'a FieldRef) -> Option<ColumnSchema<'a>> {
     let name = field.name();
     match field.data_type() {
@@ -227,6 +242,50 @@ pub fn map_arrow_to_abstract<'a>(field: &'a FieldRef) -> Option<ColumnSchema<'a>
         )),
         _ => None,
     }
+}
+
+pub fn build_final_schema<'a>(
+    schema: &'a arrow_schema::SchemaRef,
+    overrides: Vec<Vec<ColumnSchema<'a>>>,
+) -> Result<(Vec<ColumnSchema<'a>>, Vec<Option<ColumnType>>), anyhow::Error> {
+    let src_fields = schema
+        .fields()
+        .iter()
+        .filter_map(map_arrow_to_abstract)
+        .collect::<Vec<_>>();
+
+    // we need a colschema for every field to process the arrow batch
+    anyhow::ensure!(
+        src_fields.len() == schema.fields().len(),
+        "Columns length does not match schema fields length"
+    );
+
+    let source_types = src_fields.iter().map(ColumnType::from).collect::<Vec<_>>();
+    let some_src_fields = src_fields.into_iter().map(Some).collect::<Vec<_>>();
+
+    // check arrow metadata for Snowflake logical types
+    let sf_fields = schema
+        .fields()
+        .iter()
+        .map(get_sf_arrow_schema)
+        .collect::<Vec<_>>();
+
+    // we have a known schema override so do it here
+    let init_src = flatten_schema_zip(zip(some_src_fields, sf_fields)).collect();
+
+    let folded = overrides
+        .into_iter()
+        .fold(init_src, |acc, override_fields| {
+            let filled = fill_vec_with_none(&schema.fields, override_fields);
+            flatten_schema_zip(zip(acc, filled))
+                .into_iter()
+                .collect::<Vec<_>>()
+        });
+    // remove the Option as we should have a full vec
+    let final_cols = folded.into_iter().flatten().collect::<Vec<_>>();
+    let final_types = final_cols.iter().map(ColumnType::from).collect::<Vec<_>>();
+    let transforms = flatten_arrow_transforms_zip(zip(source_types, final_types));
+    Ok((final_cols, transforms))
 }
 
 pub fn flatten_arrow_transforms_zip(

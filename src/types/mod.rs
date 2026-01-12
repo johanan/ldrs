@@ -143,6 +143,29 @@ impl From<&ColumnSchema<'_>> for ColumnType {
     }
 }
 
+impl TryFrom<&str> for ColumnType {
+    type Error = anyhow::Error;
+
+    fn try_from(hint: &str) -> Result<Self, Self::Error> {
+        match hint.to_uppercase().as_str() {
+            "UUID" => Ok(ColumnType::Uuid),
+            "INT" | "INTEGER" => Ok(ColumnType::Integer),
+            "BIGINT" | "INT8" => Ok(ColumnType::BigInt),
+            "SMALLINT" | "INT2" => Ok(ColumnType::SmallInt),
+            "BOOL" | "BOOLEAN" => Ok(ColumnType::Boolean),
+            "TEXT" => Ok(ColumnType::Text),
+            "TIMESTAMP" => Ok(ColumnType::Timestamp(TimeUnit::Micros)),
+            "TIMESTAMPTZ" => Ok(ColumnType::TimestampTz(TimeUnit::Micros)),
+            "REAL" | "FLOAT4" => Ok(ColumnType::Real),
+            "DOUBLE" | "FLOAT8" => Ok(ColumnType::Double(None)),
+            "DATE" => Ok(ColumnType::Date),
+            "JSONB" => Ok(ColumnType::Jsonb),
+            "BYTEA" => Ok(ColumnType::Bytea),
+            _ => Err(anyhow::anyhow!("Unknown type hint: {}", hint)),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ColumnDefintion {
     pub name: String,
@@ -160,7 +183,7 @@ pub struct FileLoadData {
     pub path_parts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum ColumnSpec {
     #[serde(rename = "varchar", alias = "VARCHAR")]
@@ -213,37 +236,33 @@ pub enum ColumnSpec {
     Bytea { name: String },
 }
 
-impl<'a> TryFrom<&'a ColumnSpec> for ColumnSchema<'a> {
-    type Error = anyhow::Error;
-
-    fn try_from(spec: &'a ColumnSpec) -> Result<Self, Self::Error> {
+impl<'a> From<&'a ColumnSpec> for ColumnSchema<'a> {
+    fn from(spec: &'a ColumnSpec) -> Self {
         match spec {
-            ColumnSpec::Varchar { name, length } => Ok(ColumnSchema::Varchar(name, *length)),
-            ColumnSpec::Text { name } => Ok(ColumnSchema::Text(name)),
+            ColumnSpec::Varchar { name, length } => ColumnSchema::Varchar(name, *length),
+            ColumnSpec::Text { name } => ColumnSchema::Text(name),
             ColumnSpec::Numeric {
                 name,
                 precision,
                 scale,
-            } => Ok(ColumnSchema::Numeric(name, *precision, *scale)),
-            ColumnSpec::Uuid { name } => Ok(ColumnSchema::Uuid(name)),
+            } => ColumnSchema::Numeric(name, *precision, *scale),
+            ColumnSpec::Uuid { name } => ColumnSchema::Uuid(name),
             ColumnSpec::Timestamp { name, time_unit } => {
-                Ok(ColumnSchema::Timestamp(name, time_unit.clone()))
+                ColumnSchema::Timestamp(name, time_unit.clone())
             }
             ColumnSpec::TimestampTz { name, time_unit } => {
-                Ok(ColumnSchema::TimestampTz(name, time_unit.clone()))
+                ColumnSchema::TimestampTz(name, time_unit.clone())
             }
-            ColumnSpec::Boolean { name } => Ok(ColumnSchema::Boolean(name)),
-            ColumnSpec::Integer { name } => Ok(ColumnSchema::Integer(name)),
-            ColumnSpec::BigInt { name } => Ok(ColumnSchema::BigInt(name)),
-            ColumnSpec::SmallInt { name } => Ok(ColumnSchema::SmallInt(name)),
-            ColumnSpec::Real { name } => Ok(ColumnSchema::Real(name)),
-            ColumnSpec::Double { name } => Ok(ColumnSchema::Double(name, None)),
-            ColumnSpec::Date { name } => Ok(ColumnSchema::Date(name)),
-            ColumnSpec::Jsonb { name } => Ok(ColumnSchema::Jsonb(name)),
-            ColumnSpec::Custom { name, ddl_type } => {
-                Ok(ColumnSchema::Custom(name, ddl_type.clone()))
-            }
-            ColumnSpec::Bytea { name } => Ok(ColumnSchema::Bytea(name)),
+            ColumnSpec::Boolean { name } => ColumnSchema::Boolean(name),
+            ColumnSpec::Integer { name } => ColumnSchema::Integer(name),
+            ColumnSpec::BigInt { name } => ColumnSchema::BigInt(name),
+            ColumnSpec::SmallInt { name } => ColumnSchema::SmallInt(name),
+            ColumnSpec::Real { name } => ColumnSchema::Real(name),
+            ColumnSpec::Double { name } => ColumnSchema::Double(name, None),
+            ColumnSpec::Date { name } => ColumnSchema::Date(name),
+            ColumnSpec::Jsonb { name } => ColumnSchema::Jsonb(name),
+            ColumnSpec::Custom { name, ddl_type } => ColumnSchema::Custom(name, ddl_type.clone()),
+            ColumnSpec::Bytea { name } => ColumnSchema::Bytea(name),
         }
     }
 }

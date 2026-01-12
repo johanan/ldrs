@@ -3,7 +3,7 @@ use tokio_postgres::{Client, Row};
 use crate::types::{ColumnSchema, TimeUnit};
 
 #[derive(Debug)]
-struct PostgresColumnRaw {
+pub struct PostgresColumnRaw {
     column_name: String,
     pg_type: String,
     type_modifier: i32,
@@ -89,7 +89,7 @@ impl<'a> TryFrom<&'a PostgresColumnRaw> for ColumnSchema<'a> {
     }
 }
 
-async fn query_column(
+pub async fn query_column(
     conn: &Client,
     table_name: String,
 ) -> Result<Vec<PostgresColumnRaw>, anyhow::Error> {
@@ -113,6 +113,14 @@ async fn query_column(
         .into_iter()
         .map(|row| PostgresColumnRaw::try_from(&row))
         .collect::<Result<Vec<PostgresColumnRaw>, anyhow::Error>>()
+}
+
+pub async fn query_column_safe(conn: &Client, table_name: String) -> Vec<PostgresColumnRaw> {
+    let cols = query_column(conn, table_name).await;
+    match cols {
+        Ok(cols) => cols,
+        Err(_) => Vec::new(),
+    }
 }
 
 #[cfg(test)]
