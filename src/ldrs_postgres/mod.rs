@@ -1,6 +1,13 @@
+pub mod client;
 pub mod config;
 pub mod mvr_config;
+pub mod postgres_destination;
+pub mod postgres_execution;
+pub mod schema;
+pub mod schema_change;
 
+use crate::arrow_access::extracted_values::ColumnConverter;
+use crate::arrow_access::extracted_values::ExtractedValue;
 use crate::arrow_access::TypedColumnAccessor;
 use crate::ldrs_arrow::fill_vec_with_none;
 use crate::ldrs_arrow::flatten_arrow_transforms_zip;
@@ -8,35 +15,25 @@ use crate::ldrs_arrow::flatten_schema_zip;
 use crate::ldrs_arrow::get_sf_arrow_schema;
 use crate::ldrs_arrow::map_arrow_to_abstract;
 use crate::ldrs_arrow::mvr_to_stream;
+use crate::ldrs_schema::SchemaChange;
 use crate::parquet_provider::builder_from_string;
 use crate::pq::get_column_schema;
 use crate::types::ColumnSchema;
 use crate::types::ColumnType;
 use anyhow::Context;
 use arrow_array::RecordBatch;
-use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::Subcommand;
+use client::create_connection;
 use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
 use futures::StreamExt;
 use futures::TryStreamExt;
 use mvr_config::{load_config, MvrConfig};
-use native_tls::TlsConnector;
-use pg_bigdecimal::PgNumeric;
-use postgres_native_tls::MakeTlsConnector;
 use postgres_types::{to_sql_checked, ToSql, Type};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::iter::zip;
 use std::pin::pin;
 use std::pin::Pin;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tracing::info;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PostgresStrategy {
-    Binary,
-    Insert,
-}
 
 #[derive(Subcommand)]
 pub enum PgCommands {
@@ -73,18 +70,6 @@ impl LoadDefintion {
     }
 }
 
-pub async fn create_connection(conn_url: &str) -> Result<tokio_postgres::Client, anyhow::Error> {
-    let connector = TlsConnector::new().with_context(|| "Could not create TLS connector")?;
-    let connector = MakeTlsConnector::new(connector);
-    let (client, connection) = tokio_postgres::connect(conn_url, connector).await?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
-        }
-    });
-    Ok(client)
-}
-
 pub fn load_table_name<'a>(schema: &'a str, table: &'a str) -> String {
     format!("{}.{}_load", schema, table)
 }
@@ -105,30 +90,7 @@ pub fn build_ddl(load_table: String, fields: &[String]) -> String {
     ddl
 }
 
-pub fn map_parquet_to_ddl(pq: &ColumnSchema) -> String {
-    match pq {
-        ColumnSchema::SmallInt(name) => format!("{} smallint", name),
-        ColumnSchema::BigInt(name) => format!("{} bigint", name),
-        ColumnSchema::Boolean(name) => format!("{} boolean", name),
-        ColumnSchema::Double(name, _) => format!("{} double precision", name),
-        ColumnSchema::Integer(name) => format!("{} integer", name),
-        ColumnSchema::Jsonb(name) => format!("{} jsonb", name),
-        ColumnSchema::Numeric(name, precision, scale) => {
-            format!("{} numeric({}, {})", name, precision, scale)
-        }
-        ColumnSchema::Timestamp(name, ..) => format!("{} timestamp", name),
-        ColumnSchema::TimestampTz(name, ..) => format!("{} timestamptz", name),
-        ColumnSchema::Date(name) => format!("{} date", name),
-        ColumnSchema::Real(name) => format!("{} real", name),
-        ColumnSchema::Text(name) => format!("{} text", name),
-        ColumnSchema::Uuid(name) => format!("{} uuid", name),
-        ColumnSchema::Varchar(name, size) => format!("{} varchar({})", name, size),
-        ColumnSchema::Custom(name, type_name) => format!("{} {}", name, type_name),
-        ColumnSchema::Bytea(name) => format!("{} bytea", name),
-    }
-}
-
-pub fn map_parquet_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
+pub fn map_col_schema_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
     match pq {
         ColumnSchema::SmallInt(_) => postgres_types::Type::INT2,
         ColumnSchema::BigInt(_) => postgres_types::Type::INT8,
@@ -159,7 +121,8 @@ pub fn build_definition<'a>(
     let load_table = load_table_name(schema, table);
     let schema_ddl = format!("CREATE SCHEMA IF NOT EXISTS {};", schema);
     let drop_ddl = format!("DROP TABLE IF EXISTS {};", load_table);
-    let fields_ddl: Vec<String> = types.iter().map(map_parquet_to_ddl).collect();
+    let schema_change = SchemaChange::build_from_columns(&[], &types);
+    let fields_ddl: Vec<String> = schema_change.to_postgres_final_column_ddl();
     let create_ddl = build_ddl(load_table.clone(), &fields_ddl);
     let drop_target_ddl = format!("DROP TABLE IF EXISTS {}.{};", schema, table);
     let set_search_ddl = format!("SET search_path TO {};", schema);
@@ -257,7 +220,7 @@ where
 {
     let pg_types = columns
         .iter()
-        .map(map_parquet_to_pg_type)
+        .map(map_col_schema_to_pg_type)
         .collect::<Vec<_>>();
 
     let sink_tx = client
@@ -475,185 +438,6 @@ pub async fn load_from_mvr_config(args: MvrConfig, pg_url: String) -> Result<(),
         info!("Task time: {:?}", task_end - task_start);
     }
     Ok(())
-}
-
-#[derive(Debug)]
-pub enum ExtractedValue<'a> {
-    Boolean(Option<bool>),
-    Int64(Option<i64>),
-    Int32(Option<i32>),
-    Double(Option<f64>),
-    Real(Option<f32>),
-    Decimal(Option<PgNumeric>),
-    Uuid(Option<uuid::Uuid>),
-    Utf8(Option<&'a str>),
-    TimestampMillis(Option<NaiveDateTime>),
-    TimestampMicros(Option<NaiveDateTime>),
-    TimestampNanos(Option<NaiveDateTime>),
-    TimestampTzMillis(Option<DateTime<Utc>>),
-    TimestampTzMicros(Option<DateTime<Utc>>),
-    TimestampTzNanos(Option<DateTime<Utc>>),
-    Jsonb(Option<Value>),
-}
-
-#[derive(Debug)]
-enum ConversionStrategy {
-    Boolean,
-    BigInt,
-    Integer,
-    Double { scale: Option<i32> },
-    Real,
-    Text,
-    Numeric { precision: i32, scale: i32 },
-    TimestampMillis,
-    TimestampMicros,
-    TimestampNanos,
-    TimestampTzMillis,
-    TimestampTzMicros,
-    TimestampTzNanos,
-    TransformBigInt,
-    TransformInteger,
-    TransformUuid,
-    TransformJsonb,
-    TransformNumeric { precision: i32, scale: i32 },
-    TransformDouble { scale: Option<i32> },
-}
-
-#[derive(Debug)]
-struct ColumnConverter<'a> {
-    accessor: &'a TypedColumnAccessor<'a>,
-    strategy: ConversionStrategy,
-}
-
-impl<'a> ColumnConverter<'a> {
-    fn new(
-        accessor: &'a TypedColumnAccessor<'a>,
-        col_schema: &ColumnSchema,
-        transform: Option<&ColumnType>,
-    ) -> Result<Self, anyhow::Error> {
-        let strategy = match transform {
-            // all of these have an output type that is not the same as the arrow array type
-            Some(ColumnType::BigInt) => ConversionStrategy::TransformBigInt,
-            Some(ColumnType::Integer) => ConversionStrategy::TransformInteger,
-            // I know doubles do not have scale, but this could be a different type underneath
-            Some(ColumnType::Double(precision)) => {
-                ConversionStrategy::TransformDouble { scale: *precision }
-            }
-            Some(ColumnType::Numeric(precision, scale)) => ConversionStrategy::TransformNumeric {
-                precision: *precision,
-                scale: *scale,
-            },
-            Some(ColumnType::Uuid) => ConversionStrategy::TransformUuid,
-            Some(ColumnType::Jsonb) => ConversionStrategy::TransformJsonb,
-            Some(ColumnType::TimestampTz(time_unit)) => match time_unit {
-                crate::types::TimeUnit::Millis => ConversionStrategy::TimestampTzMillis,
-                crate::types::TimeUnit::Micros => ConversionStrategy::TimestampTzMicros,
-                crate::types::TimeUnit::Nanos => ConversionStrategy::TimestampTzNanos,
-            },
-            None => match col_schema {
-                // these all have the same output as arrow array type
-                ColumnSchema::Boolean(_) => ConversionStrategy::Boolean,
-                ColumnSchema::BigInt(_) => ConversionStrategy::BigInt,
-                ColumnSchema::Integer(_) => ConversionStrategy::Integer,
-                ColumnSchema::Double(_, scale) => ConversionStrategy::Double {
-                    scale: scale.clone(),
-                },
-                ColumnSchema::Text(_) | ColumnSchema::Varchar(_, _) => ConversionStrategy::Text,
-                ColumnSchema::Numeric(_, precision, scale) => ConversionStrategy::Numeric {
-                    precision: *precision,
-                    scale: *scale,
-                },
-                ColumnSchema::Timestamp(_, crate::types::TimeUnit::Millis) => {
-                    ConversionStrategy::TimestampMillis
-                }
-                ColumnSchema::Timestamp(_, crate::types::TimeUnit::Micros) => {
-                    ConversionStrategy::TimestampMicros
-                }
-                ColumnSchema::Timestamp(_, crate::types::TimeUnit::Nanos) => {
-                    ConversionStrategy::TimestampNanos
-                }
-                ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Millis) => {
-                    ConversionStrategy::TimestampTzMillis
-                }
-                ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Micros) => {
-                    ConversionStrategy::TimestampTzMicros
-                }
-                ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Nanos) => {
-                    ConversionStrategy::TimestampTzNanos
-                }
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "Unsupported column schema: {:?}",
-                        col_schema
-                    ))
-                }
-            },
-            _ => return Err(anyhow::anyhow!("Unsupported transform: {:?}", transform)),
-        };
-
-        Ok(ColumnConverter { accessor, strategy })
-    }
-
-    #[inline]
-    fn extract_value(&self, row_idx: usize) -> ExtractedValue<'_> {
-        match &self.strategy {
-            ConversionStrategy::Boolean => unsafe {
-                ExtractedValue::Boolean(self.accessor.Boolean(row_idx))
-            },
-            ConversionStrategy::BigInt => unsafe {
-                ExtractedValue::Int64(self.accessor.Int64(row_idx))
-            },
-            ConversionStrategy::Integer => unsafe {
-                ExtractedValue::Int32(self.accessor.Int32(row_idx))
-            },
-            ConversionStrategy::Double { scale: _ } => unsafe {
-                ExtractedValue::Double(self.accessor.Float64(row_idx))
-            },
-            ConversionStrategy::Text => unsafe {
-                ExtractedValue::Utf8(self.accessor.Utf8(row_idx))
-            },
-            ConversionStrategy::Numeric { precision, scale } => {
-                ExtractedValue::Decimal(self.accessor.as_pg_numeric(row_idx, *scale))
-            }
-            ConversionStrategy::TransformBigInt => {
-                ExtractedValue::Int64(self.accessor.as_int64(row_idx))
-            }
-            ConversionStrategy::TransformInteger => {
-                ExtractedValue::Int32(self.accessor.as_int32(row_idx))
-            }
-            ConversionStrategy::TransformUuid => unsafe {
-                ExtractedValue::Uuid(self.accessor.as_uuid(row_idx))
-            },
-            ConversionStrategy::TransformJsonb => {
-                ExtractedValue::Jsonb(self.accessor.as_serde(row_idx))
-            }
-            ConversionStrategy::TransformNumeric { precision, scale } => {
-                ExtractedValue::Decimal(self.accessor.as_pg_numeric(row_idx, *scale))
-            }
-            ConversionStrategy::TransformDouble { scale } => {
-                ExtractedValue::Double(self.accessor.as_float64(row_idx, *scale))
-            }
-            ConversionStrategy::TimestampMillis => {
-                ExtractedValue::TimestampMillis(self.accessor.as_chrono_naive(row_idx))
-            }
-            ConversionStrategy::TimestampMicros => {
-                ExtractedValue::TimestampMicros(self.accessor.as_chrono_naive(row_idx))
-            }
-            ConversionStrategy::TimestampNanos => {
-                ExtractedValue::TimestampNanos(self.accessor.as_chrono_naive(row_idx))
-            }
-            ConversionStrategy::TimestampTzMillis => unsafe {
-                ExtractedValue::TimestampTzMillis(self.accessor.as_chrono_tz(row_idx))
-            },
-            ConversionStrategy::TimestampTzMicros => unsafe {
-                ExtractedValue::TimestampTzMicros(self.accessor.as_chrono_tz(row_idx))
-            },
-            ConversionStrategy::TimestampTzNanos => unsafe {
-                ExtractedValue::TimestampTzNanos(self.accessor.as_chrono_tz(row_idx))
-            },
-            _ => panic!("Unsupported conversion strategy: {:?}", self.strategy),
-        }
-    }
 }
 
 impl<'a> ToSql for ExtractedValue<'a> {

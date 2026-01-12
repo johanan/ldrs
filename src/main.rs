@@ -1,7 +1,10 @@
+use std::fs;
+
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use dotenvy::dotenv;
 use ldrs::delta::{delta_merge, delta_run, DeltaCommands};
+use ldrs::ldrs_config::{create_ldrs_exec, get_all_ldrs_env_vars};
 use ldrs::ldrs_postgres::load_from_mvr_config;
 use ldrs::ldrs_postgres::PgCommands;
 use ldrs::ldrs_postgres::{load_from_file, load_postgres_cmd};
@@ -11,8 +14,16 @@ use ldrs::path_pattern;
 use ldrs::types::lua_args::modules_from_args;
 use tracing::info;
 
+#[derive(Args)]
+struct ConfigArgs {
+    #[arg(short, long)]
+    config: String,
+}
+
 #[derive(Subcommand)]
 enum Destination {
+    /// Load from a config file. All sources and destinations
+    Ld(ConfigArgs),
     /// PostgreSQL destination
     Pg {
         #[command(subcommand)]
@@ -60,6 +71,12 @@ fn main() -> Result<(), anyhow::Error> {
 
     let command_exec = main_rt.block_on(async {
         match cli.destination {
+            Destination::Ld(args) => {
+                let config_string = fs::read_to_string(&args.config)
+                    .with_context(|| format!("Failed to read config file: {}", args.config))?;
+                let ldrs_env = get_all_ldrs_env_vars();
+                create_ldrs_exec(&config_string, &ldrs_env, &rt.handle()).await
+            }
             Destination::Pg { command } => match command {
                 PgCommands::Load(args) => {
                     match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {

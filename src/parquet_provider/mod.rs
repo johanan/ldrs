@@ -17,13 +17,10 @@ pub async fn builder_from_url(
     let storage = StorageProvider::try_from_url(url)?;
     let (store, path) = storage.get_store_and_path()?;
 
-    info!("store: {:?}", store);
-
     let meta = store
         .head(&path)
         .await
         .with_context(|| "Could not find file in store")?;
-    info!("meta: {:?}", meta);
 
     let reader = match storage {
         StorageProvider::Azure(_) => ParquetObjectReader::new(store, meta).with_runtime(handle),
