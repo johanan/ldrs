@@ -137,8 +137,9 @@ pub async fn sf_arrow_stream(
     task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("ldrs-sf");
         let args = vec!["query", "--sql", &sql];
-        let cmd = cmd.args(args).env("LDRS_SF_SOURCE", conn_url);
+        let cmd = cmd.args(args);
         info!("Running command: {:?}", cmd);
+        let cmd = cmd.env("LDRS_SF_SOURCE", conn_url);
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
