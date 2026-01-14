@@ -1,10 +1,17 @@
 pub mod snowflake_source;
 
 use anyhow::Context;
+use arrow::ipc::reader::StreamReader;
+use arrow_array::RecordBatch;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
-use std::process::Command;
-use tracing::info;
+use std::{
+    future::Future,
+    process::{Command, Stdio},
+};
+use tokio::task;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tracing::{debug, info};
 use url::Url;
 
 use crate::types::lua_args::LuaArgs;
@@ -43,6 +50,12 @@ pub enum SnowflakeCommands {
 pub struct SnowflakeConnection {
     pub conn_url: Url,
     pub raw_conn_url: String,
+}
+
+pub struct SnowflakeStreamResult<S> {
+    pub batch_stream: ReceiverStream<Result<RecordBatch, anyhow::Error>>,
+    pub schema_stream: S,
+    pub command_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
 }
 
 impl SnowflakeConnection {
@@ -106,4 +119,105 @@ impl SnowflakeConnection {
         }
         Ok(results)
     }
+}
+
+pub async fn sf_arrow_stream(
+    conn: &str,
+    sql: &str,
+) -> Result<
+    SnowflakeStreamResult<impl Future<Output = Option<arrow_schema::SchemaRef>> + Send>,
+    anyhow::Error,
+> {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let (schema_tx, schema_rx) = tokio::sync::oneshot::channel();
+    let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+    let sql = sql.to_string();
+    let conn_url = conn.to_string();
+
+    task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("ldrs-sf");
+        let args = vec!["query", "--sql", &sql];
+        let cmd = cmd.args(args).env("LDRS_SF_SOURCE", conn_url);
+        info!("Running command: {:?}", cmd);
+
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn ldrs-sf"))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
+
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
+
+        // No SyncIoBridge needed - stdout is already synchronous
+        let buf_reader = std::io::BufReader::new(stdout);
+        let mut stream_reader = StreamReader::try_new(buf_reader, None)
+            .with_context(|| "Failed to create StreamReader")?;
+
+        let schema = stream_reader.schema();
+        if schema_tx.send(schema).is_err() {
+            return Err(anyhow::anyhow!("Failed to send schema: receiver dropped"));
+        }
+
+        // Stream batches
+        while let Some(batch_result) = stream_reader.next() {
+            debug!("Processing batch");
+            if tx
+                .blocking_send(batch_result.map_err(anyhow::Error::from))
+                .is_err()
+            {
+                return Err(anyhow::anyhow!("Failed to send batch"));
+            }
+        }
+        let status = child.wait()?;
+
+        if !status.success() {
+            // Read stderr synchronously if command failed
+            let mut stderr_output = String::new();
+            std::io::Read::read_to_string(&mut stderr, &mut stderr_output)?;
+
+            let _ = status_tx.send(Err(anyhow::anyhow!(
+                "Command failed with stderr: {}",
+                stderr_output
+            )));
+        } else {
+            let _ = status_tx.send(Ok(()));
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let command_handle = tokio::spawn(async move {
+        match status_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("Command monitoring task failed")),
+        }
+    });
+
+    let batch_stream = ReceiverStream::new(rx);
+    let schema_future = async move {
+        match schema_rx.await {
+            Ok(schema) => {
+                if schema.fields().is_empty() {
+                    None
+                } else {
+                    debug!("Schema: {:?}", schema);
+                    Some(schema)
+                }
+            }
+            Err(_) => None,
+        }
+    };
+
+    Ok(SnowflakeStreamResult {
+        batch_stream,
+        schema_stream: schema_future,
+        command_handle,
+    })
 }

@@ -11,15 +11,15 @@ pub struct SFBindVar {
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct SFQuery {
-    sql: String,
-    name: String,
+    pub sql: String,
+    pub name: String,
     #[serde(default)]
-    bind_vars: Vec<SFBindVar>,
+    pub bind_vars: Vec<SFBindVar>,
 }
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct SFTable {
-    name: String,
+    pub name: String,
 }
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +29,15 @@ pub enum SFSource {
     Query(SFQuery),
     #[serde(rename = "sf.table")]
     Table(SFTable),
+}
+
+impl SFSource {
+    pub fn get_name(&self) -> &str {
+        match self {
+            SFSource::Query(query) => &query.name,
+            SFSource::Table(table) => &table.name,
+        }
+    }
 }
 
 pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<SFSource, anyhow::Error> {

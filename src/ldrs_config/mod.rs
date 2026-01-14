@@ -6,6 +6,8 @@ use anyhow::Context;
 use arrow_array::RecordBatch;
 use futures::Stream;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info};
 use url::Url;
 
@@ -13,6 +15,7 @@ use crate::{
     ldrs_arrow::build_final_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
     ldrs_postgres::postgres_execution::{collect_params, load_to_postgres},
+    ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource, SnowflakeConnection},
     ldrs_storage::is_object_store_url,
     parquet_provider::builder_from_url,
     pq::get_fields,
@@ -22,6 +25,7 @@ use crate::{
 
 enum StreamType {
     Parquet(ParquetRecordBatchStream<ParquetObjectReader>),
+    Receiver(ReceiverStream<Result<RecordBatch, anyhow::Error>>),
 }
 
 impl Stream for StreamType {
@@ -35,6 +39,7 @@ impl Stream for StreamType {
             StreamType::Parquet(stream) => Pin::new(stream)
                 .poll_next(cx)
                 .map(|opt| opt.map(|res| res.map_err(Into::into))),
+            StreamType::Receiver(stream) => Pin::new(stream).poll_next(cx),
         }
     }
 }
@@ -43,6 +48,7 @@ struct LdrsSrcStream {
     schema: arrow_schema::SchemaRef,
     stream_type: StreamType,
     source_cols: Vec<ColumnSpec>,
+    cleanup_handle: Option<JoinHandle<Result<(), anyhow::Error>>>,
 }
 
 pub fn get_all_ldrs_env_vars() -> Vec<(String, String)> {
@@ -158,6 +164,24 @@ pub async fn create_ldrs_exec(
                     schema,
                     stream_type: StreamType::Parquet(stream),
                     source_cols: dest_cols,
+                    cleanup_handle: None,
+                }
+            }
+            LdrsSource::SF(sf) => {
+                let sf_sql = match &sf {
+                    SFSource::Query(sql) => sql.sql.clone(),
+                    SFSource::Table(table) => format!("SELECT * FROM {}", table.name),
+                };
+                let sf_src = get_src_url(ldrs_env, &sf.get_name(), "sf")?;
+                let arrow_stream = sf_arrow_stream(sf_src.1.as_str(), &sf_sql).await?;
+                let schema = arrow_stream.schema_stream.await.ok_or_else(|| {
+                    anyhow::Error::msg("Failed to load schema. Most likely ldrs-sf failed")
+                })?;
+                LdrsSrcStream {
+                    schema,
+                    stream_type: StreamType::Receiver(arrow_stream.batch_stream),
+                    source_cols: vec![],
+                    cleanup_handle: Some(arrow_stream.command_handle),
                 }
             }
             _ => unreachable!(),
@@ -191,6 +215,14 @@ pub async fn create_ldrs_exec(
                 .await?;
             }
         };
+
+        if let Some(handle) = src.cleanup_handle {
+            match handle.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(anyhow::anyhow!("ldrs-sf failed: {}", e)),
+                Err(e) => Err(anyhow::anyhow!("ldrs-sf task panicked: {}", e)),
+            }?
+        }
         let task_end = std::time::Instant::now();
         info!("Task time: {:?}", task_end - task_start);
     }
