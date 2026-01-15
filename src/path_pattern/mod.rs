@@ -7,7 +7,7 @@ use nom::{
     combinator::{map, opt, rest},
     multi::{many1, separated_list1},
     sequence::{delimited, preceded},
-    IResult,
+    IResult, Parser,
 };
 use serde_json::{json, Value};
 
@@ -38,7 +38,7 @@ impl<'a> PathPattern<'a> {
         Self::new_with_nom(pattern)
     }
 
-    pub fn parse_path(&self, path: &'a str) -> Result<Vec<ExtractedSegment>, anyhow::Error> {
+    pub fn parse_path(&'a self, path: &'a str) -> Result<Vec<ExtractedSegment<'a>>, anyhow::Error> {
         match self.parse_all_segments(path) {
             Ok((remaining, extracted)) => {
                 if !remaining.is_empty() {
@@ -50,12 +50,13 @@ impl<'a> PathPattern<'a> {
         }
     }
 
-    fn parse_all_segments(&self, input: &'a str) -> IResult<&str, Vec<ExtractedSegment>> {
+    fn parse_all_segments(&'a self, input: &'a str) -> IResult<&'a str, Vec<ExtractedSegment<'a>>> {
         // Split on '/' and parse each segment
         let (remaining, raw_segments) = preceded(
             opt(char('/')),
             separated_list1(char('/'), take_while1(|c: char| c != '/')),
-        )(input)?;
+        )
+        .parse(input)?;
 
         // Map each path segment against its pattern segments, then flatten
         let mut results = Vec::new();
@@ -173,13 +174,14 @@ impl<'a> PathPattern<'a> {
     }
 }
 
-fn parse_placeholder(input: &str) -> IResult<&str, PatternSegment> {
+fn parse_placeholder(input: &'_ str) -> IResult<&'_ str, PatternSegment<'_>> {
     map(delimited(char('{'), char('_'), char('}')), |_| {
         PatternSegment::Placeholder
-    })(input)
+    })
+    .parse(input)
 }
 
-fn parse_named(input: &str) -> IResult<&str, PatternSegment> {
+fn parse_named(input: &'_ str) -> IResult<&'_ str, PatternSegment<'_>> {
     map(
         delimited(
             char('{'),
@@ -187,38 +189,41 @@ fn parse_named(input: &str) -> IResult<&str, PatternSegment> {
             char('}'),
         ),
         |name: &str| PatternSegment::Named(name),
-    )(input)
+    )
+    .parse(input)
 }
 
-fn parse_wildcard(input: &str) -> IResult<&str, PatternSegment> {
-    map(char('*'), |_| PatternSegment::Wildcard)(input)
+fn parse_wildcard(input: &'_ str) -> IResult<&'_ str, PatternSegment<'_>> {
+    map(char('*'), |_| PatternSegment::Wildcard).parse(input)
 }
 
-fn parse_literal(input: &str) -> IResult<&str, PatternSegment> {
+fn parse_literal(input: &'_ str) -> IResult<&'_ str, PatternSegment<'_>> {
     map(
         take_while1(|c: char| c != '/' && c != '{' && c != '}' && c != '*'),
         |literal: &str| PatternSegment::Literal(literal),
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse a single segment
-fn parse_segment(input: &str) -> IResult<&str, PatternSegment> {
+fn parse_segment(input: &'_ str) -> IResult<&'_ str, PatternSegment<'_>> {
     alt((
         parse_placeholder,
         parse_named,
         parse_wildcard,
         parse_literal,
-    ))(input)
+    ))
+    .parse(input)
 }
 
 // Parse the full pattern
-fn parse_pattern(input: &str) -> IResult<&str, Vec<Vec<PatternSegment>>> {
-    separated_list1(char('/'), parse_compound_segment)(input)
+fn parse_pattern(input: &'_ str) -> IResult<&'_ str, Vec<Vec<PatternSegment<'_>>>> {
+    separated_list1(char('/'), parse_compound_segment).parse(input)
 }
 
 // Parse a single path segment that may contain multiple pattern segments
-fn parse_compound_segment(input: &str) -> IResult<&str, Vec<PatternSegment>> {
-    many1(parse_segment)(input)
+fn parse_compound_segment(input: &'_ str) -> IResult<&'_ str, Vec<PatternSegment<'_>>> {
+    many1(parse_segment).parse(input)
 }
 
 impl<'a> PathPattern<'a> {
