@@ -5,7 +5,6 @@ use parquet::arrow::{
     ParquetRecordBatchStreamBuilder,
 };
 use tokio::runtime::Handle;
-use tracing::info;
 use url::Url;
 
 use crate::storage::{base_or_relative_path, StorageProvider};

@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_postgres::{binary_copy::BinaryCopyInWriter, Transaction};
 use tracing::{debug, warn};
-use url::Url;
 
 use crate::{
     arrow_access::{
@@ -187,12 +186,13 @@ fn validate_execution_plan(commands: &[PgDestCommand]) -> Result<(), anyhow::Err
 }
 
 pub async fn load_to_postgres<S>(
-    pg_url: &Url,
+    pg_url: &str,
     name: &str,
     commands: &[PgDestCommand],
     final_cols: &[ColumnSchema<'_>],
     transforms: &[Option<ColumnType>],
     all_params: &[(String, String, Option<ColumnType>)],
+    role: Option<String>,
     stream: S,
 ) -> Result<(), anyhow::Error>
 where
@@ -200,8 +200,14 @@ where
 {
     // ensure we have exactly one load action
     let _ = validate_execution_plan(commands)?;
-    let mut client = create_connection(pg_url.as_str()).await?;
+    let mut client = create_connection(pg_url).await?;
     let tx = client.transaction().await?;
+    if let Some(role) = role {
+        if role.contains('"') {
+            anyhow::bail!("Role name cannot contain double quotes: {}", role);
+        }
+        tx.execute(&format!(r#"SET ROLE "{}""#, role), &[]).await?;
+    }
     let handlebars = Handlebars::new();
     let context = PgDestExecutionContext::try_new(name, handlebars)?;
 
@@ -416,7 +422,7 @@ pub async fn execute_action<'a>(
             "#,
                 handled_target, handled_source, on, update, insert, insert_values
             );
-            println!("{}", merge_sql);
+            debug!("Executing merge SQL: {}", merge_sql);
             tx.batch_execute(&merge_sql).await?;
             Ok(())
         }
@@ -468,13 +474,6 @@ fn param_tosql<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        ldrs_arrow::build_final_schema,
-        parquet_provider::builder_from_url,
-        pq::get_fields,
-        storage::base_or_relative_path,
-        test_utils::{create_runtime, drop_runtime},
-    };
 
     use super::*;
 

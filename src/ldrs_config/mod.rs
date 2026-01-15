@@ -14,8 +14,11 @@ use url::Url;
 use crate::{
     ldrs_arrow::build_final_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
-    ldrs_postgres::postgres_execution::{collect_params, load_to_postgres},
-    ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource, SnowflakeConnection},
+    ldrs_postgres::{
+        client::check_for_role,
+        postgres_execution::{collect_params, load_to_postgres},
+    },
+    ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource},
     ldrs_storage::is_object_store_url,
     parquet_provider::builder_from_url,
     pq::get_fields,
@@ -32,7 +35,7 @@ impl Stream for StreamType {
     type Item = Result<RecordBatch, anyhow::Error>;
 
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         match self.get_mut() {
@@ -57,35 +60,12 @@ pub fn get_all_ldrs_env_vars() -> Vec<(String, String)> {
         .collect()
 }
 
-pub fn get_env_url<'a>(
+pub fn get_env_value<'a>(
     vars: &'a [(String, String)],
-    name: &str,
-    prefix: &str,
-    ldrs_type: &str,
-) -> Result<&'a (String, String), anyhow::Error> {
-    let fqn = format!("{}_{}", ldrs_type, name);
-    let prefix_key = format!("{}_{}", ldrs_type, prefix);
-    let src = vars
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(&fqn))
-        .or_else(|| {
-            vars.iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(&prefix_key))
-        })
-        .or_else(|| {
-            vars.iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(ldrs_type))
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No env var found for {} or {} or {}",
-                fqn,
-                prefix_key,
-                ldrs_type
-            )
-        })?;
-
-    Ok(src)
+    keys: &[&str],
+) -> Option<&'a (String, String)> {
+    keys.iter()
+        .find_map(|key| vars.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)))
 }
 
 pub fn get_src_url<'a>(
@@ -93,7 +73,11 @@ pub fn get_src_url<'a>(
     name: &str,
     prefix: &str,
 ) -> Result<&'a (String, String), anyhow::Error> {
-    get_env_url(vars, name, prefix, "LDRS_SRC")
+    let fqn = format!("LDRS_SRC_{}", name);
+    let prefix_key = format!("LDRS_SRC_{}", prefix);
+    get_env_value(vars, &[&fqn, &prefix_key, "LDRS_SRC"]).ok_or_else(|| {
+        anyhow::anyhow!("No env var found for {} or {} or LDRS_SRC", fqn, prefix_key)
+    })
 }
 
 pub fn get_dest_url<'a>(
@@ -101,7 +85,15 @@ pub fn get_dest_url<'a>(
     name: &str,
     prefix: &str,
 ) -> Result<&'a (String, String), anyhow::Error> {
-    get_env_url(vars, name, prefix, "LDRS_DEST")
+    let fqn = format!("LDRS_DEST_{}", name);
+    let prefix_key = format!("LDRS_DEST_{}", prefix);
+    get_env_value(vars, &[&fqn, &prefix_key, "LDRS_DEST"]).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No env var found for {} or {} or LDRS_DEST",
+            fqn,
+            prefix_key
+        )
+    })
 }
 
 pub fn infer_env_type(env_type: &str, vars: &[(String, String)]) -> Option<String> {
@@ -184,13 +176,21 @@ pub async fn create_ldrs_exec(
                     cleanup_handle: Some(arrow_stream.command_handle),
                 }
             }
-            _ => unreachable!(),
         };
 
-        let dest = match task.dest {
+        let _ = match task.dest {
             LdrsDestination::Pg(pg_dest) => {
                 let dest_value = get_dest_url(ldrs_env, pg_dest.get_name(), "pg")?;
-                let pg_url = base_or_relative_path(dest_value.1.as_str())?;
+                let (pg_url, role) = check_for_role(dest_value.1.as_str())?;
+                // check the environment for a pg role
+                let role = role.or(get_env_value(
+                    ldrs_env,
+                    &[
+                        &format!("LDRS_PG_ROLE_{}", pg_dest.get_name()),
+                        "LDRS_PG_ROLE",
+                    ],
+                )
+                .map(|(_, v)| v.to_string()));
                 let source_cols = src
                     .source_cols
                     .iter()
@@ -203,16 +203,17 @@ pub async fn create_ldrs_exec(
                 // collect the params that can be bound
                 let env_params = collect_params(ldrs_env);
                 let pg_commands = pg_dest.to_pg_commands();
-                let exec = load_to_postgres(
+                load_to_postgres(
                     &pg_url,
                     pg_dest.get_name(),
                     &pg_commands,
                     &final_cols,
                     &transforms,
                     &env_params,
+                    role,
                     src.stream_type,
                 )
-                .await?;
+                .await
             }
         };
 
