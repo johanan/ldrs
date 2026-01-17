@@ -5,6 +5,10 @@ import (
 	"net/url"
 	"os"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/johanan/ldrs/go/ldrs-sf/database"
 	"github.com/spf13/cobra"
 )
@@ -38,6 +42,21 @@ var queryCmd = &cobra.Command{
 
 		err = sf.ExecuteQuery(ctx, sqlCommand)
 		if err != nil {
+			// write out an empty arrow schema and file
+			schema := arrow.NewSchema([]arrow.Field{}, nil)
+			alloc := memory.NewGoAllocator()
+			writer := ipc.NewWriter(os.Stdout, ipc.WithSchema(schema), ipc.WithAllocator(alloc))
+
+			recordBuilder := array.NewRecordBuilder(alloc, schema)
+			emptyBatch := recordBuilder.NewRecord()
+			defer recordBuilder.Release()
+			defer emptyBatch.Release()
+			if err := writer.Write(emptyBatch); err != nil {
+				return err
+			}
+			if err := writer.Close(); err != nil {
+				return err
+			}
 			return err
 		}
 
