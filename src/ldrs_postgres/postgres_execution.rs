@@ -315,8 +315,14 @@ pub async fn execute_prepared_stmt<'a>(
         .handlebars
         .render_template(&stmt.stmt, &context.context)?;
     debug!("Executing prepared statement: {}", rendered_stmt);
+    let rendered_key = stmt
+        .key
+        .as_ref()
+        .and_then(|k| context.handlebars.render_template(k, &context.context).ok())
+        .map(|k| k.to_uppercase());
+    debug!("Rendered key: {:?}", rendered_key);
 
-    let matched_params = get_params_for_stmt(&stmt.key, params);
+    let matched_params = get_params_for_stmt(&rendered_key, params);
     // if stmt has types use them, otherwise use from the matched_params
     let param_types = match &stmt.types {
         Some(types) => {
@@ -338,7 +344,9 @@ pub async fn execute_prepared_stmt<'a>(
         .map(param_tosql)
         .collect::<Result<Vec<_>, anyhow::Error>>()?;
     let param_refs = param_values.iter().map(|v| v.as_ref()).collect::<Vec<_>>();
-    tx.execute(&rendered_stmt, &param_refs).await?;
+    tx.execute(&rendered_stmt, &param_refs)
+        .await
+        .with_context(|| "Failed to execute PostgreSQL prepared statement")?;
     Ok(())
 }
 

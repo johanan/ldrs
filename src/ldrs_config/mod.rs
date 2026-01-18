@@ -219,7 +219,7 @@ pub async fn create_ldrs_exec(
                 info!("No schema found, most likely the load failed");
                 Ok(())
             }
-        };
+        }?;
 
         if let Some(handle) = src.cleanup_handle {
             match handle.await {

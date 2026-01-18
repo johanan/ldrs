@@ -89,7 +89,7 @@ func (sf *SnowflakeConn) ExecuteCommands(ctx context.Context, sql_commands []str
 	return results, nil
 }
 
-func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string) error {
+func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []any) error {
 	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
 	sf_ctx := gosnowflake.WithArrowBatchesTimestampOption(
 		gosnowflake.WithArrowAllocator(
@@ -102,9 +102,10 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string) error {
 	}
 	defer conn.Close()
 
+	namedArgs := toNamedValues(args)
 	var rows driver.Rows
 	err = conn.Raw(func(x any) error {
-		rows, err = x.(driver.QueryerContext).QueryContext(sf_ctx, query, nil)
+		rows, err = x.(driver.QueryerContext).QueryContext(sf_ctx, query, namedArgs)
 		return err
 	})
 	if err != nil {
@@ -135,7 +136,11 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string) error {
 		defer writerWG.Done()
 
 		select {
-		case schema := <-schemaReady:
+		case schema, ok := <-schemaReady:
+			if !ok {
+				return
+			}
+
 			bufWriter := bufio.NewWriter(os.Stdout)
 			ipcWriter := ipc.NewWriter(bufWriter, ipc.WithSchema(schema), ipc.WithAllocator(pool))
 			defer func() {
@@ -212,6 +217,10 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string) error {
 
 	go func() {
 		defer close(batchCh)
+		if len(batches) == 0 {
+			close(schemaReady)
+			return
+		}
 		for i := range batches {
 			select {
 			case batchCh <- i:
@@ -266,4 +275,12 @@ func GeneratePKCS8StringSupress(key *rsa.PrivateKey) string {
 	tmpBytes, _ := x509.MarshalPKCS8PrivateKey(key)
 	privKeyPKCS8 := base64.URLEncoding.EncodeToString(tmpBytes)
 	return privKeyPKCS8
+}
+
+func toNamedValues(values []any) []driver.NamedValue {
+	namedValues := make([]driver.NamedValue, len(values))
+	for idx, value := range values {
+		namedValues[idx] = driver.NamedValue{Name: "", Ordinal: idx + 1, Value: value}
+	}
+	return namedValues
 }

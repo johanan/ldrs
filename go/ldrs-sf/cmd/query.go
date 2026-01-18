@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"sort"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -40,7 +42,8 @@ var queryCmd = &cobra.Command{
 		}
 		defer sf.Close()
 
-		err = sf.ExecuteQuery(ctx, sqlCommand)
+		vars := getLdrsSfVars()
+		err = sf.ExecuteQuery(ctx, sqlCommand, vars)
 		if err != nil {
 			// write out an empty arrow schema and file
 			schema := arrow.NewSchema([]arrow.Field{}, nil)
@@ -66,4 +69,25 @@ var queryCmd = &cobra.Command{
 
 func init() {
 	queryCmd.Flags().String("sql", "", "SQL command to query")
+}
+
+func getLdrsSfVars() []any {
+	prefix := "LDRS_SF_PARAM_"
+	keys := make([]string, 0)
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, prefix) {
+			// just get the key for now
+			parts := strings.SplitN(env, "=", 2)
+			if len(parts) > 0 {
+				keys = append(keys, parts[0])
+			}
+		}
+	}
+	// sort the keys
+	sort.Strings(keys)
+	values := make([]any, len(keys))
+	for i, key := range keys {
+		values[i] = os.Getenv(key)
+	}
+	return values
 }

@@ -143,7 +143,7 @@ impl PgDestination {
                         PgDestCommand::Action(PgAction::CreateTable("{{ name }}".to_string())),
                         PgDestCommand::Prepared(PgPreparedStmt {
                             stmt: del_stmt,
-                            key: Some("DEL".to_string()),
+                            key: Some("{{ shoutySnakeCase name }}".to_string()),
                             types: del.param_keys.clone(),
                         }),
                         PgDestCommand::Load("{{ name }}".to_string()),
