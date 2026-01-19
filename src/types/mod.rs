@@ -102,21 +102,37 @@ impl<'a> ColumnSchema<'a> {
 
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 pub enum ColumnType {
+    #[serde(alias = "VARCHAR")]
     Varchar(i32),
+    #[serde(alias = "TEXT")]
     Text,
+    #[serde(alias = "TIMESTAMPTZ")]
     TimestampTz(TimeUnit),
+    #[serde(alias = "TIMESTAMP")]
     Timestamp(TimeUnit),
+    #[serde(alias = "UUID")]
     Uuid,
+    #[serde(alias = "JSONB")]
     Jsonb,
+    #[serde(alias = "NUMERIC")]
     Numeric(i32, i32),
+    #[serde(alias = "REAL")]
     Real,
+    #[serde(alias = "DOUBLE")]
     Double(Option<i32>),
+    #[serde(alias = "SMALLINT")]
     SmallInt,
+    #[serde(alias = "INTEGER")]
     Integer,
+    #[serde(alias = "BIGINT")]
     BigInt,
+    #[serde(alias = "BOOLEAN")]
     Boolean,
+    #[serde(alias = "DATE")]
     Date,
+    #[serde(alias = "CUSTOM")]
     Custom(String), // ddl_type
+    #[serde(alias = "BYTEA")]
     Bytea,
 }
 

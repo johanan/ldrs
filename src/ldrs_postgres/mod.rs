@@ -1,6 +1,5 @@
 pub mod client;
 pub mod config;
-pub mod mvr_config;
 pub mod postgres_destination;
 pub mod postgres_execution;
 pub mod schema;
@@ -9,12 +8,6 @@ pub mod schema_change;
 use crate::arrow_access::extracted_values::ColumnConverter;
 use crate::arrow_access::extracted_values::ExtractedValue;
 use crate::arrow_access::TypedColumnAccessor;
-use crate::ldrs_arrow::fill_vec_with_none;
-use crate::ldrs_arrow::flatten_arrow_transforms_zip;
-use crate::ldrs_arrow::flatten_schema_zip;
-use crate::ldrs_arrow::get_sf_arrow_schema;
-use crate::ldrs_arrow::map_arrow_to_abstract;
-use crate::ldrs_arrow::mvr_to_stream;
 use crate::ldrs_schema::SchemaChange;
 use crate::parquet_provider::builder_from_string;
 use crate::pq::get_column_schema;
@@ -27,9 +20,7 @@ use client::create_connection;
 use config::{LoadArgs, PGFileLoad, PGFileLoadArgs, ProcessedPGFileLoad};
 use futures::StreamExt;
 use futures::TryStreamExt;
-use mvr_config::{load_config, MvrConfig};
 use postgres_types::{to_sql_checked, ToSql, Type};
-use std::iter::zip;
 use std::pin::pin;
 use std::pin::Pin;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
@@ -41,8 +32,6 @@ pub enum PgCommands {
     Load(LoadArgs),
     /// Load data into PostgreSQL using a configuration file
     Config(PGFileLoadArgs),
-    /// Load data into PostgreSQL using MVR configuration
-    Mvr(MvrConfig),
 }
 
 #[derive(Debug)]
@@ -239,7 +228,7 @@ where
     let writer = BinaryCopyInWriter::new(sink, &pg_types);
     let mut pinned_writer = pin!(writer);
 
-    let mut stream = stream.into_stream();
+    let stream = stream.into_stream();
     let mut stream = pin!(stream);
 
     while let Some(batch_result) = stream.next().await {
@@ -343,103 +332,6 @@ pub async fn load_from_file(
     Ok(())
 }
 
-/// Load data into PostgreSQL using MVR configuration file
-///
-/// This function reads an MVR configuration file, processes each configuration item,
-/// executes the SQL query in each, and loads the resulting data into PostgreSQL tables.
-/// It handles the full workflow from MVR config to data loading.
-///
-/// # Arguments
-///
-/// * `args` - MVR configuration including file path and optional overrides
-/// * `pg_url` - PostgreSQL connection URL
-///
-/// # Returns
-///
-/// * `Result<(), anyhow::Error>`
-pub async fn load_from_mvr_config(args: MvrConfig, pg_url: String) -> Result<(), anyhow::Error> {
-    let tables = load_config(&args)?;
-    let total_tasks = tables.len();
-    for (i, config) in tables.iter().enumerate() {
-        let task_start = std::time::Instant::now();
-        info!("Running task: {}/{}", i + 1, total_tasks);
-        let mvr_arrow = mvr_to_stream(&config.sql).await?;
-        let schema = mvr_arrow.schema_stream.await;
-        //info!("Schema: {:?}", schema);
-        let config_cols = config
-            .columns
-            .iter()
-            .map(ColumnSchema::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        match schema {
-            Some(schema) => {
-                let filled_cols = fill_vec_with_none(&schema.fields, config_cols);
-                info!("Filled cols: {:?}", filled_cols);
-
-                let sf_schema = schema
-                    .fields()
-                    .iter()
-                    .map(get_sf_arrow_schema)
-                    .collect::<Vec<_>>();
-                info!("SF Schema: {:?}", sf_schema);
-
-                let mapped = schema
-                    .fields()
-                    .iter()
-                    .filter_map(map_arrow_to_abstract)
-                    .collect::<Vec<_>>();
-                info!("Mapped cols: {:?}", mapped);
-                let source_types = mapped.iter().map(ColumnType::from).collect::<Vec<_>>();
-                // let's start zipping, returning early if any columns do not work together
-                let mapped_option = mapped.into_iter().map(Some).collect::<Vec<_>>();
-                let override_cols = flatten_schema_zip(zip(
-                    flatten_schema_zip(zip(mapped_option, sf_schema)),
-                    filled_cols,
-                ))
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-                info!("Override cols: {:?}", override_cols);
-                // see if we need to translate any columns
-                let final_types = override_cols
-                    .iter()
-                    .map(ColumnType::from)
-                    .collect::<Vec<_>>();
-                let transforms = flatten_arrow_transforms_zip(zip(source_types, final_types));
-                info!("Transforms: {:?}", transforms);
-
-                anyhow::ensure!(
-                    override_cols.len() == schema.fields().len(),
-                    "Final columns length does not match schema fields length"
-                );
-
-                load_postgres(
-                    &override_cols,
-                    &transforms,
-                    &config.table,
-                    config.post_sql.clone(),
-                    &pg_url,
-                    config.role.clone(),
-                    mvr_arrow.batch_stream,
-                )
-                .await?
-            }
-            None => {
-                info!("No schema found. Most likely mvr failed.");
-            }
-        }
-        match mvr_arrow.command_handle.await {
-            Ok(Ok(())) => (), // Command completed successfully
-            Ok(Err(e)) => return Err(anyhow::anyhow!("Command failed: {}", e)),
-            Err(e) => return Err(anyhow::anyhow!("Command task panicked: {}", e)),
-        }
-        let task_end = std::time::Instant::now();
-        info!("Task time: {:?}", task_end - task_start);
-    }
-    Ok(())
-}
-
 impl<'a> ToSql for ExtractedValue<'a> {
     #[inline]
     fn to_sql(
@@ -463,7 +355,6 @@ impl<'a> ToSql for ExtractedValue<'a> {
             ExtractedValue::Decimal(v) => v.to_sql(ty, out),
             ExtractedValue::Utf8(v) => v.to_sql(ty, out),
             ExtractedValue::Jsonb(v) => v.to_sql(ty, out),
-            _ => Err(format!("Unsupported ExtractedValue variant: {:?}", self).into()),
         }
     }
 

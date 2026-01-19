@@ -5,7 +5,6 @@ use clap::{Args, Parser, Subcommand};
 use dotenvy::dotenv;
 use ldrs::delta::{delta_merge, delta_run, DeltaCommands};
 use ldrs::ldrs_config::{create_ldrs_exec, get_all_ldrs_env_vars};
-use ldrs::ldrs_postgres::load_from_mvr_config;
 use ldrs::ldrs_postgres::PgCommands;
 use ldrs::ldrs_postgres::{load_from_file, load_postgres_cmd};
 use ldrs::ldrs_snowflake::{SnowflakeResult, SnowflakeStrategy};
@@ -90,12 +89,6 @@ fn main() -> Result<(), anyhow::Error> {
                         Err(e) => Err(e),
                     }
                 }
-                PgCommands::Mvr(args) => {
-                    match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
-                        Ok(pg_url) => load_from_mvr_config(args, pg_url).await,
-                        Err(e) => Err(e),
-                    }
-                }
             },
             Destination::Delta { command } => match command {
                 DeltaCommands::Load(args) => delta_run(&args, rt.handle().clone()).await,
@@ -177,6 +170,5 @@ fn main() -> Result<(), anyhow::Error> {
 
     let end = std::time::Instant::now();
     info!("Time to load: {:?}", end - start);
-    info!("Debug source:\n{command_exec:#?}");
     command_exec
 }

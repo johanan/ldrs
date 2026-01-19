@@ -1927,6 +1927,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b3f9296c208515b87bd915a2f5d1163d4b3f863ba83337d7713cf478055948e"
 dependencies = [
  "derive_builder",
+ "heck",
  "log",
  "num-order",
  "pest",
@@ -2370,7 +2371,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "ldrs"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "anyhow",
  "arrow",

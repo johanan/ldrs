@@ -1,19 +1,10 @@
 use std::{
-    future::Future,
     iter::{zip, Zip},
-    process::Stdio,
     sync::Arc,
     vec::IntoIter,
 };
 
-use anyhow::Context;
-use arrow::ipc::reader::StreamReader;
-use arrow_array::RecordBatch;
 use arrow_schema::{Field, FieldRef};
-use futures::stream::StreamExt;
-use tokio::task;
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info};
 
 use crate::types::{ColumnSchema, ColumnType, TimeUnit};
 
@@ -24,118 +15,6 @@ fn map_arrow_time_to_pq_time(time_unit: &arrow_schema::TimeUnit) -> TimeUnit {
         arrow_schema::TimeUnit::Millisecond => TimeUnit::Millis,
         arrow_schema::TimeUnit::Second => TimeUnit::Millis,
     }
-}
-
-/// Struct to hold the result of the mvr_to_stream function
-///
-/// If the command fails, the command_handle will return an error
-/// but the batch_stream and schema_stream will still be valid.
-/// The schema will have to be checked to see if there are any fields.
-/// No fields means the command failed and the underlying error should be
-/// checked from the command_handle.
-pub struct MvrStreamResult<B, S> {
-    pub batch_stream: B,
-    pub schema_stream: S,
-    pub command_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-}
-
-pub async fn mvr_to_stream(
-    sql: &str,
-) -> Result<
-    MvrStreamResult<
-        impl futures::TryStream<Ok = RecordBatch, Error = arrow::error::ArrowError> + Send,
-        impl Future<Output = Option<arrow_schema::SchemaRef>> + Send,
-    >,
-    anyhow::Error,
-> {
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let (schema_tx, schema_rx) = tokio::sync::oneshot::channel();
-    let (status_tx, status_rx) = tokio::sync::oneshot::channel();
-    let sql = sql.to_string();
-
-    task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("ldrs-sf");
-        let args = vec!["query", "--sql", &sql];
-        let cmd = cmd.args(args);
-        info!("Running command: {:?}", cmd);
-
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("Failed to spawn ldrs-sf"))?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
-
-        // No SyncIoBridge needed - stdout is already synchronous
-        let buf_reader = std::io::BufReader::new(stdout);
-        let mut stream_reader = StreamReader::try_new(buf_reader, None)
-            .with_context(|| "Failed to create StreamReader")?;
-
-        let schema = stream_reader.schema();
-        if schema_tx.send(schema).is_err() {
-            return Err(anyhow::anyhow!("Failed to send schema: receiver dropped"));
-        }
-
-        // Stream batches
-        while let Some(batch_result) = stream_reader.next() {
-            debug!("Processing batch");
-            if tx.blocking_send(batch_result).is_err() {
-                return Err(anyhow::anyhow!("Failed to send batch"));
-            }
-        }
-        let status = child.wait()?;
-
-        if !status.success() {
-            // Read stderr synchronously if command failed
-            let mut stderr_output = String::new();
-            std::io::Read::read_to_string(&mut stderr, &mut stderr_output)?;
-
-            let _ = status_tx.send(Err(anyhow::anyhow!(
-                "Command failed with stderr: {}",
-                stderr_output
-            )));
-        } else {
-            let _ = status_tx.send(Ok(()));
-        }
-
-        Ok::<(), anyhow::Error>(())
-    });
-
-    let command_handle = tokio::spawn(async move {
-        match status_rx.await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("Command monitoring task failed")),
-        }
-    });
-
-    let batch_stream = ReceiverStream::new(rx).map(|result| result);
-    let schema_future = async move {
-        match schema_rx.await {
-            Ok(schema) => {
-                if schema.fields().is_empty() {
-                    None
-                } else {
-                    debug!("Schema: {:?}", schema);
-                    Some(schema)
-                }
-            }
-            Err(_) => None,
-        }
-    };
-
-    Ok(MvrStreamResult {
-        batch_stream,
-        schema_stream: schema_future,
-        command_handle,
-    })
 }
 
 pub fn fill_vec_with_none<'a>(

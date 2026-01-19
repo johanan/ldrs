@@ -48,7 +48,7 @@ impl Stream for StreamType {
 }
 
 struct LdrsSrcStream {
-    schema: arrow_schema::SchemaRef,
+    schema: Option<arrow_schema::SchemaRef>,
     stream_type: StreamType,
     source_cols: Vec<ColumnSpec>,
     cleanup_handle: Option<JoinHandle<Result<(), anyhow::Error>>>,
@@ -153,7 +153,7 @@ pub async fn create_ldrs_exec(
                     .filter_map(|pq| ColumnSpec::try_from(pq).ok())
                     .collect::<Vec<_>>();
                 LdrsSrcStream {
-                    schema,
+                    schema: Some(schema),
                     stream_type: StreamType::Parquet(stream),
                     source_cols: dest_cols,
                     cleanup_handle: None,
@@ -166,9 +166,7 @@ pub async fn create_ldrs_exec(
                 };
                 let sf_src = get_src_url(ldrs_env, &sf.get_name(), "sf")?;
                 let arrow_stream = sf_arrow_stream(sf_src.1.as_str(), &sf_sql).await?;
-                let schema = arrow_stream.schema_stream.await.ok_or_else(|| {
-                    anyhow::Error::msg("Failed to load schema. Most likely ldrs-sf failed")
-                })?;
+                let schema = arrow_stream.schema_stream.await;
                 LdrsSrcStream {
                     schema,
                     stream_type: StreamType::Receiver(arrow_stream.batch_stream),
@@ -178,49 +176,55 @@ pub async fn create_ldrs_exec(
             }
         };
 
-        let _ = match task.dest {
-            LdrsDestination::Pg(pg_dest) => {
-                let dest_value = get_dest_url(ldrs_env, pg_dest.get_name(), "pg")?;
-                let (pg_url, role) = check_for_role(dest_value.1.as_str())?;
-                // check the environment for a pg role
-                let role = role.or(get_env_value(
-                    ldrs_env,
-                    &[
-                        &format!("LDRS_PG_ROLE_{}", pg_dest.get_name()),
-                        "LDRS_PG_ROLE",
-                    ],
-                )
-                .map(|(_, v)| v.to_string()));
-                let source_cols = src
-                    .source_cols
-                    .iter()
-                    .map(ColumnSchema::from)
-                    .collect::<Vec<_>>();
-                let (final_cols, transforms) =
-                    build_final_schema(&src.schema, vec![source_cols, pg_dest.get_columns()])?;
-                info!("Final columns: {:?}", final_cols);
-                info!("Transforms: {:?}", transforms);
-                // collect the params that can be bound
-                let env_params = collect_params(ldrs_env);
-                let pg_commands = pg_dest.to_pg_commands();
-                load_to_postgres(
-                    &pg_url,
-                    pg_dest.get_name(),
-                    &pg_commands,
-                    &final_cols,
-                    &transforms,
-                    &env_params,
-                    role,
-                    src.stream_type,
-                )
-                .await
+        let _ = match src.schema {
+            Some(schema) => match task.dest {
+                LdrsDestination::Pg(pg_dest) => {
+                    let dest_value = get_dest_url(ldrs_env, pg_dest.get_name(), "pg")?;
+                    let (pg_url, role) = check_for_role(dest_value.1.as_str())?;
+                    // check the environment for a pg role
+                    let role = role.or(get_env_value(
+                        ldrs_env,
+                        &[
+                            &format!("LDRS_PG_ROLE_{}", pg_dest.get_name()),
+                            "LDRS_PG_ROLE",
+                        ],
+                    )
+                    .map(|(_, v)| v.to_string()));
+                    let source_cols = src
+                        .source_cols
+                        .iter()
+                        .map(ColumnSchema::from)
+                        .collect::<Vec<_>>();
+                    let (final_cols, transforms) =
+                        build_final_schema(&schema, vec![source_cols, pg_dest.get_columns()])?;
+                    info!("Final columns: {:?}", final_cols);
+                    info!("Transforms: {:?}", transforms);
+                    // collect the params that can be bound
+                    let env_params = collect_params(ldrs_env);
+                    let pg_commands = pg_dest.to_pg_commands();
+                    load_to_postgres(
+                        &pg_url,
+                        pg_dest.get_name(),
+                        &pg_commands,
+                        &final_cols,
+                        &transforms,
+                        &env_params,
+                        role,
+                        src.stream_type,
+                    )
+                    .await
+                }
+            },
+            None => {
+                info!("No schema found, most likely the load failed");
+                Ok(())
             }
-        };
+        }?;
 
         if let Some(handle) = src.cleanup_handle {
             match handle.await {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(anyhow::anyhow!("ldrs-sf failed: {}", e)),
+                Ok(Err(e)) => Err(e),
                 Err(e) => Err(anyhow::anyhow!("ldrs-sf task panicked: {}", e)),
             }?
         }

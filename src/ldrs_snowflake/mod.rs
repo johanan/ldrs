@@ -183,10 +183,7 @@ pub async fn sf_arrow_stream(
             let mut stderr_output = String::new();
             std::io::Read::read_to_string(&mut stderr, &mut stderr_output)?;
 
-            let _ = status_tx.send(Err(anyhow::anyhow!(
-                "Command failed with stderr: {}",
-                stderr_output
-            )));
+            let _ = status_tx.send(Err(anyhow::anyhow!("ldrs-sf stderr: {}", stderr_output)));
         } else {
             let _ = status_tx.send(Ok(()));
         }
