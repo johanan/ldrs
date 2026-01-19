@@ -65,7 +65,7 @@ async fn test_postgres_file_drop() {
         ("LDRS_SRC".to_string(), file_url.to_string()),
         ("LDRS_DEST".to_string(), pg_role_url.to_string()),
         (
-            "LDRS_PARAM_DEL_P1_TIMESTAMP".to_string(),
+            "LDRS_PARAM_PUBLIC_TEST_USERS_P1_TIMESTAMP".to_string(),
             "2024-10-08T17:22:00".to_string(),
         ),
     ];
