@@ -3,7 +3,6 @@ use std::fs;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use dotenvy::dotenv;
-use ldrs::delta::{delta_merge, delta_run, DeltaCommands};
 use ldrs::ldrs_config::{create_ldrs_exec, get_all_ldrs_env_vars};
 use ldrs::ldrs_postgres::PgCommands;
 use ldrs::ldrs_postgres::{load_from_file, load_postgres_cmd};
@@ -11,7 +10,25 @@ use ldrs::ldrs_snowflake::{SnowflakeResult, SnowflakeStrategy};
 use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
 use ldrs::path_pattern;
 use ldrs::types::lua_args::modules_from_args;
+use serde::Deserialize;
 use tracing::info;
+
+// maintaining this so clients do not break
+#[derive(Args, Deserialize, Debug)]
+pub struct DeltaLoad {
+    #[arg(short, long)]
+    pub delta_root: String,
+    #[arg(short, long)]
+    pub file: String,
+    #[arg(short, long)]
+    pub table_name: String,
+}
+
+#[derive(Subcommand)]
+pub enum DeltaCommands {
+    /// Load data into Delta Lake
+    Load(DeltaLoad),
+}
 
 #[derive(Args)]
 struct ConfigArgs {
@@ -91,8 +108,10 @@ fn main() -> Result<(), anyhow::Error> {
                 }
             },
             Destination::Delta { command } => match command {
-                DeltaCommands::Load(args) => delta_run(&args, rt.handle().clone()).await,
-                DeltaCommands::Merge(args) => delta_merge(&args, rt.handle().clone()).await,
+                DeltaCommands::Load(args) => {
+                    info!("delta load with {:?}", args);
+                    Ok(())
+                }
             },
             Destination::Sf { command } => match command {
                 ldrs::ldrs_snowflake::SnowflakeCommands::Exec { sql } => {

@@ -13,9 +13,9 @@ pub enum TimeUnit {
 impl From<&parquet::basic::TimeUnit> for TimeUnit {
     fn from(pq_unit: &parquet::basic::TimeUnit) -> Self {
         match pq_unit {
-            parquet::basic::TimeUnit::MILLIS(_) => TimeUnit::Millis,
-            parquet::basic::TimeUnit::MICROS(_) => TimeUnit::Micros,
-            parquet::basic::TimeUnit::NANOS(_) => TimeUnit::Nanos,
+            parquet::basic::TimeUnit::MILLIS => TimeUnit::Millis,
+            parquet::basic::TimeUnit::MICROS => TimeUnit::Micros,
+            parquet::basic::TimeUnit::NANOS => TimeUnit::Nanos,
         }
     }
 }
