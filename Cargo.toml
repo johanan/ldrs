@@ -1,6 +1,6 @@
 [package]
 name = "ldrs"
-version = "0.14.3"
+version = "0.15.0"
 edition = "2021"
 repository = "https://github.com/johanan/ldrs"
 authors = ["Joshua Johanan"]
