@@ -1,5 +1,4 @@
 pub mod arrow_access;
-pub mod delta;
 pub mod ldrs_arrow;
 pub mod ldrs_config;
 pub mod ldrs_parquet;

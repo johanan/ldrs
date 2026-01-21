@@ -22,8 +22,10 @@ pub async fn builder_from_url(
         .with_context(|| "Could not find file in store")?;
 
     let reader = match storage {
-        StorageProvider::Azure(_) => ParquetObjectReader::new(store, meta).with_runtime(handle),
-        StorageProvider::Local(_, _) => ParquetObjectReader::new(store, meta),
+        StorageProvider::Azure(_) => {
+            ParquetObjectReader::new(store, meta.location).with_runtime(handle)
+        }
+        StorageProvider::Local(_, _) => ParquetObjectReader::new(store, meta.location),
     };
 
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
