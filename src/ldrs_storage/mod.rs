@@ -1,18 +1,12 @@
-use std::{path::Path, pin::Pin, sync::Arc};
+use std::{path::Path, pin::Pin};
 
 use arrow_array::RecordBatch;
 use futures::Stream;
-use futures::StreamExt;
-use futures::TryStreamExt;
-use parquet::{
-    arrow::{
-        arrow_reader::ArrowReaderBuilder,
-        async_reader::{AsyncReader, ParquetObjectReader},
-    },
-    errors::ParquetError,
+use parquet::arrow::{
+    arrow_reader::ArrowReaderBuilder,
+    async_reader::{AsyncReader, ParquetObjectReader},
 };
 use serde::{Deserialize, Serialize};
-use std::pin::pin;
 use tokio::runtime::Handle;
 use url::Url;
 
@@ -36,19 +30,6 @@ pub fn is_object_store_url(url: &Url) -> bool {
         url.scheme(),
         "file" | "az" | "adl" | "azure" | "abfs" | "abfss" | "https"
     )
-}
-
-fn src_connections_from_key((key, url): (String, Url)) -> Result<(String, Url), anyhow::Error> {
-    if key == "LDRS_SRC" {
-        return Ok(("src".to_string(), url));
-    }
-    // keys should already be LDRS_SRC_*
-    let scheme = key
-        .strip_prefix("LDRS_")
-        .ok_or_else(|| anyhow::anyhow!("Key {} does not start with LDRS_SRC_", key))?
-        .to_lowercase();
-
-    Ok((scheme, url))
 }
 
 fn find_source<'a>(sources: &'a [(String, Url)], key: Option<&str>) -> Option<&'a (String, Url)> {
@@ -103,7 +84,10 @@ fn osstr_to_string(os_str: &std::ffi::OsStr) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::pin;
+    use std::pin::pin;
+
+    use futures::TryStreamExt;
+    use tokio_stream::StreamExt;
 
     use crate::{
         storage::base_or_relative_path,

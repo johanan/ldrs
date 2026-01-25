@@ -1,20 +1,17 @@
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
-const SF_NAMESPACE: &str = "sf";
-
-#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
-pub struct SFBindVar {
-    name: String,
-    value: String,
-}
+use crate::{
+    ldrs_env::{get_env_values_by_keys, get_params_for_stmt_with_default},
+    types::ColumnType,
+};
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct SFQuery {
     pub sql: String,
     pub name: String,
     #[serde(default)]
-    pub bind_vars: Vec<SFBindVar>,
+    pub param_keys: Option<Vec<String>>,
 }
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +35,39 @@ impl SFSource {
             SFSource::Table(table) => &table.name,
         }
     }
+
+    pub fn get_param_keys(&self) -> Option<&Vec<String>> {
+        match self {
+            SFSource::Query(query) => query.param_keys.as_ref(),
+            SFSource::Table(_) => None,
+        }
+    }
+
+    pub fn try_get_env_params(
+        &self,
+        env_params: &[(String, String, Option<ColumnType>)],
+    ) -> Result<Vec<(String, Option<ColumnType>)>, anyhow::Error> {
+        match self {
+            SFSource::Query(query) => match query.param_keys.as_ref() {
+                None => Ok(get_params_for_stmt_with_default(
+                    Some(&query.name),
+                    &env_params,
+                )),
+                Some(keys) => {
+                    let matched_keys = get_env_values_by_keys(&keys, &env_params);
+                    // check that matched_keys is not fewer and if so return error
+                    anyhow::ensure!(
+                        matched_keys.len() == keys.len(),
+                        "Not enough or too many environment variables. Expected {} but got {}",
+                        keys.len(),
+                        matched_keys.len()
+                    );
+                    Ok(matched_keys)
+                }
+            },
+            SFSource::Table(_) => Ok(Vec::new()),
+        }
+    }
 }
 
 pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<SFSource, anyhow::Error> {
@@ -49,6 +79,10 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<SFSource, anyh
         .get("sf.sql")
         .or(yaml.get("sql"))
         .and_then(|v| v.as_str());
+    let param_keys = yaml
+        .get("sf.param_keys")
+        .or(yaml.get("param_keys"))
+        .and_then(|v| Vec::<String>::deserialize(v).ok());
 
     match (name, sql) {
         (Some(name), Some(sql)) => {
@@ -57,7 +91,7 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<SFSource, anyh
                 Some("sf.query") | Some("sf") | None => Ok(SFSource::Query(SFQuery {
                     sql: sql.to_string(),
                     name: name.to_string(),
-                    bind_vars: Vec::new(),
+                    param_keys,
                 })),
                 Some("sf.table") => Err(anyhow::Error::msg("Tag 'sf.table' but sql is present")),
                 Some(_) => Err(anyhow::Error::msg("Invalid tag")),
@@ -104,7 +138,7 @@ name: recent_users
         let query_struct = SFSource::Query(SFQuery {
             sql: "SELECT * FROM users WHERE created_at > '2024-01-01'".to_string(),
             name: "recent_users".to_string(),
-            bind_vars: Vec::new(),
+            param_keys: None,
         });
         assert_eq!(query, query_struct);
     }
@@ -137,9 +171,93 @@ sf.name: recent_users
         let query_struct = SFSource::Query(SFQuery {
             sql: "SELECT * FROM users WHERE created_at > '2024-01-01'".to_string(),
             name: "recent_users".to_string(),
-            bind_vars: Vec::new(),
+            param_keys: None,
         });
         assert_eq!(query, query_struct);
         assert_eq!(query_infer, query_struct);
+    }
+
+    #[test]
+    fn test_try_get_env_params() {
+        let default_env_params = vec![
+            ("USER".to_string(), "user1".to_string(), None),
+            ("CREATED".to_string(), "created1".to_string(), None),
+            (
+                "OTHER_QUERY_USER".to_string(),
+                "other_user".to_string(),
+                None,
+            ),
+        ];
+
+        let sf_none = SFSource::Query(SFQuery {
+            sql: "SELECT * FROM users WHERE user_id = ? and created_at > ?".to_string(),
+            name: "RECENT_USERS".to_string(),
+            param_keys: None,
+        });
+
+        let sf_user_key = SFSource::Query(SFQuery {
+            sql: "SELECT * FROM users WHERE user_id = ?".to_string(),
+            name: "RECENT_USERS".to_string(),
+            param_keys: Some(vec!["USER".to_string()]),
+        });
+
+        let sf_other_user_key = SFSource::Query(SFQuery {
+            sql: "SELECT * FROM users WHERE user_id = ?".to_string(),
+            name: "RECENT_USERS".to_string(),
+            param_keys: Some(vec!["OTHER_QUERY_USER".to_string()]),
+        });
+
+        // no keys and params do not have name in them then default to vars not namepsaced
+        let params = sf_none.try_get_env_params(&default_env_params).unwrap();
+        assert_eq!(
+            params,
+            vec![("user1".to_string(), None), ("created1".to_string(), None),]
+        );
+
+        // specific keys match
+        let params = sf_user_key.try_get_env_params(&default_env_params).unwrap();
+        assert_eq!(params, vec![("user1".to_string(), None),]);
+
+        // target other keys
+        let params = sf_other_user_key
+            .try_get_env_params(&default_env_params)
+            .unwrap();
+        assert_eq!(params, vec![("other_user".to_string(), None),]);
+
+        let env_params = vec![
+            (
+                "RECENT_USERS_USER".to_string(),
+                "user_recent".to_string(),
+                None,
+            ),
+            (
+                "RECENT_USERS_CREATED".to_string(),
+                "created_recent".to_string(),
+                None,
+            ),
+            (
+                "OTHER_QUERY_USER".to_string(),
+                "other_user".to_string(),
+                None,
+            ),
+        ];
+
+        // now match based on named keys
+        let params = sf_none.try_get_env_params(&env_params).unwrap();
+        assert_eq!(
+            params,
+            vec![
+                ("user_recent".to_string(), None),
+                ("created_recent".to_string(), None)
+            ]
+        );
+
+        // target other keys
+        let params = sf_other_user_key.try_get_env_params(&env_params).unwrap();
+        assert_eq!(params, vec![("other_user".to_string(), None),]);
+
+        // should fail with specific key of USER as the wanted and found are different
+        let params = sf_user_key.try_get_env_params(&env_params);
+        assert_eq!(params.is_err(), true);
     }
 }

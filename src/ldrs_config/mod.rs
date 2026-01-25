@@ -14,10 +14,8 @@ use url::Url;
 use crate::{
     ldrs_arrow::build_final_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
-    ldrs_postgres::{
-        client::check_for_role,
-        postgres_execution::{collect_params, load_to_postgres},
-    },
+    ldrs_env::{collect_params, get_params_for_stmt_with_default},
+    ldrs_postgres::{client::check_for_role, postgres_execution::load_to_postgres},
     ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource},
     ldrs_storage::is_object_store_url,
     parquet_provider::builder_from_url,
@@ -52,12 +50,6 @@ struct LdrsSrcStream {
     stream_type: StreamType,
     source_cols: Vec<ColumnSpec>,
     cleanup_handle: Option<JoinHandle<Result<(), anyhow::Error>>>,
-}
-
-pub fn get_all_ldrs_env_vars() -> Vec<(String, String)> {
-    std::env::vars()
-        .filter(|(key, _)| key.starts_with("LDRS_"))
-        .collect()
 }
 
 pub fn get_env_value<'a>(
@@ -128,6 +120,9 @@ pub async fn create_ldrs_exec(
         .map(|t| get_parsed_config(&src_default, &dest_default, t))
         .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
+    // get all possible environment params
+    let env_params = collect_params(ldrs_env);
+
     let total_tasks = table_tasks.len();
     for (i, task) in table_tasks.into_iter().enumerate() {
         let task_start = std::time::Instant::now();
@@ -164,8 +159,10 @@ pub async fn create_ldrs_exec(
                     SFSource::Query(sql) => sql.sql.clone(),
                     SFSource::Table(table) => format!("SELECT * FROM {}", table.name),
                 };
-                let sf_src = get_src_url(ldrs_env, &sf.get_name(), "sf")?;
-                let arrow_stream = sf_arrow_stream(sf_src.1.as_str(), &sf_sql).await?;
+                let name = sf.get_name();
+                let sf_src = get_src_url(ldrs_env, &name, "sf")?;
+                let sf_params = sf.try_get_env_params(&env_params)?;
+                let arrow_stream = sf_arrow_stream(sf_src.1.as_str(), &sf_sql, sf_params).await?;
                 let schema = arrow_stream.schema_stream.await;
                 LdrsSrcStream {
                     schema,
@@ -237,6 +234,8 @@ pub async fn create_ldrs_exec(
 
 #[cfg(test)]
 mod tests {
+    use crate::types::ColumnType;
+
     use super::*;
 
     #[test]
@@ -264,6 +263,43 @@ mod tests {
         assert_eq!(
             get_src_url(&vars, "NO_MATCH", "NO_MATCH").unwrap(),
             &("LDRS_SRC".to_string(), "https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_collect_params() {
+        let simple_env = vec![
+            ("LDRS_PARAM_P1".to_string(), "value1".to_string()),
+            ("LDRS_PARAM_P2".to_string(), "value2".to_string()),
+        ];
+        let params = collect_params(&simple_env);
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], ("P1".to_string(), "value1".to_string(), None));
+
+        let with_type = vec![
+            ("LDRS_PARAM_P1_UUID".to_string(), "value1".to_string()),
+            (
+                "LDRS_PARAM_P2_TIMESTAMP".to_string(),
+                "2023-01-01T00:00:00Z".to_string(),
+            ),
+        ];
+        let params = collect_params(&with_type);
+        assert_eq!(params.len(), 2);
+        assert_eq!(
+            params[0],
+            (
+                "P1".to_string(),
+                "value1".to_string(),
+                Some(ColumnType::Uuid)
+            )
+        );
+        assert_eq!(
+            params[1],
+            (
+                "P2".to_string(),
+                "2023-01-01T00:00:00Z".to_string(),
+                Some(ColumnType::Timestamp(crate::types::TimeUnit::Micros))
+            )
         );
     }
 }

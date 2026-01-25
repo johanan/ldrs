@@ -10,11 +10,11 @@ use std::{
     process::{Command, Stdio},
 };
 use tokio::task;
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info};
 use url::Url;
 
-use crate::types::lua_args::LuaArgs;
+use crate::types::{lua_args::LuaArgs, ColumnType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -121,9 +121,13 @@ impl SnowflakeConnection {
     }
 }
 
+/// Execute a SQL query and stream the results as Arrow RecordBatches.
+/// This uses the ldrs-sf binary to execute the query and stream the results.
+/// `bind_params` should already be sorted by key and this is the value and type of the parameter.
 pub async fn sf_arrow_stream(
     conn: &str,
     sql: &str,
+    bind_params: Vec<(String, Option<ColumnType>)>,
 ) -> Result<
     SnowflakeStreamResult<impl Future<Output = Option<arrow_schema::SchemaRef>> + Send>,
     anyhow::Error,
@@ -140,6 +144,12 @@ pub async fn sf_arrow_stream(
         let cmd = cmd.args(args);
         info!("Running command: {:?}", cmd);
         let cmd = cmd.env("LDRS_SF_SOURCE", conn_url);
+        // bind the parameters in order for ldrs-sf
+        let sf_named_params = bind_params.into_iter().enumerate().map(|(i, (value, _))| {
+            let name = format!("LDRS_SF_PARAM_P{}", i + 1);
+            (name, value)
+        });
+        let cmd = cmd.envs(sf_named_params);
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd

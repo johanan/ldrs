@@ -7,13 +7,14 @@ use postgres_types::ToSql;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_postgres::{binary_copy::BinaryCopyInWriter, Transaction};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::{
     arrow_access::{
         extracted_values::{ColumnConverter, ExtractedValue},
         TypedColumnAccessor,
     },
+    ldrs_env::get_params_for_stmt_with_default,
     ldrs_postgres::{
         client::create_connection, map_col_schema_to_pg_type,
         schema_change::map_columnschema_to_pg_ddl,
@@ -94,79 +95,6 @@ impl<'a> PgDestExecutionContext<'a> {
             context,
             handlebars,
         })
-    }
-}
-
-const SIMPLE_TYPES: &[&str] = &[
-    "_UUID",
-    "_INT",
-    "_BIGINT",
-    "_SMALLINT",
-    "_BOOL",
-    "_TIMESTAMP",
-    "_TIMESTAMPTZ",
-    "_TEXT",
-    "_VARCHAR",
-    "_REAL",
-    "_DOUBLE",
-    "_DATE",
-    "_JSONB",
-    "_BYTEA",
-];
-
-pub fn collect_params(params: &[(String, String)]) -> Vec<(String, String, Option<ColumnType>)> {
-    let mut ldrs_params = params
-        .iter()
-        .filter_map(|(key, value)| {
-            key.strip_prefix("LDRS_PARAM_").map(|suffix| {
-                for simple_type in SIMPLE_TYPES {
-                    if let Some(key) = suffix.strip_suffix(simple_type) {
-                        let simple_type_rest = &simple_type[1..];
-                        // at least output if something failed
-                        let column_type = ColumnType::try_from(simple_type_rest)
-                            .map_err(|e| warn!("Failed to parse column type: {}", e))
-                            .ok();
-                        return (key.to_string(), value.to_string(), column_type);
-                    }
-                }
-                (suffix.to_string(), value.to_string(), None)
-            })
-        })
-        .collect::<Vec<_>>();
-    // ensure that the params are sorted by key
-    ldrs_params.sort_by(|a, b| a.0.cmp(&b.0));
-    ldrs_params
-}
-
-fn get_params_for_stmt<'a>(
-    key: &Option<String>,
-    params: &'a [(String, String, Option<ColumnType>)],
-) -> Vec<(&'a String, Option<&'a ColumnType>)> {
-    // match the key if it exists or match anything without a key
-    let key_params: Vec<(&'a String, Option<&'a ColumnType>)> = match key {
-        Some(k) => {
-            let prefix = format!("{}_", k);
-            params
-                .iter()
-                .filter(|(key, _, _)| key.starts_with(&prefix))
-                .map(|(_, value, param_type)| (value, param_type.as_ref()))
-                .collect::<Vec<_>>()
-        }
-        None => params
-            .iter()
-            .filter(|(key, _, _)| !key.contains('_'))
-            .map(|(_, value, param_type)| (value, param_type.as_ref()))
-            .collect::<Vec<_>>(),
-    };
-
-    // if there are no params and a key fallback to the defaults
-    match key_params.is_empty() && key.is_some() {
-        true => params
-            .iter()
-            .filter(|(key, _, _)| !key.contains('_'))
-            .map(|(_, value, param_type)| (value, param_type.as_ref()))
-            .collect::<Vec<_>>(),
-        false => key_params,
     }
 }
 
@@ -322,7 +250,8 @@ pub async fn execute_prepared_stmt<'a>(
         .map(|k| k.to_uppercase());
     debug!("Rendered key: {:?}", rendered_key);
 
-    let matched_params = get_params_for_stmt(&rendered_key, params);
+    let matched_params = get_params_for_stmt_with_default(rendered_key.as_deref(), params);
+
     // if stmt has types use them, otherwise use from the matched_params
     let param_types = match &stmt.types {
         Some(types) => {
@@ -331,12 +260,15 @@ pub async fn execute_prepared_stmt<'a>(
             }
             // zip together with the string value and column type
             zip(
-                matched_params.iter().map(|(k, _)| *k),
+                matched_params.iter().map(|(k, _)| k),
                 types.iter().map(Some),
             )
             .collect::<Vec<_>>()
         }
-        None => matched_params,
+        None => matched_params
+            .iter()
+            .map(|(k, ct)| (k, ct.as_ref()))
+            .collect::<Vec<_>>(),
     };
 
     let param_values = param_types
@@ -477,48 +409,5 @@ fn param_tosql<'a>(
             _ => Ok(Box::new(value)),
         },
         (value, None) => Ok(Box::new(value)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-
-    #[test]
-    fn test_collect_params() {
-        let simple_env = vec![
-            ("LDRS_PARAM_P1".to_string(), "value1".to_string()),
-            ("LDRS_PARAM_P2".to_string(), "value2".to_string()),
-        ];
-        let params = collect_params(&simple_env);
-        assert_eq!(params.len(), 2);
-        assert_eq!(params[0], ("P1".to_string(), "value1".to_string(), None));
-
-        let with_type = vec![
-            ("LDRS_PARAM_P1_UUID".to_string(), "value1".to_string()),
-            (
-                "LDRS_PARAM_P2_TIMESTAMP".to_string(),
-                "2023-01-01T00:00:00Z".to_string(),
-            ),
-        ];
-        let params = collect_params(&with_type);
-        assert_eq!(params.len(), 2);
-        assert_eq!(
-            params[0],
-            (
-                "P1".to_string(),
-                "value1".to_string(),
-                Some(ColumnType::Uuid)
-            )
-        );
-        assert_eq!(
-            params[1],
-            (
-                "P2".to_string(),
-                "2023-01-01T00:00:00Z".to_string(),
-                Some(ColumnType::Timestamp(crate::types::TimeUnit::Micros))
-            )
-        );
     }
 }
