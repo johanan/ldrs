@@ -1,4 +1,5 @@
-use tracing::warn;
+use serde_json::Value;
+use tracing::{debug, warn};
 
 use crate::types::ColumnType;
 
@@ -89,7 +90,9 @@ pub fn get_params_for_stmt_with_default(
     key: Option<&str>,
     params: &[(String, String, Option<ColumnType>)],
 ) -> Vec<(String, Option<ColumnType>)> {
+    debug!("Getting params for key: {:?}", key);
     let key_params = key.map(|k| get_params_for_key(k, params));
+    debug!("Key params: {:?}", key_params);
     match key_params {
         Some(p) if p.is_empty() => get_params_default(params),
         Some(p) => p,
@@ -106,4 +109,43 @@ pub fn get_env_values_by_keys<'a>(
         .filter(|(k, _, _)| keys.iter().any(|key| k.eq_ignore_ascii_case(key)))
         .map(|(_, v, t)| (v.clone(), t.clone()))
         .collect::<Vec<_>>()
+}
+
+#[derive(Debug)]
+pub struct LdrsExecutionContext<'a> {
+    pub context: Value,
+    pub handlebars: &'a handlebars::Handlebars<'a>,
+}
+
+impl<'a> LdrsExecutionContext<'a> {
+    pub fn try_new(
+        name: &str,
+        handlebars: &'a handlebars::Handlebars<'a>,
+    ) -> Result<Self, anyhow::Error> {
+        let fqtn_tup = name.split_once('.');
+        let (schema, table) = match fqtn_tup {
+            Some((schema, table)) => Ok((schema, table)),
+            None => Err(anyhow::Error::msg("Invalid table name")),
+        }?;
+
+        // create random load_table name
+        let load_table_name = format!(
+            "{}_{}",
+            table,
+            uuid::Uuid::new_v4().to_string().replace('-', "")
+        );
+        let load_table = format!("{}.{}", schema, load_table_name);
+
+        let context = serde_json::json!({
+            "name": name,
+            "schema": schema,
+            "table": table,
+            "load_table": load_table,
+            "load_table_name": load_table_name
+        });
+        Ok(Self {
+            context,
+            handlebars,
+        })
+    }
 }

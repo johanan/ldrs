@@ -45,14 +45,12 @@ impl SFSource {
 
     pub fn try_get_env_params(
         &self,
+        name: &str,
         env_params: &[(String, String, Option<ColumnType>)],
     ) -> Result<Vec<(String, Option<ColumnType>)>, anyhow::Error> {
         match self {
             SFSource::Query(query) => match query.param_keys.as_ref() {
-                None => Ok(get_params_for_stmt_with_default(
-                    Some(&query.name),
-                    &env_params,
-                )),
+                None => Ok(get_params_for_stmt_with_default(Some(name), &env_params)),
                 Some(keys) => {
                     let matched_keys = get_env_values_by_keys(&keys, &env_params);
                     // check that matched_keys is not fewer and if so return error
@@ -207,20 +205,25 @@ sf.name: recent_users
             param_keys: Some(vec!["OTHER_QUERY_USER".to_string()]),
         });
 
+        let name = "RECENT_USERS".to_string();
         // no keys and params do not have name in them then default to vars not namepsaced
-        let params = sf_none.try_get_env_params(&default_env_params).unwrap();
+        let params = sf_none
+            .try_get_env_params(&name, &default_env_params)
+            .unwrap();
         assert_eq!(
             params,
             vec![("user1".to_string(), None), ("created1".to_string(), None),]
         );
 
         // specific keys match
-        let params = sf_user_key.try_get_env_params(&default_env_params).unwrap();
+        let params = sf_user_key
+            .try_get_env_params(&name, &default_env_params)
+            .unwrap();
         assert_eq!(params, vec![("user1".to_string(), None),]);
 
         // target other keys
         let params = sf_other_user_key
-            .try_get_env_params(&default_env_params)
+            .try_get_env_params(&name, &default_env_params)
             .unwrap();
         assert_eq!(params, vec![("other_user".to_string(), None),]);
 
@@ -243,7 +246,7 @@ sf.name: recent_users
         ];
 
         // now match based on named keys
-        let params = sf_none.try_get_env_params(&env_params).unwrap();
+        let params = sf_none.try_get_env_params(&name, &env_params).unwrap();
         assert_eq!(
             params,
             vec![
@@ -253,11 +256,13 @@ sf.name: recent_users
         );
 
         // target other keys
-        let params = sf_other_user_key.try_get_env_params(&env_params).unwrap();
+        let params = sf_other_user_key
+            .try_get_env_params(&name, &env_params)
+            .unwrap();
         assert_eq!(params, vec![("other_user".to_string(), None),]);
 
         // should fail with specific key of USER as the wanted and found are different
-        let params = sf_user_key.try_get_env_params(&env_params);
+        let params = sf_user_key.try_get_env_params(&name, &env_params);
         assert_eq!(params.is_err(), true);
     }
 }

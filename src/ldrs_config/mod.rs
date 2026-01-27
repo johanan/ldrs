@@ -1,6 +1,6 @@
 pub mod config;
 
-use std::pin::Pin;
+use std::pin::pin;
 
 use anyhow::Context;
 use arrow_array::RecordBatch;
@@ -14,7 +14,7 @@ use url::Url;
 use crate::{
     ldrs_arrow::build_final_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
-    ldrs_env::{collect_params, get_params_for_stmt_with_default},
+    ldrs_env::{collect_params, LdrsExecutionContext},
     ldrs_postgres::{client::check_for_role, postgres_execution::load_to_postgres},
     ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource},
     ldrs_storage::is_object_store_url,
@@ -37,10 +37,10 @@ impl Stream for StreamType {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         match self.get_mut() {
-            StreamType::Parquet(stream) => Pin::new(stream)
+            StreamType::Parquet(stream) => pin!(stream)
                 .poll_next(cx)
                 .map(|opt| opt.map(|res| res.map_err(Into::into))),
-            StreamType::Receiver(stream) => Pin::new(stream).poll_next(cx),
+            StreamType::Receiver(stream) => pin!(stream).poll_next(cx),
         }
     }
 }
@@ -122,13 +122,15 @@ pub async fn create_ldrs_exec(
 
     // get all possible environment params
     let env_params = collect_params(ldrs_env);
+    debug!("Environment Params: {:?}", env_params);
+    let handlebars = handlebars::Handlebars::new();
 
     let total_tasks = table_tasks.len();
     for (i, task) in table_tasks.into_iter().enumerate() {
         let task_start = std::time::Instant::now();
         debug!("Task: {:?}", task);
         info!("Running task: {}/{}", i + 1, total_tasks);
-        let src = match task.src {
+        let (src, context) = match task.src {
             LdrsSource::File(file) => {
                 // if the filename is not provided, use the name as the filename
                 let file_name = file.filename.as_deref().unwrap_or(file.name.as_str());
@@ -147,12 +149,16 @@ pub async fn create_ldrs_exec(
                     .iter()
                     .filter_map(|pq| ColumnSpec::try_from(pq).ok())
                     .collect::<Vec<_>>();
-                LdrsSrcStream {
-                    schema: Some(schema),
-                    stream_type: StreamType::Parquet(stream),
-                    source_cols: dest_cols,
-                    cleanup_handle: None,
-                }
+                let ldrs_context = LdrsExecutionContext::try_new(&file.name, &handlebars)?;
+                (
+                    LdrsSrcStream {
+                        schema: Some(schema),
+                        stream_type: StreamType::Parquet(stream),
+                        source_cols: dest_cols,
+                        cleanup_handle: None,
+                    },
+                    ldrs_context,
+                )
             }
             LdrsSource::SF(sf) => {
                 let sf_sql = match &sf {
@@ -161,15 +167,23 @@ pub async fn create_ldrs_exec(
                 };
                 let name = sf.get_name();
                 let sf_src = get_src_url(ldrs_env, &name, "sf")?;
-                let sf_params = sf.try_get_env_params(&env_params)?;
+                let ldrs_context = LdrsExecutionContext::try_new(&name, &handlebars)?;
+                let handled_name = ldrs_context
+                    .handlebars
+                    .render_template("{{ shoutySnakeCase name }}", &ldrs_context.context)?;
+                let sf_params = sf.try_get_env_params(&handled_name, &env_params)?;
+                debug!("Snowflake Params: {:?}", sf_params);
                 let arrow_stream = sf_arrow_stream(sf_src.1.as_str(), &sf_sql, sf_params).await?;
                 let schema = arrow_stream.schema_stream.await;
-                LdrsSrcStream {
-                    schema,
-                    stream_type: StreamType::Receiver(arrow_stream.batch_stream),
-                    source_cols: vec![],
-                    cleanup_handle: Some(arrow_stream.command_handle),
-                }
+                (
+                    LdrsSrcStream {
+                        schema,
+                        stream_type: StreamType::Receiver(arrow_stream.batch_stream),
+                        source_cols: vec![],
+                        cleanup_handle: Some(arrow_stream.command_handle),
+                    },
+                    ldrs_context,
+                )
             }
         };
 
@@ -201,12 +215,12 @@ pub async fn create_ldrs_exec(
                     let pg_commands = pg_dest.to_pg_commands();
                     load_to_postgres(
                         &pg_url,
-                        pg_dest.get_name(),
                         &pg_commands,
                         &final_cols,
                         &transforms,
                         &env_params,
                         role,
+                        &context,
                         src.stream_type,
                     )
                     .await

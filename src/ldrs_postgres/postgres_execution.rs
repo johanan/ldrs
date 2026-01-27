@@ -2,10 +2,8 @@ use std::{iter::zip, pin::pin};
 
 use anyhow::Context;
 use arrow_array::RecordBatch;
-use handlebars::Handlebars;
 use postgres_types::ToSql;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio_postgres::{binary_copy::BinaryCopyInWriter, Transaction};
 use tracing::debug;
 
@@ -14,7 +12,7 @@ use crate::{
         extracted_values::{ColumnConverter, ExtractedValue},
         TypedColumnAccessor,
     },
-    ldrs_env::get_params_for_stmt_with_default,
+    ldrs_env::{get_params_for_stmt_with_default, LdrsExecutionContext},
     ldrs_postgres::{
         client::create_connection, map_col_schema_to_pg_type,
         schema_change::map_columnschema_to_pg_ddl,
@@ -59,45 +57,6 @@ pub enum PgDestCommand {
     Sql(String),
 }
 
-#[derive(Debug)]
-pub struct PgDestExecutionContext<'a> {
-    context: Value,
-    handlebars: handlebars::Handlebars<'a>,
-}
-
-impl<'a> PgDestExecutionContext<'a> {
-    pub fn try_new(
-        name: &'a str,
-        handlebars: handlebars::Handlebars<'a>,
-    ) -> Result<Self, anyhow::Error> {
-        let fqtn_tup = name.split_once('.');
-        let (schema, table) = match fqtn_tup {
-            Some((schema, table)) => Ok((schema, table)),
-            None => Err(anyhow::Error::msg("Invalid table name")),
-        }?;
-
-        // create random load_table name
-        let load_table_name = format!(
-            "{}_{}",
-            table,
-            uuid::Uuid::new_v4().to_string().replace('-', "")
-        );
-        let load_table = format!("{}.{}", schema, load_table_name);
-
-        let context = serde_json::json!({
-            "name": name,
-            "schema": schema,
-            "table": table,
-            "load_table": load_table,
-            "load_table_name": load_table_name
-        });
-        Ok(Self {
-            context,
-            handlebars,
-        })
-    }
-}
-
 fn validate_execution_plan(commands: &[PgDestCommand]) -> Result<(), anyhow::Error> {
     let load_actions = commands.iter().filter_map(|cmd| match cmd {
         PgDestCommand::Load(action) => Some(action),
@@ -115,12 +74,12 @@ fn validate_execution_plan(commands: &[PgDestCommand]) -> Result<(), anyhow::Err
 
 pub async fn load_to_postgres<S>(
     pg_url: &str,
-    name: &str,
     commands: &[PgDestCommand],
     final_cols: &[ColumnSchema<'_>],
     transforms: &[Option<ColumnType>],
     all_params: &[(String, String, Option<ColumnType>)],
     role: Option<String>,
+    context: &LdrsExecutionContext<'_>,
     stream: S,
 ) -> Result<(), anyhow::Error>
 where
@@ -136,8 +95,6 @@ where
         }
         tx.execute(&format!(r#"SET ROLE "{}""#, role), &[]).await?;
     }
-    let handlebars = Handlebars::new();
-    let context = PgDestExecutionContext::try_new(name, handlebars)?;
 
     let stream = stream.into_stream();
     let mut stream = pin!(stream);
@@ -225,7 +182,7 @@ where
 pub async fn execute_sql<'a>(
     tx: &Transaction<'a>,
     sql: &str,
-    context: &PgDestExecutionContext<'a>,
+    context: &LdrsExecutionContext<'a>,
 ) -> Result<(), anyhow::Error> {
     let rendered_sql = context.handlebars.render_template(&sql, &context.context)?;
     debug!("Executing SQL: {}", rendered_sql);
@@ -237,7 +194,7 @@ pub async fn execute_prepared_stmt<'a>(
     tx: &Transaction<'a>,
     stmt: &PgPreparedStmt,
     params: &[(String, String, Option<ColumnType>)],
-    context: &PgDestExecutionContext<'a>,
+    context: &LdrsExecutionContext<'a>,
 ) -> Result<(), anyhow::Error> {
     let rendered_stmt = context
         .handlebars
@@ -286,7 +243,7 @@ pub async fn execute_action<'a>(
     tx: &Transaction<'a>,
     action: &PgAction,
     columns: &[ColumnSchema<'a>],
-    context: &PgDestExecutionContext<'a>,
+    context: &LdrsExecutionContext<'a>,
 ) -> Result<(), anyhow::Error> {
     match action {
         PgAction::CreateTable(table) => {
