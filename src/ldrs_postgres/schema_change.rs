@@ -29,6 +29,7 @@ pub fn map_columnschema_to_pg_ddl(pq: &ColumnSchema) -> String {
         ColumnSchema::Varchar(name, size) => format!("{} varchar({})", name, size),
         ColumnSchema::Custom(name, type_name) => format!("{} {}", name, type_name),
         ColumnSchema::Bytea(name) => format!("{} bytea", name),
+        ColumnSchema::FixedSizeBinary(name, _) => format!("{} bytea", name),
     }
 }
 

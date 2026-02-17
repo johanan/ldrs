@@ -113,7 +113,9 @@ pub fn map_arrow_to_abstract<'a>(field: &'a FieldRef) -> Option<ColumnSchema<'a>
         arrow_schema::DataType::Boolean => Some(ColumnSchema::Boolean(name)),
         arrow_schema::DataType::Binary => Some(ColumnSchema::Text(name)),
         arrow_schema::DataType::Date32 => Some(ColumnSchema::Date(name)),
-        arrow_schema::DataType::FixedSizeBinary(_) => Some(ColumnSchema::Bytea(name)),
+        arrow_schema::DataType::FixedSizeBinary(size) => {
+            Some(ColumnSchema::FixedSizeBinary(name, *size))
+        }
         arrow_schema::DataType::Decimal128(precision, scale) => Some(ColumnSchema::Numeric(
             name,
             (*precision).into(),
@@ -121,6 +123,56 @@ pub fn map_arrow_to_abstract<'a>(field: &'a FieldRef) -> Option<ColumnSchema<'a>
         )),
         _ => None,
     }
+}
+
+pub fn build_source_and_target_schema<'a>(
+    schema: &'a arrow_schema::SchemaRef,
+    src_logical: Vec<ColumnSchema<'a>>,
+    overrides: Vec<Vec<ColumnSchema<'a>>>,
+) -> Result<(Vec<ColumnSchema<'a>>, Vec<ColumnSchema<'a>>), anyhow::Error> {
+    // base mappings from arrow schema types
+    let arrow_inferred = schema
+        .fields()
+        .iter()
+        .filter_map(map_arrow_to_abstract)
+        .map(Some)
+        .collect::<Vec<_>>();
+
+    // we need a colschema for every field to process the arrow batch
+    anyhow::ensure!(
+        arrow_inferred.len() == schema.fields().len(),
+        "Columns length does not match schema fields length"
+    );
+
+    let sf_inferred = schema
+        .fields()
+        .iter()
+        .map(get_sf_arrow_schema)
+        .collect::<Vec<_>>();
+
+    let filled_src = fill_vec_with_none(&schema.fields, src_logical);
+
+    // create the layers from the ground up with every column
+    let mut layers: Vec<Vec<Option<ColumnSchema<'a>>>> =
+        vec![arrow_inferred, sf_inferred, filled_src];
+    // make sure the layers are the same length
+    let filled_overrides = overrides
+        .into_iter()
+        .map(|o| fill_vec_with_none(&schema.fields, o));
+
+    layers.extend(filled_overrides);
+
+    let source = (0..schema.fields().len())
+        .map(|i| layers[..3].iter().rev().find_map(|layer| layer[i].clone()))
+        .flatten()
+        .collect::<Vec<_>>();
+
+    let target = (0..schema.fields().len())
+        .map(|i| layers.iter().rev().find_map(|layer| layer[i].clone()))
+        .flatten()
+        .collect::<Vec<_>>();
+
+    Ok((source, target))
 }
 
 pub fn build_final_schema<'a>(
@@ -181,25 +233,6 @@ pub fn flatten_arrow_transforms_zip(
     .collect::<Vec<_>>()
 }
 
-/*
-*
-*
-*
-(Some(ColumnSchema::Numeric(_, precision, scale)), Some(ColumnSchema::Integer(name))) => {
-    anyhow::ensure!(scale == 0, "Cannot map numeric with scale to integer");
-    anyhow::ensure!(
-        precision <= 9,
-        "Cannot map numeric with precision > 9 to integer for {}",
-        name
-    );
-    Ok(Some(ColumnSchema::Integer(name)))
-}
-(Some(ColumnSchema::Numeric(_, precision, scale)), Some(ColumnSchema::BigInt(name))) => {
-    anyhow::ensure!(scale == 0, "Cannot map numeric with scale to integer");
-    Ok(Some(ColumnSchema::BigInt(name)))
-}
-*/
-
 pub fn flatten_schema_zip<'a>(
     zip: Zip<IntoIter<Option<ColumnSchema<'a>>>, IntoIter<Option<ColumnSchema<'a>>>>,
 ) -> IntoIter<Option<ColumnSchema<'a>>> {
@@ -216,4 +249,68 @@ pub fn flatten_schema_zip<'a>(
     })
     .collect::<Vec<_>>()
     .into_iter()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use arrow_schema::{DataType, Schema};
+
+    use super::*;
+
+    #[test]
+    fn test_source_target_schema() {
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let (src, target) =
+            build_source_and_target_schema(&arrow_schema, Vec::new(), Vec::new()).unwrap();
+        let basic_col = vec![ColumnSchema::Text("a"), ColumnSchema::BigInt("b")];
+        assert_eq!(src, basic_col);
+        assert_eq!(target, basic_col);
+
+        // add snowflake override
+        let mut sf_numeric = Field::new("b", DataType::Int64, true);
+        // set metadata to set this int64 as numeric
+        let sf_hashmap = HashMap::from([
+            ("scale".to_string(), "10".to_string()),
+            ("precision".to_string(), "18".to_string()),
+            ("logicalType".to_string(), "FIXED".to_string()),
+        ]);
+        sf_numeric.set_metadata(sf_hashmap);
+        let snowflake = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            sf_numeric,
+        ]));
+        let (src, target) =
+            build_source_and_target_schema(&snowflake, Vec::new(), Vec::new()).unwrap();
+        let snowflake = vec![ColumnSchema::Text("a"), ColumnSchema::Numeric("b", 18, 10)];
+        assert_eq!(src, snowflake);
+        assert_eq!(target, snowflake);
+
+        // keep simple arrow but override
+        // this will create different source and target schemas
+        let overrides = vec![vec![ColumnSchema::Numeric("b", 18, 10)]];
+        let (src, target) =
+            build_source_and_target_schema(&arrow_schema, Vec::new(), overrides).unwrap();
+        let src_cols = vec![ColumnSchema::Text("a"), ColumnSchema::BigInt("b")];
+        let target_cols = vec![ColumnSchema::Text("a"), ColumnSchema::Numeric("b", 18, 10)];
+        assert_eq!(src, src_cols);
+        assert_eq!(target, target_cols);
+
+        // override the same column multiple times
+        // this shows that the last override will be applied
+        let overrides = vec![
+            vec![ColumnSchema::Uuid("a"), ColumnSchema::Numeric("b", 18, 10)],
+            vec![ColumnSchema::Numeric("b", 12, 8)],
+        ];
+        let (src, target) =
+            build_source_and_target_schema(&arrow_schema, Vec::new(), overrides).unwrap();
+        let src_cols = vec![ColumnSchema::Text("a"), ColumnSchema::BigInt("b")];
+        let target_cols = vec![ColumnSchema::Uuid("a"), ColumnSchema::Numeric("b", 12, 8)];
+        assert_eq!(src, src_cols);
+        assert_eq!(target, target_cols);
+    }
 }

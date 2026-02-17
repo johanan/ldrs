@@ -20,13 +20,14 @@ arrow-schema = { version = "57", features = ["serde"] }
 bigdecimal = "0.4.10"
 chrono = "0.4.39"
 clap = { version = "4.5.54", features = ["derive"] }
+delta_kernel = { git = "https://github.com/delta-io/delta-kernel-rs", branch = "main", features = ["default-engine-native-tls", "arrow-57", "internal-api"] }
 dotenvy = "0.15.7"
 futures = "0.3.31"
 mlua = { version = "0.11.5", features = ["lua54", "vendored", "serialize"] }
 native-tls = { version = "0.2.14", features = ["vendored"] }
 object_store = { version = "0.12.5", features = ["azure"] }
 parking_lot = "0.12.3"
-parquet = { version = "57", features = ["async", "arrow", "object_store"] }
+parquet = { version = "57", features = ["async", "arrow", "object_store", "arrow_canonical_extension_types"] }
 pg_bigdecimal = "0.1.5"
 postgres-native-tls = "0.5.2"
 postgres-types = "0.2.12"
@@ -50,6 +51,7 @@ handlebars = { version = "6.4.0", features = ["string_helpers"] }
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rstest = "0.26.1"
+test-log = { version = "0.2.19", features = ["default", "trace"] }
 tokio-util = { version = "0.7.14", features = ["io", "io-util"] }
 
 # The profile that 'dist' will build with

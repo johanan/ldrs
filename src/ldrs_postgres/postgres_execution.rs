@@ -1,7 +1,8 @@
-use std::{iter::zip, pin::pin};
+use std::{iter::zip, pin::pin, sync::Arc};
 
 use anyhow::Context;
 use arrow_array::RecordBatch;
+use arrow_schema::Schema;
 use postgres_types::ToSql;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::{binary_copy::BinaryCopyInWriter, Transaction};
@@ -9,6 +10,7 @@ use tracing::debug;
 
 use crate::{
     arrow_access::{
+        arrow_transforms::{transform_batch, ArrowColumnTransformStrategy},
         extracted_values::{ColumnConverter, ExtractedValue},
         TypedColumnAccessor,
     },
@@ -76,7 +78,7 @@ pub async fn load_to_postgres<S>(
     pg_url: &str,
     commands: &[PgDestCommand],
     final_cols: &[ColumnSchema<'_>],
-    transforms: &[Option<ColumnType>],
+    arrow_transforms: &[Option<ArrowColumnTransformStrategy>],
     all_params: &[(String, String, Option<ColumnType>)],
     role: Option<String>,
     context: &LdrsExecutionContext<'_>,
@@ -128,8 +130,29 @@ where
                 let writer = BinaryCopyInWriter::new(sink, &pg_types);
                 let mut pinned_writer = pin!(writer);
 
+                // calculate if we need to do record batch transforms
+                let transform_plan = if arrow_transforms.iter().any(|s| s.is_some()) {
+                    let target_schema = Arc::new(Schema::new(
+                        final_cols
+                            .iter()
+                            .map(|col| col.to_arrow_field())
+                            .collect::<Vec<_>>(),
+                    ));
+                    Some((arrow_transforms, target_schema))
+                } else {
+                    None
+                };
+
                 while let Some(batch_result) = stream.next().await {
-                    let batch = batch_result.unwrap();
+                    let batch = batch_result?;
+
+                    let batch = match &transform_plan {
+                        Some((transforms, target_schema)) => {
+                            transform_batch(&batch, transforms, target_schema.clone())?
+                        }
+                        None => batch,
+                    };
+
                     let num_rows = batch.num_rows();
                     let columns = batch.columns();
 
@@ -138,10 +161,8 @@ where
 
                     let converters = accessors
                         .iter()
-                        .zip(final_cols.iter().zip(transforms.iter()))
-                        .map(|(accessor, (col_schema, transform))| {
-                            ColumnConverter::new(accessor, col_schema, transform.as_ref())
-                        })
+                        .zip(final_cols.iter())
+                        .map(|(accessor, col_schema)| ColumnConverter::new(accessor, col_schema))
                         .collect::<Result<Vec<_>, _>>()
                         .unwrap();
 

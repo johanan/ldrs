@@ -5,6 +5,7 @@ pub mod parquet_types;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TimeUnit {
+    Second,
     Millis,
     Micros,
     Nanos,
@@ -74,6 +75,7 @@ pub enum ColumnSchema<'a> {
     Boolean(&'a str),
     Date(&'a str),
     Custom(&'a str, String), // (column_name, ddl_type)
+    FixedSizeBinary(&'a str, i32),
     Bytea(&'a str),
 }
 
@@ -95,6 +97,7 @@ impl<'a> ColumnSchema<'a> {
             ColumnSchema::Boolean(name) => name,
             ColumnSchema::Date(name) => name,
             ColumnSchema::Custom(name, _) => name,
+            ColumnSchema::FixedSizeBinary(name, _) => name,
             ColumnSchema::Bytea(name) => name,
         }
     }
@@ -132,6 +135,8 @@ pub enum ColumnType {
     Date,
     #[serde(alias = "CUSTOM")]
     Custom(String), // ddl_type
+    #[serde(alias = "FIXEDSIZEBINARY")]
+    FixedSizeBinary(i32),
     #[serde(alias = "BYTEA")]
     Bytea,
 }
@@ -154,6 +159,7 @@ impl From<&ColumnSchema<'_>> for ColumnType {
             ColumnSchema::Boolean(_) => ColumnType::Boolean,
             ColumnSchema::Date(_) => ColumnType::Date,
             ColumnSchema::Custom(_, ddl_type) => ColumnType::Custom(ddl_type.clone()),
+            ColumnSchema::FixedSizeBinary(_, size) => ColumnType::FixedSizeBinary(*size),
             ColumnSchema::Bytea(_) => ColumnType::Bytea,
         }
     }
