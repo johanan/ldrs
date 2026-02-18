@@ -569,12 +569,10 @@ mod tests {
                 Some(300),
                 None,
             ])),
-            Arc::new(Int64Array::from(vec![
-                Some(100),
-                Some(200),
-                Some(300),
-                None,
-            ])),
+            Arc::new(
+                Decimal64Array::from(vec![Some(100), Some(200), Some(300), None])
+                    .with_data_type(DataType::Decimal64(18, 2)),
+            ),
         );
 
         // this should compact the bits as the precision decreases, but not the scale
@@ -588,12 +586,10 @@ mod tests {
                 Some(300),
                 None,
             ])),
-            Arc::new(Int32Array::from(vec![
-                Some(100),
-                Some(200),
-                Some(300),
-                None,
-            ])),
+            Arc::new(
+                Decimal32Array::from(vec![Some(100), Some(200), Some(300), None])
+                    .with_data_type(DataType::Decimal32(9, 2)),
+            ),
         );
     }
 
