@@ -50,14 +50,8 @@ tables:
 ];
 
 #[tokio::test]
+#[test_log::test]
 async fn test_postgres_file_drop() {
-    // let _default_guard = tracing::subscriber::set_global_default(
-    //     tracing_subscriber::fmt::Subscriber::builder()
-    //         .compact()
-    //         .with_max_level(tracing::Level::TRACE)
-    //         .finish(),
-    // );
-
     let file_url = "file://";
     let pg_role_url =
         "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable&role=test_role";
@@ -81,7 +75,6 @@ async fn test_postgres_file_drop() {
         let client = create_connection(pg_url).await.unwrap();
         let _ = client.batch_execute("DROP SCHEMA IF EXISTS public_test CASCADE");
         let ex = create_ldrs_exec(config, &ldrs_env, &rt.handle()).await;
-
         assert_eq!(ex.is_ok(), true);
 
         let users = client

@@ -1,6 +1,7 @@
 pub mod arrow_access;
 pub mod ldrs_arrow;
 pub mod ldrs_config;
+pub mod ldrs_delta;
 pub mod ldrs_env;
 pub mod ldrs_parquet;
 pub mod ldrs_postgres;

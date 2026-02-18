@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 use url::Url;
 
 use crate::types::{lua_args::LuaArgs, ColumnType};
@@ -178,7 +178,7 @@ pub async fn sf_arrow_stream(
 
         // Stream batches
         while let Some(batch_result) = stream_reader.next() {
-            debug!("Processing batch");
+            trace!("Processing batch");
             if tx
                 .blocking_send(batch_result.map_err(anyhow::Error::from))
                 .is_err()

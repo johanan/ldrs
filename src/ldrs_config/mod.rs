@@ -12,7 +12,10 @@ use tracing::{debug, info};
 use url::Url;
 
 use crate::{
-    ldrs_arrow::build_final_schema,
+    arrow_access::arrow_transforms::{
+        build_arrow_transform_strategy, ArrowColumnTransformStrategy,
+    },
+    ldrs_arrow::build_source_and_target_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
     ldrs_env::{collect_params, LdrsExecutionContext},
     ldrs_postgres::{client::check_for_role, postgres_execution::load_to_postgres},
@@ -201,23 +204,36 @@ pub async fn create_ldrs_exec(
                         ],
                     )
                     .map(|(_, v)| v.to_string()));
+                    // custom overrides from the source
                     let source_cols = src
                         .source_cols
                         .iter()
                         .map(ColumnSchema::from)
                         .collect::<Vec<_>>();
-                    let (final_cols, transforms) =
-                        build_final_schema(&schema, vec![source_cols, pg_dest.get_columns()])?;
-                    info!("Final columns: {:?}", final_cols);
-                    info!("Transforms: {:?}", transforms);
+
+                    let (src_cols, target_cols) = build_source_and_target_schema(
+                        &schema,
+                        source_cols,
+                        vec![pg_dest.get_columns()],
+                    )?;
+                    let strategies: Vec<Option<ArrowColumnTransformStrategy>> = src_cols
+                        .iter()
+                        .zip(target_cols.iter())
+                        .zip(schema.fields().iter())
+                        .map(|((source, target), field)| {
+                            build_arrow_transform_strategy(source, target, field.data_type())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    info!("Target columns: {:?}", target_cols);
+                    info!("Arrow Transforms: {:?}", strategies);
                     // collect the params that can be bound
                     let env_params = collect_params(ldrs_env);
                     let pg_commands = pg_dest.to_pg_commands();
                     load_to_postgres(
                         &pg_url,
                         &pg_commands,
-                        &final_cols,
-                        &transforms,
+                        &target_cols,
+                        &strategies,
                         &env_params,
                         role,
                         &context,

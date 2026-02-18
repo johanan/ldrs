@@ -5,8 +5,6 @@ use clap::{Args, Parser, Subcommand};
 use dotenvy::dotenv;
 use ldrs::ldrs_config::create_ldrs_exec;
 use ldrs::ldrs_env::get_all_ldrs_env_vars;
-use ldrs::ldrs_postgres::PgCommands;
-use ldrs::ldrs_postgres::{load_from_file, load_postgres_cmd};
 use ldrs::ldrs_snowflake::{SnowflakeResult, SnowflakeStrategy};
 use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
 use ldrs::path_pattern;
@@ -41,11 +39,6 @@ struct ConfigArgs {
 enum Destination {
     /// Load from a config file. All sources and destinations
     Ld(ConfigArgs),
-    /// PostgreSQL destination
-    Pg {
-        #[command(subcommand)]
-        command: PgCommands,
-    },
     /// Delta Lake destination
     Delta {
         #[command(subcommand)]
@@ -94,20 +87,6 @@ fn main() -> Result<(), anyhow::Error> {
                 let ldrs_env = get_all_ldrs_env_vars();
                 create_ldrs_exec(&config_string, &ldrs_env, &rt.handle()).await
             }
-            Destination::Pg { command } => match command {
-                PgCommands::Load(args) => {
-                    match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
-                        Ok(pg_url) => load_postgres_cmd(&args, pg_url, rt.handle().clone()).await,
-                        Err(e) => Err(e),
-                    }
-                }
-                PgCommands::Config(args) => {
-                    match std::env::var("LDRS_PG_URL").with_context(|| "LDRS_PG_URL not set") {
-                        Ok(pg_url) => load_from_file(args, pg_url, rt.handle().clone()).await,
-                        Err(e) => Err(e),
-                    }
-                }
-            },
             Destination::Delta { command } => match command {
                 DeltaCommands::Load(args) => {
                     info!("delta load with {:?}", args);

@@ -12,8 +12,10 @@ use serde_yaml::Value;
 pub struct LdrsConfig {
     #[serde(default)]
     pub src: Option<String>,
+    pub src_defaults: Option<Value>,
     #[serde(default)]
     pub dest: Option<String>,
+    pub dest_defaults: Option<Value>,
     pub tables: Vec<serde_yaml::Value>,
 }
 

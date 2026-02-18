@@ -1,3 +1,4 @@
+pub mod arrow_transforms;
 pub mod extracted_values;
 
 use std::borrow::Cow;
@@ -5,40 +6,16 @@ use std::borrow::Cow;
 use arrow::datatypes::ArrowNativeType;
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
-    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal32Array, Decimal64Array,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use bigdecimal::FromPrimitive;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use pg_bigdecimal::{BigDecimal, BigInt, PgNumeric};
 use serde_json::Value;
-
-pub fn fast_pow10(exp: i32) -> f64 {
-    match exp {
-        0 => 1.0,
-        1 => 10.0,
-        2 => 100.0,
-        3 => 1_000.0,
-        4 => 10_000.0,
-        5 => 100_000.0,
-        6 => 1_000_000.0,
-        7 => 10_000_000.0,
-        8 => 100_000_000.0,
-        9 => 1_000_000_000.0,
-        10 => 10_000_000_000.0,
-        11 => 100_000_000_000.0,
-        12 => 1_000_000_000_000.0,
-        13 => 10_000_000_000_000.0,
-        14 => 100_000_000_000_000.0,
-        15 => 1_000_000_000_000_000.0,
-        16 => 10_000_000_000_000_000.0,
-        17 => 100_000_000_000_000_000.0,
-        18 => 1_000_000_000_000_000_000.0,
-        _ => 10_f64.powi(exp),
-    }
-}
 
 macro_rules! define_column_accessor {
     ($(($variant:ident, $array_type:ty, $value_type:ty)),*) => {
@@ -52,6 +29,8 @@ macro_rules! define_column_accessor {
             TimestampMillisecond(&'a TimestampMillisecondArray, bool),
             TimestampMicrosecond(&'a TimestampMicrosecondArray, bool),
             TimestampNanosecond(&'a TimestampNanosecondArray, bool),
+            Decimal32(&'a Decimal32Array, u8, i8),
+            Decimal64(&'a Decimal64Array, u8, i8),
             Decimal128(&'a Decimal128Array, u8, i8),
             FixedSizeBinary(&'a FixedSizeBinaryArray, i32),
             Struct(&'a StructArray),
@@ -71,6 +50,10 @@ macro_rules! define_column_accessor {
                         Self::TimestampMicrosecond(array.as_primitive(), tz.is_some()),
                     DataType::Timestamp(TimeUnit::Nanosecond, tz) =>
                         Self::TimestampNanosecond(array.as_primitive(), tz.is_some()),
+                    DataType::Decimal32(precision, scale) =>
+                        Self::Decimal32(array.as_primitive(), *precision, *scale),
+                    DataType::Decimal64(precision, scale) =>
+                        Self::Decimal64(array.as_primitive(), *precision, *scale),
                     DataType::Decimal128(precision, scale) =>
                         Self::Decimal128(array.as_primitive(), *precision, *scale),
                     DataType::FixedSizeBinary(size) =>
@@ -112,60 +95,6 @@ define_column_accessor!(
 );
 
 impl<'a> TypedColumnAccessor<'a> {
-    pub fn as_int64(&self, row: usize) -> Option<i64> {
-        match self {
-            Self::Int64(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row))
-                }
-            }
-            Self::Int32(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(i64::from(arr.value(row)))
-                }
-            }
-            Self::Int16(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(i64::from(arr.value(row)))
-                }
-            }
-            Self::Int8(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(i64::from(arr.value(row)))
-                }
-            }
-            Self::Decimal128(arr, _, _) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    let value = arr.value(row);
-                    Some(value as i64)
-                }
-            }
-            Self::Utf8(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    let v = arr.value(row);
-                    v.parse::<i64>()
-                        .unwrap_or_else(|e| {
-                            panic!("Failed to parse i64 from string for row {}: {}", row, e)
-                        })
-                        .into()
-                }
-            }
-            _ => panic!("Not an Integer array"),
-        }
-    }
-
     pub fn as_serde(&self, row: usize) -> Option<Value> {
         match self {
             Self::Utf8(arr) => {
@@ -182,86 +111,6 @@ impl<'a> TypedColumnAccessor<'a> {
         }
     }
 
-    pub fn as_int32(&self, row: usize) -> Option<i32> {
-        match self {
-            Self::Int32(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row))
-                }
-            }
-            Self::Int16(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(i32::from(arr.value(row)))
-                }
-            }
-            Self::Int8(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(i32::from(arr.value(row)))
-                }
-            }
-            Self::Int64(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    let value = arr.value(row);
-                    if value < i32::MIN as i64 || value > i32::MAX as i64 {
-                        panic!("Value out of range for i32: {}", value);
-                    }
-                    Some(value as i32)
-                }
-            }
-            Self::Decimal128(arr, _, _) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    let value = arr.value(row);
-                    Some(value as i32)
-                }
-            }
-            _ => panic!("Not an Integer array"),
-        }
-    }
-
-    pub fn as_decimal128(&self, row: usize) -> Option<i128> {
-        match self {
-            Self::Decimal128(arr, _, _) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row))
-                }
-            }
-            Self::Int64(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(i128::from(arr.value(row)))
-                }
-            }
-            Self::Int32(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(i128::from(arr.value(row)))
-                }
-            }
-            Self::Int16(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(i128::from(arr.value(row)))
-                }
-            }
-            _ => panic!("Not a Decimal128 array"),
-        }
-    }
-
     pub fn as_pg_numeric(&self, row: usize, scale: i32) -> Option<PgNumeric> {
         match self {
             Self::Decimal128(arr, _, scale) => {
@@ -269,6 +118,26 @@ impl<'a> TypedColumnAccessor<'a> {
                     None
                 } else {
                     let big_int = BigInt::from_i128(arr.value(row));
+                    Some(pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
+                        BigDecimal::new(bi, (*scale).to_i64().expect("Scale failed"))
+                    })))
+                }
+            }
+            Self::Decimal64(arr, _, scale) => {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    let big_int = BigInt::from_i64(arr.value(row) as i64);
+                    Some(pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
+                        BigDecimal::new(bi, (*scale).to_i64().expect("Scale failed"))
+                    })))
+                }
+            }
+            Self::Decimal32(arr, _, scale) => {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    let big_int = BigInt::from_i64(arr.value(row) as i64);
                     Some(pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
                         BigDecimal::new(bi, (*scale).to_i64().expect("Scale failed"))
                     })))
@@ -315,70 +184,6 @@ impl<'a> TypedColumnAccessor<'a> {
                 }
             }
             _ => panic!("Not a Decimal128 or Integer array"),
-        }
-    }
-
-    pub fn as_float64(&self, row: usize, scale: Option<i32>) -> Option<f64> {
-        match self {
-            Self::Float64(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row))
-                }
-            }
-            Self::Float32(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(f64::from(arr.value(row)))
-                }
-            }
-            Self::Decimal128(arr, _, scale) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    let value = arr.value(row);
-                    Some(value as f64 / fast_pow10(*scale as i32))
-                }
-            }
-            Self::Int64(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    scale
-                        .map(|s| arr.value(row) as f64 / fast_pow10(s))
-                        .or_else(|| Some(arr.value(row) as f64))
-                }
-            }
-            Self::Int32(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    scale
-                        .map(|s| f64::from(arr.value(row)) / fast_pow10(s))
-                        .or_else(|| Some(f64::from(arr.value(row))))
-                }
-            }
-            Self::Int16(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    scale
-                        .map(|s| f64::from(arr.value(row)) / fast_pow10(s))
-                        .or_else(|| Some(f64::from(arr.value(row))))
-                }
-            }
-            Self::Int8(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    scale
-                        .map(|s| f64::from(arr.value(row)) / fast_pow10(s))
-                        .or_else(|| Some(f64::from(arr.value(row))))
-                }
-            }
-            _ => panic!("Not a Float64 or Float32 array"),
         }
     }
 
@@ -590,27 +395,5 @@ impl<'a> TypedColumnAccessor<'a> {
             Self::FixedSizeBinary(_, size) => Some(*size),
             _ => None,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-
-    #[test]
-    fn test_bigint_to_float() {
-        let arr = Arc::new(Int64Array::from(vec![100, 200, 300])) as Arc<dyn Array>;
-        let typed = TypedColumnAccessor::new(&arr);
-        assert_eq!(Some(1.00), typed.as_float64(0, Some(2)));
-        assert_eq!(Some(10.0), typed.as_float64(0, Some(1)));
-        assert_eq!(Some(100.0), typed.as_float64(0, Some(0)));
-        assert_eq!(Some(2.00), typed.as_float64(1, Some(2)));
-        assert_eq!(Some(3.00), typed.as_float64(2, Some(2)));
-
-        assert_eq!(Some(100), typed.as_int64(0));
-        assert_eq!(Some(200), typed.as_int64(1));
-        assert_eq!(Some(300), typed.as_int64(2));
     }
 }
