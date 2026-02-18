@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arrow::{
-    array::AsArray, buffer::Buffer, compute::CastOptions, datatypes::Decimal64Type,
+    array::AsArray, buffer::Buffer, compute::CastOptions, datatypes::Decimal128Type,
     util::display::FormatOptions,
 };
 use arrow_array::{
-    Array, ArrayRef, FixedSizeBinaryArray, Float64Array, Int16Array, Int32Array, Int64Array,
-    Int8Array, RecordBatch, StringArray,
+    Array, ArrayRef, Decimal32Array, Decimal64Array, FixedSizeBinaryArray, Float64Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, SchemaRef};
 
@@ -50,6 +50,11 @@ pub enum ArrowCustomTransform {
         scale: i8,
         target_type: arrow_schema::DataType,
     },
+    IntToDecimal {
+        precision: u8,
+        scale: i8,
+        target_type: arrow_schema::DataType,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,9 +92,9 @@ impl ColumnType {
             ColumnType::Double(_) => DataType::Float64,
             ColumnType::Numeric(precision, scale) => {
                 if *precision <= 9 {
-                    DataType::Int32
+                    DataType::Decimal32(*precision as u8, *scale as i8)
                 } else if *precision <= 18 {
-                    DataType::Int64
+                    DataType::Decimal64(*precision as u8, *scale as i8)
                 } else {
                     DataType::Decimal128(*precision as u8, *scale as i8)
                 }
@@ -158,16 +163,15 @@ pub fn build_arrow_transform_strategy(
                 ),
                 // numeric and the physical type is the same, nothing to do
                 ColumnType::Numeric(_, _) if source_physical == &target_physical => Ok(None),
-                // numeric and the scale is the same but different physical types
-                // let arrow cast the physical type
-                ColumnType::Numeric(_, target_s)
-                    if s == target_s
-                        && arrow::compute::can_cast_types(source_physical, &target_physical) =>
-                {
-                    Ok(Some(ArrowColumnTransformStrategy::ArrowCast {
+                // if it is int backed then we just want to tell arrow to use the int values but as decimals
+                // only works if scale is exactly the same
+                ColumnType::Numeric(p, scale) if is_int_backed && s == scale => Ok(Some(
+                    ArrowColumnTransformStrategy::Custom(ArrowCustomTransform::IntToDecimal {
+                        precision: p as u8,
+                        scale: s as i8,
                         target_type: target_physical,
-                    }))
-                }
+                    }),
+                )),
                 // we need to cast to a double so we need the scale to divide the int
                 ColumnType::Double(_) if is_int_backed => Ok(Some(
                     ArrowColumnTransformStrategy::Custom(ArrowCustomTransform::Double { scale: s }),
@@ -263,6 +267,11 @@ fn apply_custom_transform(
             scale,
             target_type,
         } => rescale_decimal_array(col, *precision, *scale, target_type),
+        ArrowCustomTransform::IntToDecimal {
+            precision,
+            scale,
+            target_type,
+        } => int_to_decimal_arrow_cast(col, *precision, *scale, target_type),
     }
 }
 
@@ -294,18 +303,85 @@ pub fn uuid_to_string_array(source: &FixedSizeBinaryArray) -> ArrayRef {
     Arc::new(result)
 }
 
+pub fn int_to_decimal_arrow_cast(
+    source: &ArrayRef,
+    precision: u8,
+    scale: i8,
+    target_type: &DataType,
+) -> Result<ArrayRef, anyhow::Error> {
+    // match on type and then tell arrow that the int array is actually a decimal array
+    // we run this unsafe as we know that the values have to fit inside of the decimal no matter the precision
+    let (intermediate_type, decimal_arr): (DataType, ArrayRef) = match source.data_type() {
+        DataType::Int8 | DataType::Int16 => {
+            let int32_arr = arrow::compute::cast(source, &DataType::Int32)?;
+            let arrow_dec = DataType::Decimal32(precision, scale);
+            let array_data = int32_arr.to_data();
+            let decimal_data = unsafe {
+                array_data
+                    .into_builder()
+                    .data_type(arrow_dec.clone())
+                    .build_unchecked()
+            };
+            (arrow_dec, Arc::new(Decimal32Array::from(decimal_data)))
+        }
+        DataType::Int32 => {
+            let arrow_dec = DataType::Decimal32(precision, scale);
+            let array_data = source.to_data();
+            let decimal_data = unsafe {
+                array_data
+                    .into_builder()
+                    .data_type(arrow_dec.clone())
+                    .build_unchecked()
+            };
+            (arrow_dec, Arc::new(Decimal32Array::from(decimal_data)))
+        }
+        DataType::Int64 => {
+            let arrow_dec = DataType::Decimal64(precision, scale);
+            let array_data = source.to_data();
+            let decimal_data = unsafe {
+                array_data
+                    .into_builder()
+                    .data_type(arrow_dec.clone())
+                    .build_unchecked()
+            };
+            (arrow_dec, Arc::new(Decimal64Array::from(decimal_data)))
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Unsupported source type for int_to_decimal: {:?}",
+                source.data_type()
+            ))
+        }
+    };
+
+    if &intermediate_type == target_type {
+        return Ok(decimal_arr);
+    }
+    // arrow cast will now take the correct action and return the correct value
+    arrow::compute::cast_with_options(
+        &decimal_arr,
+        target_type,
+        &CastOptions {
+            safe: false,
+            format_options: FormatOptions::default(),
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to cast decimal: {}", e))
+}
+
 pub fn rescale_decimal_array(
     source: &ArrayRef,
     precision: u8,
     scale: i8,
     target_type: &DataType,
 ) -> Result<ArrayRef, anyhow::Error> {
-    // Step 1: int -> Decimal with 0 maintaining the value
+    // int -> Decimal with 0 maintaining the value
+    // Decimal128 should cover all the values and precision we need
     let decimal_type = match source.data_type() {
-        DataType::Int8 => DataType::Decimal64(precision, 0),
-        DataType::Int16 => DataType::Decimal64(precision, 0),
-        DataType::Int32 => DataType::Decimal64(precision, 0),
-        DataType::Int64 => DataType::Decimal64(precision, 0),
+        DataType::Int8 => DataType::Decimal128(precision, 0),
+        DataType::Int16 => DataType::Decimal128(precision, 0),
+        DataType::Int32 => DataType::Decimal128(precision, 0),
+        DataType::Int64 => DataType::Decimal128(precision, 0),
         _ => {
             return Err(anyhow::anyhow!(
                 "Unsupported source type for rescale_decimal_array"
@@ -321,13 +397,13 @@ pub fn rescale_decimal_array(
         },
     )
     .with_context(|| format!("Failed to cast to Decimal({}, {})", precision, scale))?;
-    // Step 2: Decimal -> Decimal with the desired scale
+    // Decimal -> Decimal with the desired scale
     let rescaled = decimal_arr
-        .as_primitive::<Decimal64Type>()
+        .as_primitive::<Decimal128Type>()
         .clone()
         .with_precision_and_scale(precision, scale)?;
 
-    // Step 3: Decimal -> target
+    // Decimal -> target
     arrow::compute::cast_with_options(
         &rescaled,
         target_type,
@@ -361,8 +437,9 @@ pub fn int_to_double_array(source: &ArrayRef, scale: i32) -> Result<ArrayRef, an
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, Int32Array};
+    use arrow_array::{ArrayRef, Decimal128Array, Int32Array};
     use arrow_schema::{DataType, Field, Schema};
+    use tracing::debug;
     use uuid::Uuid;
 
     fn assert_transform(
@@ -378,6 +455,7 @@ mod tests {
             &source_physical,
         )
         .unwrap();
+        debug!("Strategy {:?}", strategy);
 
         let target_physical = target_logical.to_arrow_datatype();
 
@@ -540,5 +618,56 @@ mod tests {
                 None,
             ])),
         );
+    }
+
+    #[test_log::test]
+    fn test_decimal_to_decimal_int_source() {
+        assert_transform(
+            ColumnType::Numeric(38, 5),
+            ColumnType::Numeric(38, 5),
+            DataType::Int64,
+            Arc::new(Int64Array::from(vec![
+                Some(1234500000),
+                Some(6789000000),
+                None,
+            ])),
+            Arc::new(
+                Decimal128Array::from(vec![Some(1234500000), Some(6789000000), None])
+                    .with_data_type(DataType::Decimal128(38, 5)),
+            ),
+        )
+    }
+
+    #[test_log::test]
+    fn test_decimal_to_decimal_int_diff_scale() {
+        assert_transform(
+            ColumnType::Numeric(38, 5),
+            ColumnType::Numeric(38, 2),
+            DataType::Int64,
+            Arc::new(Int64Array::from(vec![
+                Some(1234500000),
+                Some(6789000000),
+                None,
+            ])),
+            Arc::new(
+                Decimal128Array::from(vec![Some(1234500), Some(6789000), None])
+                    .with_data_type(DataType::Decimal128(38, 2)),
+            ),
+        );
+        // now try a different precision
+        assert_transform(
+            ColumnType::Numeric(38, 5),
+            ColumnType::Numeric(18, 2),
+            DataType::Int64,
+            Arc::new(Int64Array::from(vec![
+                Some(1234500000),
+                Some(6789000000),
+                None,
+            ])),
+            Arc::new(
+                Decimal64Array::from(vec![Some(1234500), Some(6789000), None])
+                    .with_data_type(DataType::Decimal64(18, 2)),
+            ),
+        )
     }
 }

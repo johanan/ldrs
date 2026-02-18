@@ -6,17 +6,16 @@ use std::borrow::Cow;
 use arrow::datatypes::ArrowNativeType;
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
-    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal32Array, Decimal64Array,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use bigdecimal::FromPrimitive;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use pg_bigdecimal::{BigDecimal, BigInt, PgNumeric};
 use serde_json::Value;
-
-use crate::arrow_access::arrow_transforms::fast_pow10;
 
 macro_rules! define_column_accessor {
     ($(($variant:ident, $array_type:ty, $value_type:ty)),*) => {
@@ -30,6 +29,8 @@ macro_rules! define_column_accessor {
             TimestampMillisecond(&'a TimestampMillisecondArray, bool),
             TimestampMicrosecond(&'a TimestampMicrosecondArray, bool),
             TimestampNanosecond(&'a TimestampNanosecondArray, bool),
+            Decimal32(&'a Decimal32Array, u8, i8),
+            Decimal64(&'a Decimal64Array, u8, i8),
             Decimal128(&'a Decimal128Array, u8, i8),
             FixedSizeBinary(&'a FixedSizeBinaryArray, i32),
             Struct(&'a StructArray),
@@ -49,6 +50,10 @@ macro_rules! define_column_accessor {
                         Self::TimestampMicrosecond(array.as_primitive(), tz.is_some()),
                     DataType::Timestamp(TimeUnit::Nanosecond, tz) =>
                         Self::TimestampNanosecond(array.as_primitive(), tz.is_some()),
+                    DataType::Decimal32(precision, scale) =>
+                        Self::Decimal32(array.as_primitive(), *precision, *scale),
+                    DataType::Decimal64(precision, scale) =>
+                        Self::Decimal64(array.as_primitive(), *precision, *scale),
                     DataType::Decimal128(precision, scale) =>
                         Self::Decimal128(array.as_primitive(), *precision, *scale),
                     DataType::FixedSizeBinary(size) =>
@@ -113,6 +118,26 @@ impl<'a> TypedColumnAccessor<'a> {
                     None
                 } else {
                     let big_int = BigInt::from_i128(arr.value(row));
+                    Some(pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
+                        BigDecimal::new(bi, (*scale).to_i64().expect("Scale failed"))
+                    })))
+                }
+            }
+            Self::Decimal64(arr, _, scale) => {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    let big_int = BigInt::from_i64(arr.value(row) as i64);
+                    Some(pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
+                        BigDecimal::new(bi, (*scale).to_i64().expect("Scale failed"))
+                    })))
+                }
+            }
+            Self::Decimal32(arr, _, scale) => {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    let big_int = BigInt::from_i64(arr.value(row) as i64);
                     Some(pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
                         BigDecimal::new(bi, (*scale).to_i64().expect("Scale failed"))
                     })))
