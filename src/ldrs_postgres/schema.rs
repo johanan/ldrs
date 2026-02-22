@@ -2,13 +2,14 @@ use tokio_postgres::{Client, Row};
 
 use crate::types::{ColumnSchema, TimeUnit};
 
+/// Represents a column in a PostgreSQL table.
+/// uses types defined here https://www.postgresql.org/docs/current/catalog-pg-attribute.html
+/// not_null is ignored because, quoting the docs it is possibley invalid
 #[derive(Debug)]
 pub struct PostgresColumnRaw {
     column_name: String,
     pg_type: String,
     type_modifier: i32,
-    not_null: bool,
-    att_num: i16,
 }
 
 impl TryFrom<i32> for TimeUnit {
@@ -33,15 +34,11 @@ impl TryFrom<&Row> for PostgresColumnRaw {
         let column_name: &str = row.get(0);
         let pg_type: &str = row.get(1);
         let type_modifier: i32 = row.get(2);
-        let not_null: bool = row.get(3);
-        let att_num: i16 = row.get(4);
 
         Ok(PostgresColumnRaw {
             column_name: column_name.to_string(),
             pg_type: pg_type.to_string(),
             type_modifier,
-            not_null,
-            att_num,
         })
     }
 }
@@ -98,7 +95,6 @@ pub async fn query_column(
             a.attname AS column_name,
             t.typname AS pg_type,  -- Raw PG type name like 'varchar', 'timestamptz'
             a.atttypmod AS type_modifier,  -- Type modifier (length info)
-            a.attnotnull AS not_null,
             a.attnum AS att_num
            FROM pg_attribute a
         JOIN pg_type t ON a.atttypid = t.oid

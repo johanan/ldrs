@@ -1,3 +1,7 @@
+// Adding this as clippy did not like the the type name in the define_column_accessor!
+// so it complained that Boolean should have been snake_case
+#![allow(non_snake_case)]
+
 pub mod arrow_transforms;
 pub mod extracted_values;
 

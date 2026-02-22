@@ -8,8 +8,6 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
-const PG_NAMESPACE: &str = "pg";
-
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 pub struct PgCommon {
     pub name: String,
@@ -63,7 +61,7 @@ impl PgDestination {
         }
     }
 
-    pub fn get_columns(&self) -> Vec<ColumnSchema> {
+    pub fn get_columns(&self) -> Vec<ColumnSchema<'_>> {
         let cols = match self {
             PgDestination::DropReplace(common) => &common.columns,
             PgDestination::TruncateInsert(common) => &common.columns,
