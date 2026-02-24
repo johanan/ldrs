@@ -1,9 +1,10 @@
 pub mod config;
 
-use std::pin::pin;
+use std::{pin::pin, sync::Arc};
 
 use anyhow::Context;
 use arrow_array::RecordBatch;
+use arrow_schema::Schema;
 use futures::Stream;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
 use tokio::task::JoinHandle;
@@ -18,12 +19,13 @@ use crate::{
     ldrs_arrow::build_source_and_target_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
     ldrs_env::{collect_params, LdrsExecutionContext},
+    ldrs_parquet::write_parquet,
     ldrs_postgres::{client::check_for_role, postgres_execution::load_to_postgres},
     ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource},
     ldrs_storage::is_object_store_url,
     parquet_provider::builder_from_url,
     pq::get_fields,
-    storage::base_or_relative_path,
+    storage::{base_or_relative_path, ensure_trailing_slash},
     types::{ColumnSchema, ColumnSpec},
 };
 
@@ -148,7 +150,7 @@ pub async fn create_ldrs_exec(
                 let fields = get_fields(file_md.file_metadata())?;
 
                 let stream = builder.with_batch_size(1024).build()?;
-                let dest_cols = fields
+                let source_cols = fields
                     .iter()
                     .filter_map(|pq| ColumnSpec::try_from(pq).ok())
                     .collect::<Vec<_>>();
@@ -157,7 +159,7 @@ pub async fn create_ldrs_exec(
                     LdrsSrcStream {
                         schema: Some(schema),
                         stream_type: StreamType::Parquet(stream),
-                        source_cols: dest_cols,
+                        source_cols,
                         cleanup_handle: None,
                     },
                     ldrs_context,
@@ -240,6 +242,53 @@ pub async fn create_ldrs_exec(
                         src.stream_type,
                     )
                     .await
+                }
+                LdrsDestination::Pq(parq) => {
+                    let dest_value = get_dest_url(ldrs_env, &parq.name, "pq")?;
+                    let dest_value = ensure_trailing_slash(dest_value.1.as_str());
+                    let handled_filename = context
+                        .handlebars
+                        .render_template(&parq.filename, &context.context)?;
+                    let full_path = format!("{}{}", dest_value, handled_filename);
+                    let full_name = base_or_relative_path(&full_path)?;
+                    debug!("full_name: {:?}", full_name);
+
+                    let source_cols = src
+                        .source_cols
+                        .iter()
+                        .map(ColumnSchema::from)
+                        .collect::<Vec<_>>();
+
+                    let dest_cols = parq
+                        .columns
+                        .iter()
+                        .map(ColumnSchema::from)
+                        .collect::<Vec<_>>();
+
+                    let (src_cols, target_cols) =
+                        build_source_and_target_schema(&schema, source_cols, vec![dest_cols])?;
+                    let strategies: Vec<Option<ArrowColumnTransformStrategy>> = src_cols
+                        .iter()
+                        .zip(target_cols.iter())
+                        .zip(schema.fields().iter())
+                        .map(|((source, target), field)| {
+                            build_arrow_transform_strategy(source, target, field.data_type())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    info!("Target columns: {:?}", target_cols);
+                    info!("Arrow Transforms: {:?}", strategies);
+                    // create the new schema if there are any type changes
+                    let schema = if strategies.iter().any(|s| s.is_some()) {
+                        Arc::new(Schema::new(
+                            target_cols
+                                .iter()
+                                .map(|col| col.to_arrow_field())
+                                .collect::<Vec<_>>(),
+                        ))
+                    } else {
+                        schema
+                    };
+                    write_parquet(&full_name.to_string(), schema, strategies, src.stream_type).await
                 }
             },
             None => {

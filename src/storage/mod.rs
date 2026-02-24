@@ -7,6 +7,14 @@ use azure::AzureUrl;
 use object_store::{ObjectStore, ObjectStoreScheme};
 use url::{ParseError, Url};
 
+pub fn ensure_trailing_slash(url: &str) -> String {
+    if url.ends_with('/') {
+        url.to_string()
+    } else {
+        format!("{}/", url)
+    }
+}
+
 pub fn base_or_relative_path(path: &str) -> Result<Url, anyhow::Error> {
     let try_parse = Url::parse(path);
     match try_parse {

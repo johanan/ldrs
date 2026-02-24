@@ -116,8 +116,7 @@ where
                 // set it all up to write to
                 let handled_table = context
                     .handlebars
-                    .render_template(load_table, &context.context)
-                    .unwrap();
+                    .render_template(load_table, &context.context)?;
                 let pg_types = final_cols
                     .iter()
                     .map(map_col_schema_to_pg_type)

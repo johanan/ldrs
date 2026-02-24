@@ -1,6 +1,12 @@
 use futures::TryStreamExt;
 use ldrs::{
+    ldrs_config::{
+        config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource},
+        create_ldrs_exec,
+    },
     ldrs_parquet::write_parquet,
+    ldrs_snowflake::snowflake_source::{SFQuery, SFSource},
+    ldrs_storage::{FileSource, ParquetDestination},
     parquet_provider::{self},
 };
 use tracing::info;
@@ -49,8 +55,90 @@ async fn test_parquet() {
             target_path
         );
         info!("schema: {:?}", schema);
-        write_parquet(&file_path, schema, stream).await.unwrap();
+        write_parquet(&file_path, schema, Vec::new(), stream)
+            .await
+            .unwrap();
     }
 
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+/// filename for destination will need to use the pq namespace to make sure that the src does not parse it
+#[test_log::test]
+fn test_parquet_file_src_and_dest() {
+    let test_yaml = r#"
+name: public.users
+pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
+"#;
+
+    let test_value = serde_yaml::from_str(test_yaml).unwrap();
+    let config = get_parsed_config(&Some("file".into()), &Some("pq".into()), test_value).unwrap();
+    let expected_config = LdrsParsedConfig {
+        src: LdrsSource::File(FileSource {
+            name: "public.users".into(),
+            filename: None,
+        }),
+        src_prefix: "file".into(),
+        dest: LdrsDestination::Pq(ParquetDestination {
+            name: "public.users".into(),
+            filename: "tests/test_data/parquet_writes/public.users.written.snappy.parquet".into(),
+            columns: Vec::new(),
+        }),
+        dest_prefix: "pq".into(),
+    };
+    assert_eq!(config, expected_config);
+
+    // when the source is not a file we can use filename
+    let sf_yaml = r#"
+name: public.users
+sql: select * from users
+filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
+"#;
+
+    let test_value = serde_yaml::from_str(sf_yaml).unwrap();
+    let config = get_parsed_config(&Some("sf".into()), &Some("pq".into()), test_value).unwrap();
+    let expected_config = LdrsParsedConfig {
+        src: LdrsSource::SF(SFSource::Query(SFQuery {
+            name: "public.users".into(),
+            sql: "select * from users".into(),
+            param_keys: None,
+        })),
+        src_prefix: "sf".into(),
+        dest: LdrsDestination::Pq(ParquetDestination {
+            name: "public.users".into(),
+            filename: "tests/test_data/parquet_writes/public.users.written.snappy.parquet".into(),
+            columns: Vec::new(),
+        }),
+        dest_prefix: "pq".into(),
+    };
+    assert_eq!(config, expected_config);
+}
+
+#[tokio::test]
+#[test_log::test]
+async fn test_parquet_full_round_trip() {
+    let config = r#"
+src: file
+dest: pq
+
+tables:
+  - name: public_test.users
+    filename: tests/test_data/public.users/public.users.snappy.parquet
+    pq.filename: tests/test_data/parquet_writes/{{ name }}_roundtrip.snappy.parquet
+"#;
+
+    let file_url = "file://";
+    let pq_url = "file://";
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), file_url.to_string()),
+        ("LDRS_DEST".to_string(), pq_url.to_string()),
+    ];
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let ex = create_ldrs_exec(config, &ldrs_env, &rt.handle()).await;
+    ex.unwrap();
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }

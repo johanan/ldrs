@@ -1,7 +1,7 @@
 use crate::{
     ldrs_postgres::postgres_destination::{from_serde_yaml, PgDestination},
     ldrs_snowflake::snowflake_source::{from_serde_yaml as from_sf_serde_yaml, SFSource},
-    ldrs_storage::FileSource,
+    ldrs_storage::{FileSource, ParquetDestination},
 };
 
 use anyhow::Context;
@@ -19,18 +19,19 @@ pub struct LdrsConfig {
     pub tables: Vec<serde_yaml::Value>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum LdrsSource {
     File(FileSource),
     SF(SFSource),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum LdrsDestination {
     Pg(PgDestination),
+    Pq(ParquetDestination),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct LdrsParsedConfig {
     pub src: LdrsSource,
     pub src_prefix: String,
@@ -96,6 +97,10 @@ pub fn get_parsed_config(
                 .with_context(|| format!("failed to parse pg destination: {}", dest))
                 .or_else(|_| from_serde_yaml(&dest_value, Some(&dest)))?;
             Ok(LdrsDestination::Pg(parsed))
+        }
+        "pq" => {
+            let parsed = ParquetDestination::try_from(&dest_value)?;
+            Ok(LdrsDestination::Pq(parsed))
         }
         _ => Err(anyhow::Error::msg("unsupported dest type")),
     }?;
