@@ -1,7 +1,7 @@
 use futures::TryStreamExt;
 use ldrs::{
     ldrs_config::{
-        config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource},
+        config::{get_parsed_config, LdrsDestination, LdrsParsedConfig, LdrsSource},
         create_ldrs_exec,
     },
     ldrs_parquet::write_parquet,
@@ -72,7 +72,14 @@ pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
 "#;
 
     let test_value = serde_yaml::from_str(test_yaml).unwrap();
-    let config = get_parsed_config(&Some("file".into()), &Some("pq".into()), test_value).unwrap();
+    let config = get_parsed_config(
+        &Some("file".into()),
+        &Some("pq".into()),
+        &None,
+        &None,
+        test_value,
+    )
+    .unwrap();
     let expected_config = LdrsParsedConfig {
         src: LdrsSource::File(FileSource {
             name: "public.users".into(),
@@ -96,7 +103,14 @@ filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
 "#;
 
     let test_value = serde_yaml::from_str(sf_yaml).unwrap();
-    let config = get_parsed_config(&Some("sf".into()), &Some("pq".into()), test_value).unwrap();
+    let config = get_parsed_config(
+        &Some("sf".into()),
+        &Some("pq".into()),
+        &None,
+        &None,
+        test_value,
+    )
+    .unwrap();
     let expected_config = LdrsParsedConfig {
         src: LdrsSource::SF(SFSource::Query(SFQuery {
             name: "public.users".into(),
@@ -120,11 +134,14 @@ async fn test_parquet_full_round_trip() {
     let config = r#"
 src: file
 dest: pq
+src_defaults:
+  filename: tests/test_data/{{ name }}/{{ name }}.snappy.parquet
+dest_defaults:
+  pq.filename: tests/test_data/parquet_writes/{{ name }}_roundtrip.snappy.parquet
 
 tables:
-  - name: public_test.users
-    filename: tests/test_data/public.users/public.users.snappy.parquet
-    pq.filename: tests/test_data/parquet_writes/{{ name }}_roundtrip.snappy.parquet
+  - name: public.users
+  - name: public.numbers
 "#;
 
     let file_url = "file://";
@@ -138,7 +155,24 @@ tables:
         .enable_all()
         .build()
         .unwrap();
-    let ex = create_ldrs_exec(config, &ldrs_env, &rt.handle()).await;
-    ex.unwrap();
+    let expected_files = vec![
+        "tests/test_data/parquet_writes/public.users_roundtrip.snappy.parquet",
+        "tests/test_data/parquet_writes/public.numbers_roundtrip.snappy.parquet",
+    ];
+    // delete before the test
+    for file in &expected_files {
+        let _ = std::fs::remove_file(file);
+    }
+    let _ = create_ldrs_exec(config, &ldrs_env, &rt.handle())
+        .await
+        .unwrap();
+    // ensure the expected files exist
+    for file in &expected_files {
+        assert!(
+            std::path::Path::new(file).exists(),
+            "expected file not found: {}",
+            file
+        );
+    }
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }

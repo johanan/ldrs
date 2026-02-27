@@ -39,9 +39,23 @@ pub struct LdrsParsedConfig {
     pub dest_prefix: String,
 }
 
+fn merge_with_defaults(defaults: &Value, specific: Value) -> Value {
+    match (defaults, specific) {
+        (Value::Mapping(def_map), Value::Mapping(mut spec_map)) => {
+            for (k, v) in def_map {
+                spec_map.entry(k.clone()).or_insert(v.clone());
+            }
+            Value::Mapping(spec_map)
+        }
+        (_, specific) => specific,
+    }
+}
+
 pub fn get_parsed_config(
     src_default: &Option<String>,
     dest_default: &Option<String>,
+    src_default_value: &Option<Value>,
+    dest_default_value: &Option<Value>,
     value: Value,
 ) -> Result<LdrsParsedConfig, anyhow::Error> {
     // first see if we have a src in the yaml value, that overrides
@@ -64,7 +78,12 @@ pub fn get_parsed_config(
     // get the prefix or the whole value
     // and then insert it into the value and then parse it
     let src_prefix = src.split('.').next().unwrap_or(&src);
-    let mut src_value = value.clone();
+
+    let dest_base = value.clone();
+    let mut src_value = match src_default_value {
+        Some(defaults) => merge_with_defaults(&defaults, value),
+        None => value,
+    };
     if let Value::Mapping(ref mut src_map) = src_value {
         src_map.insert(Value::String("src".to_string()), Value::String(src.clone()));
     }
@@ -84,7 +103,10 @@ pub fn get_parsed_config(
     }?;
 
     let dest_prefix = dest.split('.').next().unwrap_or(&dest);
-    let mut dest_value = value.clone();
+    let mut dest_value = match dest_default_value {
+        Some(defaults) => merge_with_defaults(&defaults, dest_base),
+        None => dest_base,
+    };
     if let Value::Mapping(ref mut dest_map) = dest_value {
         dest_map.insert(
             Value::String("dest".to_string()),
@@ -139,7 +161,7 @@ tables:
         let config: LdrsConfig = serde_yaml::from_str(config_yaml).unwrap();
         // parse each table
         for table in config.tables {
-            let parsed = get_parsed_config(&config.src, &config.dest, table);
+            let parsed = get_parsed_config(&config.src, &config.dest, &None, &None, table);
             println!("{:?}", parsed);
         }
     }

@@ -54,7 +54,7 @@ impl<'a> TryFrom<&'a PostgresColumnRaw> for ColumnSchema<'a> {
             "int4" => Ok(ColumnSchema::Integer(col_name)),
             "int8" => Ok(ColumnSchema::BigInt(col_name)),
             "float4" => Ok(ColumnSchema::Real(col_name)),
-            "float8" => Ok(ColumnSchema::Double(col_name, None)),
+            "float8" => Ok(ColumnSchema::Double(col_name)),
             "numeric" => {
                 let precision = ((raw.type_modifier - 4) >> 16) & 65535;
                 let scale = (raw.type_modifier - 4) & 65535;
@@ -157,7 +157,7 @@ mod tests {
         assert!(col_schema[1] == ColumnSchema::Integer("integer_value"));
         assert!(col_schema[2] == ColumnSchema::BigInt("bigint_value"));
         assert!(col_schema[3] == ColumnSchema::Numeric("decimal_value", 38, 15));
-        assert!(col_schema[4] == ColumnSchema::Double("double_value", None));
+        assert!(col_schema[4] == ColumnSchema::Double("double_value"));
         assert!(col_schema[5] == ColumnSchema::Real("float_value"));
 
         // query for the users table

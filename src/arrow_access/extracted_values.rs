@@ -61,7 +61,7 @@ impl<'a> ColumnConverter<'a> {
             ColumnSchema::Boolean(_) => ExtractionStrategy::Boolean,
             ColumnSchema::BigInt(_) => ExtractionStrategy::BigInt,
             ColumnSchema::Integer(_) => ExtractionStrategy::Integer,
-            ColumnSchema::Double(_, _) => ExtractionStrategy::Double,
+            ColumnSchema::Double(_) => ExtractionStrategy::Double,
             ColumnSchema::Real(_) => ExtractionStrategy::Real,
             ColumnSchema::Text(_) | ColumnSchema::Varchar(_, _) => ExtractionStrategy::Text,
             ColumnSchema::Numeric(_, _, scale) => ExtractionStrategy::Numeric { scale: *scale },

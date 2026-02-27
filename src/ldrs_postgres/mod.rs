@@ -14,7 +14,7 @@ pub fn map_col_schema_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
         ColumnSchema::SmallInt(_) => postgres_types::Type::INT2,
         ColumnSchema::BigInt(_) => postgres_types::Type::INT8,
         ColumnSchema::Boolean(_) => postgres_types::Type::BOOL,
-        ColumnSchema::Double(_, _) => postgres_types::Type::FLOAT8,
+        ColumnSchema::Double(_) => postgres_types::Type::FLOAT8,
         ColumnSchema::Integer(_) => postgres_types::Type::INT4,
         ColumnSchema::Jsonb(_) => postgres_types::Type::JSONB,
         ColumnSchema::Numeric(_, _, _) => postgres_types::Type::NUMERIC,

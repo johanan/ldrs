@@ -363,7 +363,7 @@ fn param_tosql<'a>(
                 .parse::<i32>()
                 .map(|v| Box::new(v) as Box<dyn ToSql + Sync>)
                 .map_err(|e| anyhow::anyhow!("Failed to parse Int: {}", e)),
-            ColumnType::Double(_) => value
+            ColumnType::Double => value
                 .parse::<f64>()
                 .map(|v| Box::new(v) as Box<dyn ToSql + Sync>)
                 .map_err(|e| anyhow::anyhow!("Failed to parse Float: {}", e)),
