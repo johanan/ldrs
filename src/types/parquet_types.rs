@@ -1,6 +1,4 @@
-use crate::types::{ColumnSchema, TimeUnit};
-use parquet::basic::LogicalType;
-use parquet::schema::types::Type::{GroupType, PrimitiveType};
+use crate::types::TimeUnit;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -58,21 +56,22 @@ impl From<parquet::basic::Type> for ParquetPhysicalType {
     }
 }
 
-impl From<parquet::basic::LogicalType> for ParquetLogicalType {
-    fn from(logical_type: parquet::basic::LogicalType) -> Self {
+impl From<&parquet::basic::LogicalType> for ParquetLogicalType {
+    fn from(logical_type: &parquet::basic::LogicalType) -> Self {
         use parquet::basic::LogicalType;
 
         match logical_type {
             LogicalType::String => ParquetLogicalType::String,
-            LogicalType::Decimal { scale, precision } => {
-                ParquetLogicalType::Decimal { precision, scale }
-            }
+            LogicalType::Decimal { scale, precision } => ParquetLogicalType::Decimal {
+                precision: *precision,
+                scale: *scale,
+            },
             LogicalType::Timestamp {
                 is_adjusted_to_u_t_c,
                 unit,
             } => ParquetLogicalType::Timestamp {
-                unit: TimeUnit::from(&unit),
-                is_utc: is_adjusted_to_u_t_c,
+                unit: TimeUnit::from(unit),
+                is_utc: *is_adjusted_to_u_t_c,
             },
             LogicalType::Uuid => ParquetLogicalType::Uuid,
             LogicalType::Json => ParquetLogicalType::Json,
@@ -90,7 +89,7 @@ impl<'a> From<&'a parquet::schema::types::Type> for ParquetColumn<'a> {
                 let name = pq_field.name();
                 let physical_type = ParquetPhysicalType::from(pq_field.get_physical_type());
                 let logical_type = basic_info
-                    .logical_type()
+                    .logical_type_ref()
                     .map(|lt| ParquetLogicalType::from(lt));
                 let repetition = format!("{:?}", basic_info.repetition());
 

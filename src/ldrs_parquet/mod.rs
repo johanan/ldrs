@@ -10,6 +10,7 @@ use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use std::pin::pin;
 use std::sync::Arc;
 
+use crate::arrow_access::arrow_transforms::{transform_batch, ArrowColumnTransformStrategy};
 use crate::storage::StorageProvider;
 use crate::types::{ColumnSchema, ColumnSpec, TimeUnit};
 
@@ -46,7 +47,7 @@ impl<'a> TryFrom<&'a Arc<parquet::schema::types::Type>> for ColumnSchema<'a> {
                     }
                     _ => match field.get_physical_type() {
                         parquet::basic::Type::FLOAT => ColumnSchema::Real(name),
-                        parquet::basic::Type::DOUBLE => ColumnSchema::Double(name, None),
+                        parquet::basic::Type::DOUBLE => ColumnSchema::Double(name),
                         parquet::basic::Type::INT32 => ColumnSchema::Integer(name),
                         parquet::basic::Type::INT64 => ColumnSchema::BigInt(name),
                         parquet::basic::Type::BOOLEAN => ColumnSchema::Boolean(name),
@@ -114,11 +115,19 @@ impl TryFrom<&Arc<parquet::schema::types::Type>> for ColumnSpec {
 pub async fn write_parquet<S>(
     file_path: &str,
     schema: SchemaRef,
+    transforms: Vec<Option<ArrowColumnTransformStrategy>>,
     stream: S,
 ) -> Result<(), anyhow::Error>
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
+    // determine if we need to transform the batches
+    let transform_plan = if transforms.iter().any(|s| s.is_some()) {
+        Some(transforms)
+    } else {
+        None
+    };
+
     let storage = StorageProvider::try_from_string(file_path)?;
     let (store, path) = storage.get_store_and_path()?;
     let parq_writer = ParquetObjectWriter::new(store, path);
@@ -126,13 +135,18 @@ where
         .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
         .set_compression(parquet::basic::Compression::SNAPPY)
         .build();
-    let mut writer = AsyncArrowWriter::try_new(parq_writer, schema, Some(writer_props))?;
+    let mut writer = AsyncArrowWriter::try_new(parq_writer, schema.clone(), Some(writer_props))?;
+
     // start reading the stream and writing to the parquet file
     let mut pinned_stream = pin!(stream);
     while let Some(batch) = pinned_stream.next().await {
-        writer.write(&batch?).await?;
+        let batch = batch?;
+        let batch = match &transform_plan {
+            Some(plan) => transform_batch(&batch, &plan, schema.clone())?,
+            None => batch,
+        };
+        writer.write(&batch).await?;
     }
-    let metadata = writer.close().await?;
-    println!("Metadata: {:?}", metadata);
+    let _ = writer.close().await?;
     Ok(())
 }

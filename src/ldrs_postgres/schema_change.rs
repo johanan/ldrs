@@ -14,7 +14,7 @@ pub fn map_columnschema_to_pg_ddl(pq: &ColumnSchema) -> String {
         ColumnSchema::SmallInt(name) => format!("{} smallint", name),
         ColumnSchema::BigInt(name) => format!("{} bigint", name),
         ColumnSchema::Boolean(name) => format!("{} boolean", name),
-        ColumnSchema::Double(name, _) => format!("{} double precision", name),
+        ColumnSchema::Double(name) => format!("{} double precision", name),
         ColumnSchema::Integer(name) => format!("{} integer", name),
         ColumnSchema::Jsonb(name) => format!("{} jsonb", name),
         ColumnSchema::Numeric(name, precision, scale) => {
@@ -52,7 +52,7 @@ mod tests {
             "is_active boolean"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Double("price", None)),
+            map_columnschema_to_pg_ddl(&ColumnSchema::Double("price")),
             "price double precision"
         );
         assert_eq!(

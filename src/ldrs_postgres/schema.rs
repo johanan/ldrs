@@ -2,13 +2,14 @@ use tokio_postgres::{Client, Row};
 
 use crate::types::{ColumnSchema, TimeUnit};
 
+/// Represents a column in a PostgreSQL table.
+/// uses types defined here https://www.postgresql.org/docs/current/catalog-pg-attribute.html
+/// not_null is ignored because, quoting the docs it is possibley invalid
 #[derive(Debug)]
 pub struct PostgresColumnRaw {
     column_name: String,
     pg_type: String,
     type_modifier: i32,
-    not_null: bool,
-    att_num: i16,
 }
 
 impl TryFrom<i32> for TimeUnit {
@@ -33,15 +34,11 @@ impl TryFrom<&Row> for PostgresColumnRaw {
         let column_name: &str = row.get(0);
         let pg_type: &str = row.get(1);
         let type_modifier: i32 = row.get(2);
-        let not_null: bool = row.get(3);
-        let att_num: i16 = row.get(4);
 
         Ok(PostgresColumnRaw {
             column_name: column_name.to_string(),
             pg_type: pg_type.to_string(),
             type_modifier,
-            not_null,
-            att_num,
         })
     }
 }
@@ -57,7 +54,7 @@ impl<'a> TryFrom<&'a PostgresColumnRaw> for ColumnSchema<'a> {
             "int4" => Ok(ColumnSchema::Integer(col_name)),
             "int8" => Ok(ColumnSchema::BigInt(col_name)),
             "float4" => Ok(ColumnSchema::Real(col_name)),
-            "float8" => Ok(ColumnSchema::Double(col_name, None)),
+            "float8" => Ok(ColumnSchema::Double(col_name)),
             "numeric" => {
                 let precision = ((raw.type_modifier - 4) >> 16) & 65535;
                 let scale = (raw.type_modifier - 4) & 65535;
@@ -98,7 +95,6 @@ pub async fn query_column(
             a.attname AS column_name,
             t.typname AS pg_type,  -- Raw PG type name like 'varchar', 'timestamptz'
             a.atttypmod AS type_modifier,  -- Type modifier (length info)
-            a.attnotnull AS not_null,
             a.attnum AS att_num
            FROM pg_attribute a
         JOIN pg_type t ON a.atttypid = t.oid
@@ -161,7 +157,7 @@ mod tests {
         assert!(col_schema[1] == ColumnSchema::Integer("integer_value"));
         assert!(col_schema[2] == ColumnSchema::BigInt("bigint_value"));
         assert!(col_schema[3] == ColumnSchema::Numeric("decimal_value", 38, 15));
-        assert!(col_schema[4] == ColumnSchema::Double("double_value", None));
+        assert!(col_schema[4] == ColumnSchema::Double("double_value"));
         assert!(col_schema[5] == ColumnSchema::Real("float_value"));
 
         // query for the users table

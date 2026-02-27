@@ -10,6 +10,17 @@ tables:
     filename: tests/test_data/public.users/public.users.snappy.parquet
     post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
 ",
+    // test the defaults
+    "
+dest: pg.drop_replace
+src: file
+src_defaults:
+  filename: tests/test_data/public.users/public.{{ table }}.snappy.parquet
+
+tables:
+- name: public_test.users
+  post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
+",
     // test without src or dest to see if the defaults work
     "
 tables:

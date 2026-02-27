@@ -1,9 +1,4 @@
-use parquet::basic::LogicalType;
-use parquet::file::metadata::FileMetaData;
-use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use std::sync::Arc;
-
-use crate::types::{ColumnDefintion, ColumnSchema, TimeUnit};
 
 pub fn get_fields(
     metadata: &parquet::file::metadata::FileMetaData,

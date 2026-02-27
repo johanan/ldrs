@@ -1,7 +1,7 @@
 use crate::{
     ldrs_postgres::postgres_destination::{from_serde_yaml, PgDestination},
     ldrs_snowflake::snowflake_source::{from_serde_yaml as from_sf_serde_yaml, SFSource},
-    ldrs_storage::FileSource,
+    ldrs_storage::{FileSource, ParquetDestination},
 };
 
 use anyhow::Context;
@@ -19,18 +19,19 @@ pub struct LdrsConfig {
     pub tables: Vec<serde_yaml::Value>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum LdrsSource {
     File(FileSource),
     SF(SFSource),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum LdrsDestination {
     Pg(PgDestination),
+    Pq(ParquetDestination),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct LdrsParsedConfig {
     pub src: LdrsSource,
     pub src_prefix: String,
@@ -38,9 +39,23 @@ pub struct LdrsParsedConfig {
     pub dest_prefix: String,
 }
 
+fn merge_with_defaults(defaults: &Value, specific: Value) -> Value {
+    match (defaults, specific) {
+        (Value::Mapping(def_map), Value::Mapping(mut spec_map)) => {
+            for (k, v) in def_map {
+                spec_map.entry(k.clone()).or_insert(v.clone());
+            }
+            Value::Mapping(spec_map)
+        }
+        (_, specific) => specific,
+    }
+}
+
 pub fn get_parsed_config(
     src_default: &Option<String>,
     dest_default: &Option<String>,
+    src_default_value: &Option<Value>,
+    dest_default_value: &Option<Value>,
     value: Value,
 ) -> Result<LdrsParsedConfig, anyhow::Error> {
     // first see if we have a src in the yaml value, that overrides
@@ -63,7 +78,12 @@ pub fn get_parsed_config(
     // get the prefix or the whole value
     // and then insert it into the value and then parse it
     let src_prefix = src.split('.').next().unwrap_or(&src);
-    let mut src_value = value.clone();
+
+    let dest_base = value.clone();
+    let mut src_value = match src_default_value {
+        Some(defaults) => merge_with_defaults(&defaults, value),
+        None => value,
+    };
     if let Value::Mapping(ref mut src_map) = src_value {
         src_map.insert(Value::String("src".to_string()), Value::String(src.clone()));
     }
@@ -83,7 +103,10 @@ pub fn get_parsed_config(
     }?;
 
     let dest_prefix = dest.split('.').next().unwrap_or(&dest);
-    let mut dest_value = value.clone();
+    let mut dest_value = match dest_default_value {
+        Some(defaults) => merge_with_defaults(&defaults, dest_base),
+        None => dest_base,
+    };
     if let Value::Mapping(ref mut dest_map) = dest_value {
         dest_map.insert(
             Value::String("dest".to_string()),
@@ -96,6 +119,10 @@ pub fn get_parsed_config(
                 .with_context(|| format!("failed to parse pg destination: {}", dest))
                 .or_else(|_| from_serde_yaml(&dest_value, Some(&dest)))?;
             Ok(LdrsDestination::Pg(parsed))
+        }
+        "pq" => {
+            let parsed = ParquetDestination::try_from(&dest_value)?;
+            Ok(LdrsDestination::Pq(parsed))
         }
         _ => Err(anyhow::Error::msg("unsupported dest type")),
     }?;
@@ -134,7 +161,7 @@ tables:
         let config: LdrsConfig = serde_yaml::from_str(config_yaml).unwrap();
         // parse each table
         for table in config.tables {
-            let parsed = get_parsed_config(&config.src, &config.dest, table);
+            let parsed = get_parsed_config(&config.src, &config.dest, &None, &None, table);
             println!("{:?}", parsed);
         }
     }

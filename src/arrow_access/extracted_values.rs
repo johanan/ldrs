@@ -61,9 +61,13 @@ impl<'a> ColumnConverter<'a> {
             ColumnSchema::Boolean(_) => ExtractionStrategy::Boolean,
             ColumnSchema::BigInt(_) => ExtractionStrategy::BigInt,
             ColumnSchema::Integer(_) => ExtractionStrategy::Integer,
-            ColumnSchema::Double(_, _) => ExtractionStrategy::Double,
+            ColumnSchema::Double(_) => ExtractionStrategy::Double,
+            ColumnSchema::Real(_) => ExtractionStrategy::Real,
             ColumnSchema::Text(_) | ColumnSchema::Varchar(_, _) => ExtractionStrategy::Text,
             ColumnSchema::Numeric(_, _, scale) => ExtractionStrategy::Numeric { scale: *scale },
+            ColumnSchema::Timestamp(_, crate::types::TimeUnit::Second) => {
+                ExtractionStrategy::TimestampSeconds
+            }
             ColumnSchema::Timestamp(_, crate::types::TimeUnit::Millis) => {
                 ExtractionStrategy::TimestampMillis
             }
@@ -72,6 +76,9 @@ impl<'a> ColumnConverter<'a> {
             }
             ColumnSchema::Timestamp(_, crate::types::TimeUnit::Nanos) => {
                 ExtractionStrategy::TimestampNanos
+            }
+            ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Second) => {
+                ExtractionStrategy::TimestampTzSeconds
             }
             ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Millis) => {
                 ExtractionStrategy::TimestampTzMillis

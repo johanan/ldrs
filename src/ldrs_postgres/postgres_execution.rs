@@ -116,8 +116,7 @@ where
                 // set it all up to write to
                 let handled_table = context
                     .handlebars
-                    .render_template(load_table, &context.context)
-                    .unwrap();
+                    .render_template(load_table, &context.context)?;
                 let pg_types = final_cols
                     .iter()
                     .map(map_col_schema_to_pg_type)
@@ -364,7 +363,7 @@ fn param_tosql<'a>(
                 .parse::<i32>()
                 .map(|v| Box::new(v) as Box<dyn ToSql + Sync>)
                 .map_err(|e| anyhow::anyhow!("Failed to parse Int: {}", e)),
-            ColumnType::Double(_) => value
+            ColumnType::Double => value
                 .parse::<f64>()
                 .map(|v| Box::new(v) as Box<dyn ToSql + Sync>)
                 .map_err(|e| anyhow::anyhow!("Failed to parse Float: {}", e)),

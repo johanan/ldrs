@@ -65,10 +65,7 @@ pub enum ColumnSchema<'a> {
     Jsonb(&'a str),
     Numeric(&'a str, i32, i32),
     Real(&'a str),
-    // I know doubles do not have scale, but there are situations
-    // where we want a double and the underlying arrow is an integer
-    // we need the source scale to properly convert it to double
-    Double(&'a str, Option<i32>),
+    Double(&'a str),
     SmallInt(&'a str),
     Integer(&'a str),
     BigInt(&'a str),
@@ -90,7 +87,7 @@ impl<'a> ColumnSchema<'a> {
             ColumnSchema::Jsonb(name) => name,
             ColumnSchema::Numeric(name, _, _) => name,
             ColumnSchema::Real(name) => name,
-            ColumnSchema::Double(name, _) => name,
+            ColumnSchema::Double(name) => name,
             ColumnSchema::SmallInt(name) => name,
             ColumnSchema::Integer(name) => name,
             ColumnSchema::BigInt(name) => name,
@@ -122,7 +119,7 @@ pub enum ColumnType {
     #[serde(alias = "REAL")]
     Real,
     #[serde(alias = "DOUBLE")]
-    Double(Option<i32>),
+    Double,
     #[serde(alias = "SMALLINT")]
     SmallInt,
     #[serde(alias = "INTEGER")]
@@ -152,7 +149,7 @@ impl From<&ColumnSchema<'_>> for ColumnType {
             ColumnSchema::Jsonb(_) => ColumnType::Jsonb,
             ColumnSchema::Numeric(_, p, s) => ColumnType::Numeric(*p, *s),
             ColumnSchema::Real(_) => ColumnType::Real,
-            ColumnSchema::Double(_, scale) => ColumnType::Double(*scale),
+            ColumnSchema::Double(_) => ColumnType::Double,
             ColumnSchema::SmallInt(_) => ColumnType::SmallInt,
             ColumnSchema::Integer(_) => ColumnType::Integer,
             ColumnSchema::BigInt(_) => ColumnType::BigInt,
@@ -179,7 +176,7 @@ impl TryFrom<&str> for ColumnType {
             "TIMESTAMP" => Ok(ColumnType::Timestamp(TimeUnit::Micros)),
             "TIMESTAMPTZ" => Ok(ColumnType::TimestampTz(TimeUnit::Micros)),
             "REAL" | "FLOAT4" => Ok(ColumnType::Real),
-            "DOUBLE" | "FLOAT8" => Ok(ColumnType::Double(None)),
+            "DOUBLE" | "FLOAT8" => Ok(ColumnType::Double),
             "DATE" => Ok(ColumnType::Date),
             "JSONB" => Ok(ColumnType::Jsonb),
             "BYTEA" => Ok(ColumnType::Bytea),
@@ -280,7 +277,7 @@ impl<'a> From<&'a ColumnSpec> for ColumnSchema<'a> {
             ColumnSpec::BigInt { name } => ColumnSchema::BigInt(name),
             ColumnSpec::SmallInt { name } => ColumnSchema::SmallInt(name),
             ColumnSpec::Real { name } => ColumnSchema::Real(name),
-            ColumnSpec::Double { name } => ColumnSchema::Double(name, None),
+            ColumnSpec::Double { name } => ColumnSchema::Double(name),
             ColumnSpec::Date { name } => ColumnSchema::Date(name),
             ColumnSpec::Jsonb { name } => ColumnSchema::Jsonb(name),
             ColumnSpec::Custom { name, ddl_type } => ColumnSchema::Custom(name, ddl_type.clone()),

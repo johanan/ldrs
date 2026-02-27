@@ -1,9 +1,10 @@
 pub mod config;
 
-use std::pin::pin;
+use std::{pin::pin, sync::Arc};
 
 use anyhow::Context;
 use arrow_array::RecordBatch;
+use arrow_schema::{Schema, SchemaRef};
 use futures::Stream;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
 use tokio::task::JoinHandle;
@@ -13,17 +14,18 @@ use url::Url;
 
 use crate::{
     arrow_access::arrow_transforms::{
-        build_arrow_transform_strategy, ArrowColumnTransformStrategy,
+        build_arrow_transform_strategy, map_arrow_metadata, ArrowColumnTransformStrategy,
     },
     ldrs_arrow::build_source_and_target_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
-    ldrs_env::{collect_params, LdrsExecutionContext},
+    ldrs_env::{collect_params, collect_vars_by_prefix, setup_handlebars, LdrsExecutionContext},
+    ldrs_parquet::write_parquet,
     ldrs_postgres::{client::check_for_role, postgres_execution::load_to_postgres},
     ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource},
     ldrs_storage::is_object_store_url,
     parquet_provider::builder_from_url,
     pq::get_fields,
-    storage::base_or_relative_path,
+    storage::{base_or_relative_path, ensure_trailing_slash},
     types::{ColumnSchema, ColumnSpec},
 };
 
@@ -106,6 +108,35 @@ pub fn infer_env_type(env_type: &str, vars: &[(String, String)]) -> Option<Strin
     }
 }
 
+fn column_helper<'a>(
+    source_cols: &'a Vec<ColumnSpec>,
+    dest_cols: Vec<ColumnSchema<'a>>,
+    schema: &'a SchemaRef,
+) -> Result<
+    (
+        Vec<ColumnSchema<'a>>,
+        Vec<std::option::Option<ArrowColumnTransformStrategy>>,
+    ),
+    anyhow::Error,
+> {
+    let source_cols = source_cols
+        .iter()
+        .map(ColumnSchema::from)
+        .collect::<Vec<_>>();
+
+    let (src_cols, target_cols) =
+        build_source_and_target_schema(schema, source_cols, vec![dest_cols])?;
+    let strategies: Vec<Option<ArrowColumnTransformStrategy>> = src_cols
+        .iter()
+        .zip(target_cols.iter())
+        .zip(schema.fields().iter())
+        .map(|((source, target), field)| {
+            build_arrow_transform_strategy(source, target, field.data_type())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((target_cols, strategies))
+}
+
 pub async fn create_ldrs_exec(
     config_string: &str,
     ldrs_env: &[(String, String)],
@@ -120,13 +151,23 @@ pub async fn create_ldrs_exec(
     let table_tasks = config
         .tables
         .into_iter()
-        .map(|t| get_parsed_config(&src_default, &dest_default, t))
+        .map(|t| {
+            get_parsed_config(
+                &src_default,
+                &dest_default,
+                &config.src_defaults,
+                &config.dest_defaults,
+                t,
+            )
+        })
         .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
     // get all possible environment params
     let env_params = collect_params(ldrs_env);
     debug!("Environment Params: {:?}", env_params);
-    let handlebars = handlebars::Handlebars::new();
+    let mut handlebars = handlebars::Handlebars::new();
+    setup_handlebars(&mut handlebars);
+    let handlebars_vars = collect_vars_by_prefix(ldrs_env, "TEMPL");
 
     let total_tasks = table_tasks.len();
     for (i, task) in table_tasks.into_iter().enumerate() {
@@ -135,10 +176,17 @@ pub async fn create_ldrs_exec(
         info!("Running task: {}/{}", i + 1, total_tasks);
         let (src, context) = match task.src {
             LdrsSource::File(file) => {
+                let ldrs_context =
+                    LdrsExecutionContext::try_new(&file.name, &handlebars, &handlebars_vars)?;
                 // if the filename is not provided, use the name as the filename
                 let file_name = file.filename.as_deref().unwrap_or(file.name.as_str());
                 let src_value = get_src_url(ldrs_env, &file.name, "file")?;
-                let joined = format!("{}{}", src_value.1.as_str(), file_name);
+                // render the filename if it has tokens in the path
+                let joined = ldrs_context.render_template(&format!(
+                    "{}{}",
+                    src_value.1.as_str(),
+                    file_name
+                ))?;
                 let src_url = base_or_relative_path(&joined)?;
                 let builder = builder_from_url(src_url.clone(), cloud_io_rt.clone()).await?;
 
@@ -148,16 +196,15 @@ pub async fn create_ldrs_exec(
                 let fields = get_fields(file_md.file_metadata())?;
 
                 let stream = builder.with_batch_size(1024).build()?;
-                let dest_cols = fields
+                let source_cols = fields
                     .iter()
                     .filter_map(|pq| ColumnSpec::try_from(pq).ok())
                     .collect::<Vec<_>>();
-                let ldrs_context = LdrsExecutionContext::try_new(&file.name, &handlebars)?;
                 (
                     LdrsSrcStream {
                         schema: Some(schema),
                         stream_type: StreamType::Parquet(stream),
-                        source_cols: dest_cols,
+                        source_cols,
                         cleanup_handle: None,
                     },
                     ldrs_context,
@@ -170,10 +217,9 @@ pub async fn create_ldrs_exec(
                 };
                 let name = sf.get_name();
                 let sf_src = get_src_url(ldrs_env, &name, "sf")?;
-                let ldrs_context = LdrsExecutionContext::try_new(&name, &handlebars)?;
-                let handled_name = ldrs_context
-                    .handlebars
-                    .render_template("{{ shoutySnakeCase name }}", &ldrs_context.context)?;
+                let ldrs_context =
+                    LdrsExecutionContext::try_new(&name, &handlebars, &handlebars_vars)?;
+                let handled_name = ldrs_context.render_template("{{ shoutySnakeCase name }}")?;
                 let sf_params = sf.try_get_env_params(&handled_name, &env_params)?;
                 debug!("Snowflake Params: {:?}", sf_params);
                 let arrow_stream = sf_arrow_stream(sf_src.1.as_str(), &sf_sql, sf_params).await?;
@@ -204,26 +250,8 @@ pub async fn create_ldrs_exec(
                         ],
                     )
                     .map(|(_, v)| v.to_string()));
-                    // custom overrides from the source
-                    let source_cols = src
-                        .source_cols
-                        .iter()
-                        .map(ColumnSchema::from)
-                        .collect::<Vec<_>>();
-
-                    let (src_cols, target_cols) = build_source_and_target_schema(
-                        &schema,
-                        source_cols,
-                        vec![pg_dest.get_columns()],
-                    )?;
-                    let strategies: Vec<Option<ArrowColumnTransformStrategy>> = src_cols
-                        .iter()
-                        .zip(target_cols.iter())
-                        .zip(schema.fields().iter())
-                        .map(|((source, target), field)| {
-                            build_arrow_transform_strategy(source, target, field.data_type())
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let (target_cols, strategies) =
+                        column_helper(&src.source_cols, pg_dest.get_columns(), &schema)?;
                     info!("Target columns: {:?}", target_cols);
                     info!("Arrow Transforms: {:?}", strategies);
                     // collect the params that can be bound
@@ -240,6 +268,37 @@ pub async fn create_ldrs_exec(
                         src.stream_type,
                     )
                     .await
+                }
+                LdrsDestination::Pq(parq) => {
+                    let dest_value = get_dest_url(ldrs_env, &parq.name, "pq")?;
+                    let dest_value = ensure_trailing_slash(dest_value.1.as_str());
+                    let handled_filename = context.render_template(&parq.filename)?;
+                    let full_path = format!("{}{}", dest_value, handled_filename);
+                    let full_name = base_or_relative_path(&full_path)?;
+                    debug!("full_name: {:?}", full_name);
+                    let dest_cols = parq
+                        .columns
+                        .iter()
+                        .map(ColumnSchema::from)
+                        .collect::<Vec<_>>();
+                    let (target_cols, strategies) =
+                        column_helper(&src.source_cols, dest_cols, &schema)?;
+
+                    info!("Target columns: {:?}", target_cols);
+                    info!("Arrow Transforms: {:?}", strategies);
+                    // create the new schema if there are any type changes
+                    // adding and keeping the current metadata
+                    let schema = if strategies.iter().any(|s| s.is_some()) {
+                        let fields = target_cols
+                            .iter()
+                            .zip(schema.fields())
+                            .map(map_arrow_metadata)
+                            .collect::<Vec<_>>();
+                        Arc::new(Schema::new(fields))
+                    } else {
+                        schema
+                    };
+                    write_parquet(&full_name.to_string(), schema, strategies, src.stream_type).await
                 }
             },
             None => {
