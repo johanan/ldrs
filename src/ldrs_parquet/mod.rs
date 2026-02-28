@@ -6,6 +6,7 @@ use parquet::arrow::async_writer::ParquetObjectWriter;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::LogicalType;
 use parquet::file::properties::WriterPropertiesBuilder;
+use parquet::schema::types::ColumnPath;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use std::pin::pin;
 use std::sync::Arc;
@@ -116,6 +117,7 @@ pub async fn write_parquet<S>(
     file_path: &str,
     schema: SchemaRef,
     transforms: Vec<Option<ArrowColumnTransformStrategy>>,
+    bloom_filters: Vec<Vec<String>>,
     stream: S,
 ) -> Result<(), anyhow::Error>
 where
@@ -131,11 +133,18 @@ where
     let storage = StorageProvider::try_from_string(file_path)?;
     let (store, path) = storage.get_store_and_path()?;
     let parq_writer = ParquetObjectWriter::new(store, path);
-    let writer_props = WriterPropertiesBuilder::default()
+    let mut writer_props = WriterPropertiesBuilder::default()
         .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
         .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-    let mut writer = AsyncArrowWriter::try_new(parq_writer, schema.clone(), Some(writer_props))?;
+        .set_dictionary_enabled(true)
+        .set_encoding(parquet::basic::Encoding::PLAIN);
+    // add each bloom filter
+    for filter in bloom_filters {
+        writer_props = writer_props.set_column_bloom_filter_enabled(ColumnPath::from(filter), true);
+    }
+
+    let mut writer =
+        AsyncArrowWriter::try_new(parq_writer, schema.clone(), Some(writer_props.build()))?;
 
     // start reading the stream and writing to the parquet file
     let mut pinned_stream = pin!(stream);

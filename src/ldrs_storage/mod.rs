@@ -15,6 +15,7 @@ pub struct ParquetDestination {
     pub name: String,
     pub filename: String,
     pub columns: Vec<ColumnSpec>,
+    pub bloom_filters: Vec<Vec<String>>,
 }
 
 impl TryFrom<&Value> for ParquetDestination {
@@ -34,10 +35,15 @@ impl TryFrom<&Value> for ParquetDestination {
             .get("columns")
             .and_then(|c| Vec::<ColumnSpec>::deserialize(c).ok())
             .unwrap_or_default();
+        let bloom_filters = value
+            .get("bloom_filters")
+            .and_then(|b| Vec::<Vec<String>>::deserialize(b).ok())
+            .unwrap_or_default();
         Ok(ParquetDestination {
             name,
             filename,
             columns,
+            bloom_filters,
         })
     }
 }

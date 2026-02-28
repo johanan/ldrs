@@ -298,7 +298,14 @@ pub async fn create_ldrs_exec(
                     } else {
                         schema
                     };
-                    write_parquet(&full_name.to_string(), schema, strategies, src.stream_type).await
+                    write_parquet(
+                        &full_name.to_string(),
+                        schema,
+                        strategies,
+                        parq.bloom_filters,
+                        src.stream_type,
+                    )
+                    .await
                 }
             },
             None => {

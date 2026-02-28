@@ -55,7 +55,7 @@ async fn test_parquet() {
             target_path
         );
         info!("schema: {:?}", schema);
-        write_parquet(&file_path, schema, Vec::new(), stream)
+        write_parquet(&file_path, schema, Vec::new(), Vec::new(), stream)
             .await
             .unwrap();
     }
@@ -90,6 +90,7 @@ pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
             name: "public.users".into(),
             filename: "tests/test_data/parquet_writes/public.users.written.snappy.parquet".into(),
             columns: Vec::new(),
+            bloom_filters: Vec::new(),
         }),
         dest_prefix: "pq".into(),
     };
@@ -122,6 +123,7 @@ filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
             name: "public.users".into(),
             filename: "tests/test_data/parquet_writes/public.users.written.snappy.parquet".into(),
             columns: Vec::new(),
+            bloom_filters: Vec::new(),
         }),
         dest_prefix: "pq".into(),
     };
@@ -141,6 +143,7 @@ dest_defaults:
 
 tables:
   - name: public.users
+    bloom_filters: [[unique_id]]
   - name: public.numbers
 "#;
 
