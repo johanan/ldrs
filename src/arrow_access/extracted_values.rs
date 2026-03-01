@@ -2,7 +2,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use pg_bigdecimal::PgNumeric;
 use serde_json::Value;
 
-use crate::{arrow_access::TypedColumnAccessor, types::ColumnSchema};
+use crate::{arrow_access::TypedColumnAccessor, types::ColumnSpec};
 
 #[derive(Debug)]
 pub enum ExtractedValue<'a> {
@@ -55,48 +55,52 @@ pub struct ColumnConverter<'a> {
 impl<'a> ColumnConverter<'a> {
     pub fn new(
         accessor: &'a TypedColumnAccessor<'a>,
-        col_schema: &ColumnSchema,
+        col_spec: &ColumnSpec,
     ) -> Result<Self, anyhow::Error> {
-        let strategy = match col_schema {
-            ColumnSchema::Boolean(_) => ExtractionStrategy::Boolean,
-            ColumnSchema::BigInt(_) => ExtractionStrategy::BigInt,
-            ColumnSchema::Integer(_) => ExtractionStrategy::Integer,
-            ColumnSchema::Double(_) => ExtractionStrategy::Double,
-            ColumnSchema::Real(_) => ExtractionStrategy::Real,
-            ColumnSchema::Text(_) | ColumnSchema::Varchar(_, _) => ExtractionStrategy::Text,
-            ColumnSchema::Numeric(_, _, scale) => ExtractionStrategy::Numeric { scale: *scale },
-            ColumnSchema::Timestamp(_, crate::types::TimeUnit::Second) => {
-                ExtractionStrategy::TimestampSeconds
-            }
-            ColumnSchema::Timestamp(_, crate::types::TimeUnit::Millis) => {
-                ExtractionStrategy::TimestampMillis
-            }
-            ColumnSchema::Timestamp(_, crate::types::TimeUnit::Micros) => {
-                ExtractionStrategy::TimestampMicros
-            }
-            ColumnSchema::Timestamp(_, crate::types::TimeUnit::Nanos) => {
-                ExtractionStrategy::TimestampNanos
-            }
-            ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Second) => {
-                ExtractionStrategy::TimestampTzSeconds
-            }
-            ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Millis) => {
-                ExtractionStrategy::TimestampTzMillis
-            }
-            ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Micros) => {
-                ExtractionStrategy::TimestampTzMicros
-            }
-            ColumnSchema::TimestampTz(_, crate::types::TimeUnit::Nanos) => {
-                ExtractionStrategy::TimestampTzNanos
-            }
-            ColumnSchema::Uuid(_) => ExtractionStrategy::Uuid,
-            ColumnSchema::Jsonb(_) => ExtractionStrategy::Jsonb,
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Unsupported column schema: {:?}",
-                    col_schema
-                ))
-            }
+        let strategy = match col_spec {
+            ColumnSpec::Boolean { .. } => ExtractionStrategy::Boolean,
+            ColumnSpec::BigInt { .. } => ExtractionStrategy::BigInt,
+            ColumnSpec::SmallInt { .. } => ExtractionStrategy::Integer,
+            ColumnSpec::Integer { .. } => ExtractionStrategy::Integer,
+            ColumnSpec::Double { .. } => ExtractionStrategy::Double,
+            ColumnSpec::Real { .. } => ExtractionStrategy::Real,
+            ColumnSpec::Text { .. } | ColumnSpec::Varchar { .. } => ExtractionStrategy::Text,
+            ColumnSpec::Numeric { scale, .. } => ExtractionStrategy::Numeric { scale: *scale },
+            ColumnSpec::Timestamp {
+                time_unit: crate::types::TimeUnit::Second,
+                ..
+            } => ExtractionStrategy::TimestampSeconds,
+            ColumnSpec::Timestamp {
+                time_unit: crate::types::TimeUnit::Millis,
+                ..
+            } => ExtractionStrategy::TimestampMillis,
+            ColumnSpec::Timestamp {
+                time_unit: crate::types::TimeUnit::Micros,
+                ..
+            } => ExtractionStrategy::TimestampMicros,
+            ColumnSpec::Timestamp {
+                time_unit: crate::types::TimeUnit::Nanos,
+                ..
+            } => ExtractionStrategy::TimestampNanos,
+            ColumnSpec::TimestampTz {
+                time_unit: crate::types::TimeUnit::Second,
+                ..
+            } => ExtractionStrategy::TimestampTzSeconds,
+            ColumnSpec::TimestampTz {
+                time_unit: crate::types::TimeUnit::Millis,
+                ..
+            } => ExtractionStrategy::TimestampTzMillis,
+            ColumnSpec::TimestampTz {
+                time_unit: crate::types::TimeUnit::Micros,
+                ..
+            } => ExtractionStrategy::TimestampTzMicros,
+            ColumnSpec::TimestampTz {
+                time_unit: crate::types::TimeUnit::Nanos,
+                ..
+            } => ExtractionStrategy::TimestampTzNanos,
+            ColumnSpec::Uuid { .. } => ExtractionStrategy::Uuid,
+            ColumnSpec::Jsonb { .. } => ExtractionStrategy::Jsonb,
+            _ => return Err(anyhow::anyhow!("Unsupported column spec: {:?}", col_spec)),
         };
 
         Ok(ColumnConverter { accessor, strategy })

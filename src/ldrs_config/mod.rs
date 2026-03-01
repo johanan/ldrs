@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::{
     arrow_access::arrow_transforms::{
-        build_arrow_transform_strategy, map_arrow_metadata, ArrowColumnTransformStrategy,
+        build_arrow_transform_strategy, ArrowColumnTransformStrategy,
     },
     ldrs_arrow::build_source_and_target_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
@@ -26,7 +26,7 @@ use crate::{
     parquet_provider::builder_from_url,
     pq::get_fields,
     storage::{base_or_relative_path, ensure_trailing_slash},
-    types::{ColumnSchema, ColumnSpec},
+    types::ColumnSpec,
 };
 
 enum StreamType {
@@ -108,22 +108,17 @@ pub fn infer_env_type(env_type: &str, vars: &[(String, String)]) -> Option<Strin
     }
 }
 
-fn column_helper<'a>(
-    source_cols: &'a Vec<ColumnSpec>,
-    dest_cols: Vec<ColumnSchema<'a>>,
-    schema: &'a SchemaRef,
+fn column_helper(
+    source_cols: Vec<ColumnSpec>,
+    dest_cols: Vec<ColumnSpec>,
+    schema: &SchemaRef,
 ) -> Result<
     (
-        Vec<ColumnSchema<'a>>,
+        Vec<ColumnSpec>,
         Vec<std::option::Option<ArrowColumnTransformStrategy>>,
     ),
     anyhow::Error,
 > {
-    let source_cols = source_cols
-        .iter()
-        .map(ColumnSchema::from)
-        .collect::<Vec<_>>();
-
     let (src_cols, target_cols) =
         build_source_and_target_schema(schema, source_cols, vec![dest_cols])?;
     let strategies: Vec<Option<ArrowColumnTransformStrategy>> = src_cols
@@ -250,13 +245,13 @@ pub async fn create_ldrs_exec(
                         ],
                     )
                     .map(|(_, v)| v.to_string()));
+                    let pg_commands = pg_dest.to_pg_commands();
                     let (target_cols, strategies) =
-                        column_helper(&src.source_cols, pg_dest.get_columns(), &schema)?;
+                        column_helper(src.source_cols, pg_dest.get_columns(), &schema)?;
                     info!("Target columns: {:?}", target_cols);
                     info!("Arrow Transforms: {:?}", strategies);
                     // collect the params that can be bound
                     let env_params = collect_params(ldrs_env);
-                    let pg_commands = pg_dest.to_pg_commands();
                     load_to_postgres(
                         &pg_url,
                         &pg_commands,
@@ -276,13 +271,8 @@ pub async fn create_ldrs_exec(
                     let full_path = format!("{}{}", dest_value, handled_filename);
                     let full_name = base_or_relative_path(&full_path)?;
                     debug!("full_name: {:?}", full_name);
-                    let dest_cols = parq
-                        .columns
-                        .iter()
-                        .map(ColumnSchema::from)
-                        .collect::<Vec<_>>();
                     let (target_cols, strategies) =
-                        column_helper(&src.source_cols, dest_cols, &schema)?;
+                        column_helper(src.source_cols, parq.columns, &schema)?;
 
                     info!("Target columns: {:?}", target_cols);
                     info!("Arrow Transforms: {:?}", strategies);
@@ -291,8 +281,7 @@ pub async fn create_ldrs_exec(
                     let schema = if strategies.iter().any(|s| s.is_some()) {
                         let fields = target_cols
                             .iter()
-                            .zip(schema.fields())
-                            .map(map_arrow_metadata)
+                            .map(|col| col.to_arrow_field())
                             .collect::<Vec<_>>();
                         Arc::new(Schema::new(fields))
                     } else {

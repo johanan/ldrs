@@ -5,29 +5,29 @@ pub mod schema;
 pub mod schema_change;
 
 use crate::arrow_access::extracted_values::ExtractedValue;
-use crate::types::ColumnSchema;
+use crate::types::ColumnSpec;
 use crate::types::ColumnType;
 use postgres_types::{to_sql_checked, ToSql, Type};
 
-pub fn map_col_schema_to_pg_type(pq: &ColumnSchema) -> postgres_types::Type {
+pub fn map_colspec_to_pg_type(pq: &ColumnSpec) -> postgres_types::Type {
     match pq {
-        ColumnSchema::SmallInt(_) => postgres_types::Type::INT2,
-        ColumnSchema::BigInt(_) => postgres_types::Type::INT8,
-        ColumnSchema::Boolean(_) => postgres_types::Type::BOOL,
-        ColumnSchema::Double(_) => postgres_types::Type::FLOAT8,
-        ColumnSchema::Integer(_) => postgres_types::Type::INT4,
-        ColumnSchema::Jsonb(_) => postgres_types::Type::JSONB,
-        ColumnSchema::Numeric(_, _, _) => postgres_types::Type::NUMERIC,
-        ColumnSchema::Timestamp(_, _) => postgres_types::Type::TIMESTAMP,
-        ColumnSchema::TimestampTz(_, _) => postgres_types::Type::TIMESTAMPTZ,
-        ColumnSchema::Date(_) => postgres_types::Type::DATE,
-        ColumnSchema::Real(_) => postgres_types::Type::FLOAT4,
-        ColumnSchema::Text(_) => postgres_types::Type::TEXT,
-        ColumnSchema::Uuid(_) => postgres_types::Type::UUID,
-        ColumnSchema::Varchar(_, _) => postgres_types::Type::VARCHAR,
-        ColumnSchema::Custom(_, _) => postgres_types::Type::VARCHAR,
-        ColumnSchema::FixedSizeBinary(_, _) => postgres_types::Type::BYTEA,
-        ColumnSchema::Bytea(_) => postgres_types::Type::BYTEA,
+        ColumnSpec::SmallInt { .. } => postgres_types::Type::INT2,
+        ColumnSpec::BigInt { .. } => postgres_types::Type::INT8,
+        ColumnSpec::Boolean { .. } => postgres_types::Type::BOOL,
+        ColumnSpec::Double { .. } => postgres_types::Type::FLOAT8,
+        ColumnSpec::Integer { .. } => postgres_types::Type::INT4,
+        ColumnSpec::Jsonb { .. } => postgres_types::Type::JSONB,
+        ColumnSpec::Numeric { .. } => postgres_types::Type::NUMERIC,
+        ColumnSpec::Timestamp { .. } => postgres_types::Type::TIMESTAMP,
+        ColumnSpec::TimestampTz { .. } => postgres_types::Type::TIMESTAMPTZ,
+        ColumnSpec::Date { .. } => postgres_types::Type::DATE,
+        ColumnSpec::Real { .. } => postgres_types::Type::FLOAT4,
+        ColumnSpec::Text { .. } => postgres_types::Type::TEXT,
+        ColumnSpec::Uuid { .. } => postgres_types::Type::UUID,
+        ColumnSpec::Varchar { .. } => postgres_types::Type::VARCHAR,
+        ColumnSpec::Custom { .. } => postgres_types::Type::VARCHAR,
+        ColumnSpec::FixedSizeBinary { .. } => postgres_types::Type::BYTEA,
+        ColumnSpec::Bytea { .. } => postgres_types::Type::BYTEA,
     }
 }
 
