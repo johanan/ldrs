@@ -16,10 +16,9 @@ use crate::{
     },
     ldrs_env::{get_params_for_stmt_with_default, LdrsExecutionContext},
     ldrs_postgres::{
-        client::create_connection, map_col_schema_to_pg_type,
-        schema_change::map_columnschema_to_pg_ddl,
+        client::create_connection, map_colspec_to_pg_type, schema_change::map_colspec_to_pg_ddl,
     },
-    types::{ColumnSchema, ColumnType},
+    types::{ColumnSpec, ColumnType},
 };
 use futures::{StreamExt, TryStreamExt};
 
@@ -77,7 +76,7 @@ fn validate_execution_plan(commands: &[PgDestCommand]) -> Result<(), anyhow::Err
 pub async fn load_to_postgres<S>(
     pg_url: &str,
     commands: &[PgDestCommand],
-    final_cols: &[ColumnSchema<'_>],
+    final_cols: &[ColumnSpec],
     arrow_transforms: &[Option<ArrowColumnTransformStrategy>],
     all_params: &[(String, String, Option<ColumnType>)],
     role: Option<String>,
@@ -119,7 +118,7 @@ where
                     .render_template(load_table, &context.context)?;
                 let pg_types = final_cols
                     .iter()
-                    .map(map_col_schema_to_pg_type)
+                    .map(map_colspec_to_pg_type)
                     .collect::<Vec<_>>();
                 let binary_ddl = format!("COPY {} FROM STDIN WITH (FORMAT BINARY)", handled_table);
                 let sink = tx
@@ -262,7 +261,7 @@ pub async fn execute_prepared_stmt<'a>(
 pub async fn execute_action<'a>(
     tx: &Transaction<'a>,
     action: &PgAction,
-    columns: &[ColumnSchema<'a>],
+    columns: &[ColumnSpec],
     context: &LdrsExecutionContext<'a>,
 ) -> Result<(), anyhow::Error> {
     match action {
@@ -272,7 +271,7 @@ pub async fn execute_action<'a>(
                 .render_template(&table, &context.context)?;
             let col_ddl = columns
                 .iter()
-                .map(|col| map_columnschema_to_pg_ddl(col))
+                .map(map_colspec_to_pg_ddl)
                 .collect::<Vec<String>>();
             let mut ddl = format!("CREATE TABLE if not exists {} (", handled_table);
             let fields_ddl = col_ddl.join(", ");
@@ -287,7 +286,7 @@ pub async fn execute_action<'a>(
                 .render_template(&table, &context.context)?;
             let col_ddl = columns
                 .iter()
-                .map(|col| map_columnschema_to_pg_ddl(col))
+                .map(map_colspec_to_pg_ddl)
                 .collect::<Vec<String>>();
             let mut ddl = format!("CREATE TEMP TABLE {} (", handled_table);
             let fields_ddl = col_ddl.join(", ");

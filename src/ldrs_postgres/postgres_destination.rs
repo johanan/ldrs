@@ -3,7 +3,7 @@ use crate::{
         postgres_execution::{PgAction, PgDestCommand, PgMergeConfig, PgPreparedStmt},
         ColumnType,
     },
-    types::{ColumnSchema, ColumnSpec},
+    types::ColumnSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -61,14 +61,13 @@ impl PgDestination {
         }
     }
 
-    pub fn get_columns(&self) -> Vec<ColumnSchema<'_>> {
-        let cols = match self {
-            PgDestination::DropReplace(common) => &common.columns,
-            PgDestination::TruncateInsert(common) => &common.columns,
-            PgDestination::Merge(merge) => &merge.columns,
-            PgDestination::DeleteInsert(delete_insert) => &delete_insert.columns,
-        };
-        cols.iter().map(ColumnSchema::from).collect::<Vec<_>>()
+    pub fn get_columns(self) -> Vec<ColumnSpec> {
+        match self {
+            PgDestination::DropReplace(common) => common.columns,
+            PgDestination::TruncateInsert(common) => common.columns,
+            PgDestination::Merge(merge) => merge.columns,
+            PgDestination::DeleteInsert(delete_insert) => delete_insert.columns,
+        }
     }
 }
 

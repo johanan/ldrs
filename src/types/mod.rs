@@ -162,6 +162,32 @@ impl From<&ColumnSchema<'_>> for ColumnType {
     }
 }
 
+impl From<&ColumnSpec> for ColumnType {
+    fn from(col: &ColumnSpec) -> Self {
+        match col {
+            ColumnSpec::Varchar { length, .. } => ColumnType::Varchar(*length),
+            ColumnSpec::Text { .. } => ColumnType::Text,
+            ColumnSpec::TimestampTz { time_unit, .. } => ColumnType::TimestampTz(time_unit.clone()),
+            ColumnSpec::Timestamp { time_unit, .. } => ColumnType::Timestamp(time_unit.clone()),
+            ColumnSpec::Uuid { .. } => ColumnType::Uuid,
+            ColumnSpec::Jsonb { .. } => ColumnType::Jsonb,
+            ColumnSpec::Numeric {
+                precision, scale, ..
+            } => ColumnType::Numeric(*precision, *scale),
+            ColumnSpec::Real { .. } => ColumnType::Real,
+            ColumnSpec::Double { .. } => ColumnType::Double,
+            ColumnSpec::SmallInt { .. } => ColumnType::SmallInt,
+            ColumnSpec::Integer { .. } => ColumnType::Integer,
+            ColumnSpec::BigInt { .. } => ColumnType::BigInt,
+            ColumnSpec::Boolean { .. } => ColumnType::Boolean,
+            ColumnSpec::Date { .. } => ColumnType::Date,
+            ColumnSpec::Custom { ddl_type, .. } => ColumnType::Custom(ddl_type.clone()),
+            ColumnSpec::FixedSizeBinary { size, .. } => ColumnType::FixedSizeBinary(*size),
+            ColumnSpec::Bytea { .. } => ColumnType::Bytea,
+        }
+    }
+}
+
 impl TryFrom<&str> for ColumnType {
     type Error = anyhow::Error;
 
@@ -251,8 +277,34 @@ pub enum ColumnSpec {
     Date { name: String },
     #[serde(rename = "custom", alias = "CUSTOM")]
     Custom { name: String, ddl_type: String },
+    #[serde(rename = "fixedsizebinary", alias = "FIXEDSIZEBINARY")]
+    FixedSizeBinary { name: String, size: i32 },
     #[serde(rename = "bytea", alias = "BYTEA")]
     Bytea { name: String },
+}
+
+impl ColumnSpec {
+    pub fn name(&self) -> &str {
+        match self {
+            ColumnSpec::BigInt { name } => name,
+            ColumnSpec::Boolean { name } => name,
+            ColumnSpec::Bytea { name } => name,
+            ColumnSpec::Custom { name, .. } => name,
+            ColumnSpec::Date { name } => name,
+            ColumnSpec::Double { name } => name,
+            ColumnSpec::FixedSizeBinary { name, .. } => name,
+            ColumnSpec::Integer { name } => name,
+            ColumnSpec::Jsonb { name } => name,
+            ColumnSpec::Numeric { name, .. } => name,
+            ColumnSpec::Real { name } => name,
+            ColumnSpec::SmallInt { name } => name,
+            ColumnSpec::Text { name } => name,
+            ColumnSpec::Timestamp { name, .. } => name,
+            ColumnSpec::TimestampTz { name, .. } => name,
+            ColumnSpec::Uuid { name } => name,
+            ColumnSpec::Varchar { name, .. } => name,
+        }
+    }
 }
 
 impl<'a> From<&'a ColumnSpec> for ColumnSchema<'a> {
@@ -281,6 +333,9 @@ impl<'a> From<&'a ColumnSpec> for ColumnSchema<'a> {
             ColumnSpec::Date { name } => ColumnSchema::Date(name),
             ColumnSpec::Jsonb { name } => ColumnSchema::Jsonb(name),
             ColumnSpec::Custom { name, ddl_type } => ColumnSchema::Custom(name, ddl_type.clone()),
+            ColumnSpec::FixedSizeBinary { name, size } => {
+                ColumnSchema::FixedSizeBinary(name, *size)
+            }
             ColumnSpec::Bytea { name } => ColumnSchema::Bytea(name),
         }
     }

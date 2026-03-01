@@ -1,35 +1,37 @@
-use crate::{ldrs_schema::SchemaChange, types::ColumnSchema};
+use crate::{ldrs_schema::SchemaChange, types::ColumnSpec};
 
 impl<'a> SchemaChange<'a> {
     pub fn to_postgres_final_column_ddl(&self) -> Vec<String> {
         self.final_schema
             .iter()
-            .map(|col| map_columnschema_to_pg_ddl(col))
+            .map(|col| map_colspec_to_pg_ddl(col))
             .collect()
     }
 }
 
-pub fn map_columnschema_to_pg_ddl(pq: &ColumnSchema) -> String {
+pub fn map_colspec_to_pg_ddl(pq: &ColumnSpec) -> String {
     match pq {
-        ColumnSchema::SmallInt(name) => format!("{} smallint", name),
-        ColumnSchema::BigInt(name) => format!("{} bigint", name),
-        ColumnSchema::Boolean(name) => format!("{} boolean", name),
-        ColumnSchema::Double(name) => format!("{} double precision", name),
-        ColumnSchema::Integer(name) => format!("{} integer", name),
-        ColumnSchema::Jsonb(name) => format!("{} jsonb", name),
-        ColumnSchema::Numeric(name, precision, scale) => {
-            format!("{} numeric({}, {})", name, precision, scale)
-        }
-        ColumnSchema::Timestamp(name, ..) => format!("{} timestamp", name),
-        ColumnSchema::TimestampTz(name, ..) => format!("{} timestamptz", name),
-        ColumnSchema::Date(name) => format!("{} date", name),
-        ColumnSchema::Real(name) => format!("{} real", name),
-        ColumnSchema::Text(name) => format!("{} text", name),
-        ColumnSchema::Uuid(name) => format!("{} uuid", name),
-        ColumnSchema::Varchar(name, size) => format!("{} varchar({})", name, size),
-        ColumnSchema::Custom(name, type_name) => format!("{} {}", name, type_name),
-        ColumnSchema::Bytea(name) => format!("{} bytea", name),
-        ColumnSchema::FixedSizeBinary(name, _) => format!("{} bytea", name),
+        ColumnSpec::SmallInt { name } => format!("{} smallint", name),
+        ColumnSpec::BigInt { name } => format!("{} bigint", name),
+        ColumnSpec::Boolean { name } => format!("{} boolean", name),
+        ColumnSpec::Double { name } => format!("{} double precision", name),
+        ColumnSpec::Integer { name } => format!("{} integer", name),
+        ColumnSpec::Jsonb { name } => format!("{} jsonb", name),
+        ColumnSpec::Numeric {
+            name,
+            precision,
+            scale,
+        } => format!("{} numeric({}, {})", name, precision, scale),
+        ColumnSpec::Timestamp { name, .. } => format!("{} timestamp", name),
+        ColumnSpec::TimestampTz { name, .. } => format!("{} timestamptz", name),
+        ColumnSpec::Date { name } => format!("{} date", name),
+        ColumnSpec::Real { name } => format!("{} real", name),
+        ColumnSpec::Text { name } => format!("{} text", name),
+        ColumnSpec::Uuid { name } => format!("{} uuid", name),
+        ColumnSpec::Varchar { name, length } => format!("{} varchar({})", name, length),
+        ColumnSpec::Custom { name, ddl_type } => format!("{} {}", name, ddl_type),
+        ColumnSpec::Bytea { name } => format!("{} bytea", name),
+        ColumnSpec::FixedSizeBinary { name, .. } => format!("{} bytea", name),
     }
 }
 
@@ -40,73 +42,95 @@ mod tests {
     #[test]
     fn test_map_parquet_to_ddl() {
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::SmallInt("id")),
+            map_colspec_to_pg_ddl(&ColumnSpec::SmallInt { name: "id".into() }),
             "id smallint"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::BigInt("id")),
+            map_colspec_to_pg_ddl(&ColumnSpec::BigInt { name: "id".into() }),
             "id bigint"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Boolean("is_active")),
+            map_colspec_to_pg_ddl(&ColumnSpec::Boolean {
+                name: "is_active".into()
+            }),
             "is_active boolean"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Double("price")),
+            map_colspec_to_pg_ddl(&ColumnSpec::Double {
+                name: "price".into()
+            }),
             "price double precision"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Integer("age")),
+            map_colspec_to_pg_ddl(&ColumnSpec::Integer { name: "age".into() }),
             "age integer"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Jsonb("data")),
+            map_colspec_to_pg_ddl(&ColumnSpec::Jsonb {
+                name: "data".into()
+            }),
             "data jsonb"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Numeric("amount", 10, 2)),
+            map_colspec_to_pg_ddl(&ColumnSpec::Numeric {
+                name: "amount".into(),
+                precision: 10,
+                scale: 2,
+            }),
             "amount numeric(10, 2)"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Timestamp(
-                "created_at",
-                crate::types::TimeUnit::Millis
-            )),
+            map_colspec_to_pg_ddl(&ColumnSpec::Timestamp {
+                name: "created_at".into(),
+                time_unit: crate::types::TimeUnit::Millis,
+            }),
             "created_at timestamp"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::TimestampTz(
-                "updated_at",
-                crate::types::TimeUnit::Micros
-            )),
+            map_colspec_to_pg_ddl(&ColumnSpec::TimestampTz {
+                name: "updated_at".into(),
+                time_unit: crate::types::TimeUnit::Micros,
+            }),
             "updated_at timestamptz"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Date("dob")),
+            map_colspec_to_pg_ddl(&ColumnSpec::Date { name: "dob".into() }),
             "dob date"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Real("score")),
+            map_colspec_to_pg_ddl(&ColumnSpec::Real {
+                name: "score".into()
+            }),
             "score real"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Text("description")),
+            map_colspec_to_pg_ddl(&ColumnSpec::Text {
+                name: "description".into()
+            }),
             "description text"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Uuid("id")),
+            map_colspec_to_pg_ddl(&ColumnSpec::Uuid { name: "id".into() }),
             "id uuid"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Varchar("name", 100)),
+            map_colspec_to_pg_ddl(&ColumnSpec::Varchar {
+                name: "name".into(),
+                length: 100
+            }),
             "name varchar(100)"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Custom("custom", "custom_type".to_string())),
+            map_colspec_to_pg_ddl(&ColumnSpec::Custom {
+                name: "custom".into(),
+                ddl_type: "custom_type".into(),
+            }),
             "custom custom_type"
         );
         assert_eq!(
-            map_columnschema_to_pg_ddl(&ColumnSchema::Bytea("data")),
+            map_colspec_to_pg_ddl(&ColumnSpec::Bytea {
+                name: "data".into()
+            }),
             "data bytea"
         );
     }
@@ -115,9 +139,14 @@ mod tests {
     fn test_final_column_schema() {
         let current = vec![];
         let next = vec![
-            ColumnSchema::Integer("id"),
-            ColumnSchema::Text("name"),
-            ColumnSchema::Varchar("email", 255),
+            ColumnSpec::Integer { name: "id".into() },
+            ColumnSpec::Text {
+                name: "name".into(),
+            },
+            ColumnSpec::Varchar {
+                name: "email".into(),
+                length: 255,
+            },
         ];
         let schema_change = SchemaChange::build_from_columns(&current, &next);
         let ddl = schema_change.to_postgres_final_column_ddl();

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::Context;
 use arrow::{
@@ -9,12 +9,9 @@ use arrow_array::{
     Array, ArrayRef, Decimal32Array, Decimal64Array, FixedSizeBinaryArray, Float64Array,
     Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
 };
-use arrow_schema::{
-    extension::{ExtensionType, EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY},
-    DataType, Field, SchemaRef,
-};
+use arrow_schema::{DataType, Field, SchemaRef};
 
-use crate::types::{ColumnSchema, ColumnType, TimeUnit};
+use crate::types::{ColumnSpec, ColumnType, TimeUnit};
 
 pub fn fast_pow10(exp: i32) -> f64 {
     match exp {
@@ -77,29 +74,19 @@ impl TimeUnit {
     }
 }
 
-impl<'a> ColumnSchema<'a> {
-    pub fn to_arrow_field(&self) -> Field {
-        let col_type = ColumnType::from(self);
-        Field::new(self.name(), col_type.to_arrow_datatype(), true)
-    }
-
+impl ColumnSpec {
     /// This will add the arrow extension using Arrow extensions
     /// for right now this is used to pass logical type information
     /// right now just for Uuid and Json
-    pub fn arrow_metadata(&self) -> Option<HashMap<String, String>> {
+    pub fn to_arrow_field(&self) -> Field {
+        let col_type = ColumnType::from(self);
+        let field = Field::new(self.name(), col_type.to_arrow_datatype(), true);
         match self {
-            ColumnSchema::Uuid(_) => Some(HashMap::from([(
-                EXTENSION_TYPE_NAME_KEY.into(),
-                arrow_schema::extension::Uuid::NAME.into(),
-            )])),
-            ColumnSchema::Jsonb(_) => Some(HashMap::from([
-                (
-                    EXTENSION_TYPE_NAME_KEY.into(),
-                    arrow_schema::extension::Json::NAME.into(),
-                ),
-                (EXTENSION_TYPE_METADATA_KEY.into(), "".into()),
-            ])),
-            _ => None,
+            ColumnSpec::Uuid { .. } => field.with_extension_type(arrow_schema::extension::Uuid),
+            ColumnSpec::Jsonb { .. } => {
+                field.with_extension_type(arrow_schema::extension::Json::default())
+            }
+            _ => field,
         }
     }
 }
@@ -135,25 +122,6 @@ impl ColumnType {
             ColumnType::Custom(_) => DataType::Binary,
         }
     }
-}
-
-/// This ensures that the metadata of the arrow field is preserved when mapping a new schema
-pub fn map_arrow_metadata((col, arrow_field): (&ColumnSchema<'_>, &Arc<Field>)) -> Field {
-    let mut field = col.to_arrow_field();
-    let metadata = col.arrow_metadata();
-    match metadata {
-        Some(metadata) => {
-            let merged: HashMap<String, String> = arrow_field
-                .metadata()
-                .clone()
-                .into_iter()
-                .chain(metadata)
-                .collect();
-            field.set_metadata(merged);
-        }
-        None => field.set_metadata(arrow_field.metadata().clone()),
-    }
-    field
 }
 
 pub fn build_arrow_transform_strategy(
