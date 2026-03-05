@@ -85,7 +85,7 @@ async fn test_postgres_file_drop() {
     for config in TEST_CASES {
         let client = create_connection(pg_url).await.unwrap();
         let _ = client.batch_execute("DROP SCHEMA IF EXISTS public_test CASCADE");
-        let ex = create_ldrs_exec(config, &ldrs_env, &rt.handle()).await;
+        let ex = create_ldrs_exec(config, &ldrs_env, None, &rt.handle()).await;
         assert_eq!(ex.is_ok(), true);
 
         let users = client
@@ -125,7 +125,7 @@ async fn test_postgres_env_role() {
         .enable_all()
         .build()
         .unwrap();
-    let ex = create_ldrs_exec("", &ldrs_env, &rt.handle()).await;
+    let ex = create_ldrs_exec("", &ldrs_env, None, &rt.handle()).await;
     assert!(ex.is_err());
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }

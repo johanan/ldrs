@@ -157,11 +157,10 @@ impl<'a> LdrsExecutionContext<'a> {
         handlebars: &'a handlebars::Handlebars<'a>,
         template_vars: &[(String, String)],
     ) -> Result<Self, anyhow::Error> {
-        let fqtn_tup = name.split_once('.');
-        let (schema, table) = match fqtn_tup {
-            Some((schema, table)) => Ok((schema, table)),
-            None => Err(anyhow::Error::msg("Invalid table name")),
-        }?;
+        let (schema, table) = match name.split_once('.') {
+            Some((schema, table)) => (Some(schema), table),
+            None => (None, name),
+        };
 
         let shouty_name = name.to_uppercase().replace('.', "_");
         let name_prefix = format!("{}_", shouty_name);
@@ -187,12 +186,14 @@ impl<'a> LdrsExecutionContext<'a> {
             table,
             uuid::Uuid::new_v4().to_string().replace('-', "")
         );
-        let load_table = format!("{}.{}", schema, load_table_name);
         let now = chrono::prelude::Utc::now();
         map.insert("name".into(), name.into());
-        map.insert("schema".into(), schema.into());
+        if let Some(s) = schema {
+            let load_table = format!("{}.{}", s, load_table_name);
+            map.insert("schema".into(), s.into());
+            map.insert("load_table".into(), load_table.into());
+        }
         map.insert("table".into(), table.into());
-        map.insert("load_table".into(), load_table.into());
         map.insert("load_table_name".into(), load_table_name.into());
         map.insert(
             "rfc3339".into(),
@@ -284,5 +285,25 @@ mod tests {
             context.render_template("{{ foo }}").unwrap(),
             "BAR".to_string()
         );
+    }
+
+    #[test_log::test]
+    fn test_handlebars_schema() {
+        let mut hb = handlebars::Handlebars::new();
+        setup_handlebars(&mut hb);
+        let context = LdrsExecutionContext::try_new("test.table", &hb, &[]).unwrap();
+        assert_eq!(
+            context.render_template("{{ schema }}.{{ table }}").unwrap(),
+            "test.table".to_string()
+        );
+
+        let mut hb = handlebars::Handlebars::new();
+        setup_handlebars(&mut hb);
+        let context = LdrsExecutionContext::try_new("table", &hb, &[]).unwrap();
+        assert_eq!(
+            context.render_template("{{ table }}").unwrap(),
+            "table".to_string()
+        );
+        assert_eq!(context.render_template("{{ schema }}").is_err(), true);
     }
 }

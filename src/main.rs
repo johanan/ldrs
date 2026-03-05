@@ -33,6 +33,8 @@ pub enum DeltaCommands {
 struct ConfigArgs {
     #[arg(short, long)]
     config: String,
+    #[arg(long, value_delimiter = ',')]
+    select: Option<Vec<String>>,
 }
 
 #[derive(Subcommand)]
@@ -85,7 +87,7 @@ fn main() -> Result<(), anyhow::Error> {
                 let config_string = fs::read_to_string(&args.config)
                     .with_context(|| format!("Failed to read config file: {}", args.config))?;
                 let ldrs_env = get_all_ldrs_env_vars();
-                create_ldrs_exec(&config_string, &ldrs_env, &rt.handle()).await
+                create_ldrs_exec(&config_string, &ldrs_env, args.select, &rt.handle()).await
             }
             Destination::Delta { command } => match command {
                 DeltaCommands::Load(args) => {
