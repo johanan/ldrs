@@ -135,6 +135,7 @@ fn column_helper(
 pub async fn create_ldrs_exec(
     config_string: &str,
     ldrs_env: &[(String, String)],
+    select: Option<Vec<String>>,
     cloud_io_rt: &tokio::runtime::Handle,
 ) -> Result<(), anyhow::Error> {
     let config: LdrsConfig =
@@ -157,6 +158,18 @@ pub async fn create_ldrs_exec(
         })
         .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
+    let filtered_tasks: Vec<_> = match select {
+        Some(selected_tables) => table_tasks
+            .into_iter()
+            .filter(|t| {
+                selected_tables
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(t.src.name()))
+            })
+            .collect(),
+        None => table_tasks,
+    };
+    debug!("Tasks to be run {:?}", filtered_tasks);
     // get all possible environment params
     let env_params = collect_params(ldrs_env);
     debug!("Environment Params: {:?}", env_params);
@@ -164,8 +177,8 @@ pub async fn create_ldrs_exec(
     setup_handlebars(&mut handlebars);
     let handlebars_vars = collect_vars_by_prefix(ldrs_env, "TEMPL");
 
-    let total_tasks = table_tasks.len();
-    for (i, task) in table_tasks.into_iter().enumerate() {
+    let total_tasks = filtered_tasks.len();
+    for (i, task) in filtered_tasks.into_iter().enumerate() {
         let task_start = std::time::Instant::now();
         debug!("Task: {:?}", task);
         info!("Running task: {}/{}", i + 1, total_tasks);
@@ -217,7 +230,9 @@ pub async fn create_ldrs_exec(
                 let handled_name = ldrs_context.render_template("{{ shoutySnakeCase name }}")?;
                 let sf_params = sf.try_get_env_params(&handled_name, &env_params)?;
                 debug!("Snowflake Params: {:?}", sf_params);
-                let arrow_stream = sf_arrow_stream(sf_src.1.as_str(), &sf_sql, sf_params).await?;
+                let rendered_sql = ldrs_context.render_template(&sf_sql)?;
+                let arrow_stream =
+                    sf_arrow_stream(sf_src.1.as_str(), &rendered_sql, sf_params).await?;
                 let schema = arrow_stream.schema_stream.await;
                 (
                     LdrsSrcStream {

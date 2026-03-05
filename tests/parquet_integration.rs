@@ -166,7 +166,7 @@ tables:
     for file in &expected_files {
         let _ = std::fs::remove_file(file);
     }
-    let _ = create_ldrs_exec(config, &ldrs_env, &rt.handle())
+    let _ = create_ldrs_exec(config, &ldrs_env, None, &rt.handle())
         .await
         .unwrap();
     // ensure the expected files exist

@@ -25,6 +25,15 @@ pub enum LdrsSource {
     SF(SFSource),
 }
 
+impl LdrsSource {
+    pub fn name(&self) -> &str {
+        match self {
+            LdrsSource::File(fs) => &fs.name,
+            LdrsSource::SF(sf) => sf.get_name(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum LdrsDestination {
     Pg(PgDestination),
