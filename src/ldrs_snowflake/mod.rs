@@ -204,7 +204,7 @@ pub async fn sf_arrow_stream(
     let command_handle = tokio::spawn(async move {
         match status_rx.await {
             Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("Command monitoring task failed")),
+            Err(e) => Err(anyhow::anyhow!("Command monitoring task failed: {}", e)),
         }
     });
 

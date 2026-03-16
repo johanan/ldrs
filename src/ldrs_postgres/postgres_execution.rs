@@ -164,20 +164,17 @@ where
                         .collect::<Result<Vec<_>, _>>()
                         .unwrap();
 
-                    let mut batch_buffer = Vec::<Vec<ExtractedValue>>::with_capacity(num_rows);
+                    let mut batch_buffer =
+                        Vec::<ExtractedValue>::with_capacity(batch.columns().len());
                     for row_idx in 0..num_rows {
-                        let row_values: Vec<ExtractedValue> = converters
-                            .iter()
-                            .map(|converter| converter.extract_value(row_idx))
-                            .collect();
+                        batch_buffer.clear();
+                        for converter in converters.iter() {
+                            batch_buffer.push(converter.extract_value(row_idx));
+                        }
 
-                        batch_buffer.push(row_values);
-                    }
-
-                    for row in batch_buffer.iter() {
                         pinned_writer
                             .as_mut()
-                            .write_raw(row)
+                            .write_raw(&batch_buffer)
                             .await
                             .with_context(|| "Failed to write row to PostgreSQL")
                             .unwrap();

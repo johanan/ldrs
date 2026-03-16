@@ -42,8 +42,13 @@ var queryCmd = &cobra.Command{
 		}
 		defer sf.Close()
 
+		parallel, err := cmd.Flags().GetInt("parallel")
+		if err != nil {
+			return err
+		}
+
 		vars := getLdrsSfVars()
-		err = sf.ExecuteQuery(ctx, sqlCommand, vars)
+		err = sf.ExecuteQuery(ctx, sqlCommand, vars, parallel)
 		if err != nil {
 			// write out an empty arrow schema and file
 			schema := arrow.NewSchema([]arrow.Field{}, nil)
@@ -51,7 +56,7 @@ var queryCmd = &cobra.Command{
 			writer := ipc.NewWriter(os.Stdout, ipc.WithSchema(schema), ipc.WithAllocator(alloc))
 
 			recordBuilder := array.NewRecordBuilder(alloc, schema)
-			emptyBatch := recordBuilder.NewRecord()
+			emptyBatch := recordBuilder.NewRecordBatch()
 			defer recordBuilder.Release()
 			defer emptyBatch.Release()
 			if err := writer.Write(emptyBatch); err != nil {
@@ -69,6 +74,7 @@ var queryCmd = &cobra.Command{
 
 func init() {
 	queryCmd.Flags().String("sql", "", "SQL command to query")
+	queryCmd.Flags().Int("parallel", 2, "Number of parallel readers to use for the query")
 }
 
 func getLdrsSfVars() []any {
