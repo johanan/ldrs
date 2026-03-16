@@ -181,6 +181,22 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 			select {
 			case records, ok := <-resultCh:
 				if !ok {
+					for {
+						recs, exists := buffer[nextIndex]
+						if !exists {
+							break
+						}
+						delete(buffer, nextIndex)
+						if err := writeRecords(recs); err != nil {
+							bufWriter.Flush()
+							select {
+							case errorCh <- err:
+							default:
+							}
+							return
+						}
+						nextIndex++
+					}
 					return
 				}
 				buffer[records.index] = records.records
