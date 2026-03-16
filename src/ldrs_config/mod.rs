@@ -313,7 +313,7 @@ pub async fn create_ldrs_exec(
                 }
             },
             None => {
-                info!("No schema found, most likely the load failed");
+                info!("No schema found, most likely the load failed or no Arrow Record Batches were produced.");
                 Ok(())
             }
         }?;

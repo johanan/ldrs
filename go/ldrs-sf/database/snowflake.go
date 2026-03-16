@@ -89,7 +89,7 @@ func (sf *SnowflakeConn) ExecuteCommands(ctx context.Context, sql_commands []str
 	return results, nil
 }
 
-func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []any) error {
+func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []any, numReaders int) error {
 	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
 	sf_ctx := gosnowflake.WithArrowBatchesTimestampOption(
 		gosnowflake.WithArrowAllocator(
@@ -118,14 +118,17 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 		return err
 	}
 
-	batchCh := make(chan int, 10)
-	recordCh := make(chan arrow.Record, 1024)
+	type batchResult struct {
+		index   int
+		records *[]arrow.Record
+	}
+
+	batchCh := make(chan int, numReaders)
+	resultCh := make(chan batchResult, numReaders)
 	errorCh := make(chan error, 1)
 
 	ctx, cancel := context.WithCancel(sf_ctx)
 	defer cancel()
-
-	schemaReady := make(chan *arrow.Schema, 1)
 
 	// waitgroups
 	var readersWG sync.WaitGroup
@@ -135,26 +138,60 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 	go func() {
 		defer writerWG.Done()
 
-		select {
-		case schema, ok := <-schemaReady:
-			if !ok {
-				return
+		buffer := make(map[int]*[]arrow.Record)
+		nextIndex := 0
+
+		// wait for the first batch to arrive to get the schema, but buffer any batches that arrive in the meantime
+		for result := range resultCh {
+			buffer[result.index] = result.records
+			if _, has := buffer[0]; has {
+				break
 			}
+		}
 
+		if buffer[0] == nil {
+			// write an empty ipc stream and exit
+			emptySchema := arrow.NewSchema([]arrow.Field{}, nil)
 			bufWriter := bufio.NewWriter(os.Stdout)
-			ipcWriter := ipc.NewWriter(bufWriter, ipc.WithSchema(schema), ipc.WithAllocator(pool))
-			defer func() {
-				ipcWriter.Close()
-				bufWriter.Flush()
-			}()
+			ipcWriter := ipc.NewWriter(bufWriter, ipc.WithSchema(emptySchema), ipc.WithAllocator(pool))
+			ipcWriter.Close()
+			bufWriter.Flush()
+			return
+		}
 
-			for {
-				select {
-				case record, ok := <-recordCh:
-					if !ok {
-						return
+		schema := (*buffer[0])[0].Schema()
+		bufWriter := bufio.NewWriter(os.Stdout)
+		ipcWriter := ipc.NewWriter(bufWriter, ipc.WithSchema(schema), ipc.WithAllocator(pool))
+		defer func() {
+			ipcWriter.Close()
+			bufWriter.Flush()
+		}()
+
+		writeRecords := func(recs *[]arrow.Record) error {
+			for _, record := range *recs {
+				if err := ipcWriter.Write(record); err != nil {
+					return err
+				}
+				record.Release()
+			}
+			return nil
+		}
+
+		for {
+			select {
+			case records, ok := <-resultCh:
+				if !ok {
+					return
+				}
+				buffer[records.index] = records.records
+
+				for {
+					recs, exists := buffer[nextIndex]
+					if !exists {
+						break
 					}
-					if err := ipcWriter.Write(record); err != nil {
+					delete(buffer, nextIndex)
+					if err := writeRecords(recs); err != nil {
 						bufWriter.Flush()
 						select {
 						case errorCh <- err:
@@ -162,13 +199,12 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 						}
 						return
 					}
-					record.Release()
-				case <-ctx.Done():
-					return
+					nextIndex++
 				}
+
+			case <-ctx.Done():
+				return
 			}
-		case <-ctx.Done():
-			return
 		}
 	}()
 
@@ -191,18 +227,10 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 					return
 				}
 
-				for j, record := range *records {
-					if i == 0 && j == 0 {
-						schemaReady <- record.Schema()
-						close(schemaReady)
-					}
-
-					select {
-					case recordCh <- record:
-					case <-ctx.Done():
-						record.Release()
-						return
-					}
+				select {
+				case resultCh <- batchResult{index: i, records: records}:
+				case <-ctx.Done():
+					return
 				}
 
 			case <-ctx.Done():
@@ -211,16 +239,13 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 		}
 	}
 
-	readersWG.Add(2)
-	go readerWorker()
-	go readerWorker()
+	readersWG.Add(numReaders)
+	for i := 0; i < numReaders; i++ {
+		go readerWorker()
+	}
 
 	go func() {
 		defer close(batchCh)
-		if len(batches) == 0 {
-			close(schemaReady)
-			return
-		}
 		for i := range batches {
 			select {
 			case batchCh <- i:
@@ -232,22 +257,18 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 
 	go func() {
 		readersWG.Wait()
-		close(recordCh)
+		close(resultCh)
 	}()
+
+	writerWG.Wait()
 
 	select {
 	case err := <-errorCh:
 		cancel()
-		writerWG.Wait()
 		return err
-	case <-ctx.Done():
-		writerWG.Wait()
-		return ctx.Err()
 	default:
+		return nil
 	}
-
-	writerWG.Wait()
-	return nil
 }
 
 func ParsePEMPrivateKey(pemKey string) (*rsa.PrivateKey, error) {
