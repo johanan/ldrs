@@ -5,6 +5,7 @@ use futures::Stream;
 use parquet::arrow::async_writer::ParquetObjectWriter;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::LogicalType;
+use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterPropertiesBuilder;
 use parquet::schema::types::ColumnPath;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
@@ -73,7 +74,7 @@ pub async fn write_parquet<S>(
     transforms: Vec<Option<ArrowColumnTransformStrategy>>,
     bloom_filters: Vec<Vec<String>>,
     stream: S,
-) -> Result<(), anyhow::Error>
+) -> Result<ParquetMetaData, anyhow::Error>
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
@@ -109,6 +110,6 @@ where
         };
         writer.write(&batch).await?;
     }
-    let _ = writer.close().await?;
-    Ok(())
+    let metadata = writer.close().await?;
+    Ok(metadata)
 }
