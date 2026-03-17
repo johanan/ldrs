@@ -98,6 +98,7 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 
 	conn, err := sf.Snowflake.Conn(sf_ctx)
 	if err != nil {
+		writeEmptyStream(pool)
 		return err
 	}
 	defer conn.Close()
@@ -109,12 +110,15 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 		return err
 	})
 	if err != nil {
+		writeEmptyStream(pool)
 		return err
 	}
 	defer rows.Close()
 
 	batches, err := rows.(gosnowflake.SnowflakeRows).GetArrowBatches()
 	if err != nil {
+		// write an empty ipc stream and exit
+		writeEmptyStream(pool)
 		return err
 	}
 
@@ -151,11 +155,7 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 
 		if buffer[0] == nil {
 			// write an empty ipc stream and exit
-			emptySchema := arrow.NewSchema([]arrow.Field{}, nil)
-			bufWriter := bufio.NewWriter(os.Stdout)
-			ipcWriter := ipc.NewWriter(bufWriter, ipc.WithSchema(emptySchema), ipc.WithAllocator(pool))
-			ipcWriter.Close()
-			bufWriter.Flush()
+			writeEmptyStream(pool)
 			return
 		}
 
@@ -285,6 +285,14 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 	default:
 		return nil
 	}
+}
+
+func writeEmptyStream(pool memory.Allocator) {
+	emptySchema := arrow.NewSchema([]arrow.Field{}, nil)
+	bufWriter := bufio.NewWriter(os.Stdout)
+	ipcWriter := ipc.NewWriter(bufWriter, ipc.WithSchema(emptySchema), ipc.WithAllocator(pool))
+	ipcWriter.Close()
+	bufWriter.Flush()
 }
 
 func ParsePEMPrivateKey(pemKey string) (*rsa.PrivateKey, error) {

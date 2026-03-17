@@ -144,6 +144,7 @@ dest_defaults:
 tables:
   - name: public.users
     bloom_filters: [[unique_id]]
+    columns: [ { name: created, type: timestamptz, time_unit: Micros }]
   - name: public.numbers
 "#;
 
