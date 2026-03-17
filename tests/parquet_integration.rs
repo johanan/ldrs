@@ -1,5 +1,10 @@
+use std::sync::Arc;
+
+use arrow_array::{Int8Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use ldrs::{
+    arrow_access::arrow_transforms::build_arrow_transform_strategy,
     ldrs_config::{
         config::{get_parsed_config, LdrsDestination, LdrsParsedConfig, LdrsSource},
         create_ldrs_exec,
@@ -8,6 +13,7 @@ use ldrs::{
     ldrs_snowflake::snowflake_source::{SFQuery, SFSource},
     ldrs_storage::{FileSource, ParquetDestination},
     parquet_provider::{self},
+    types::ColumnType,
 };
 use tracing::info;
 
@@ -179,4 +185,45 @@ tables:
         );
     }
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+/// Snowflake sends DECIMAL(1,0) as Int8.
+/// and parquet did not like the transform that came across
+#[tokio::test]
+#[test_log::test]
+async fn test_parquet_numeric_precision1_scale0() {
+    let source_logical = ColumnType::Numeric(1, 0);
+    let target_logical = ColumnType::Numeric(1, 0);
+    let source_physical = DataType::Int8;
+
+    let strategy =
+        build_arrow_transform_strategy(source_logical, target_logical.clone(), &source_physical)
+            .unwrap();
+    info!("strategy: {:?}", strategy);
+    let target_physical = target_logical.to_arrow_datatype();
+    let source_schema = Arc::new(Schema::new(vec![Field::new("flag", source_physical, true)]));
+    let target_schema = Arc::new(Schema::new(vec![Field::new("flag", target_physical, true)]));
+
+    let batch = RecordBatch::try_new(
+        source_schema,
+        vec![Arc::new(Int8Array::from(vec![Some(1), Some(0), None]))],
+    )
+    .unwrap();
+
+    let cd = std::env::current_dir().unwrap();
+    let file_path = format!(
+        "{}/tests/test_data/parquet_writes/decimal32_test.snappy.parquet",
+        cd.display()
+    );
+
+    let stream = futures::stream::iter(vec![Ok(batch)]);
+    write_parquet(
+        &file_path,
+        target_schema,
+        vec![strategy],
+        Vec::new(),
+        stream,
+    )
+    .await
+    .unwrap();
 }

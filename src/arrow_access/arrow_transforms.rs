@@ -100,6 +100,17 @@ impl ColumnType {
             ColumnType::BigInt => DataType::Int64,
             ColumnType::Real => DataType::Float32,
             ColumnType::Double => DataType::Float64,
+            // add a check if the scale is 0 and a small precision, keep it as an integer
+            ColumnType::Numeric(precision, scale) if *scale == 0 && *precision <= 9 => {
+                if *precision <= 2 {
+                    DataType::Int8
+                } else if *precision <= 4 {
+                    DataType::Int16
+                } else {
+                    DataType::Int32
+                }
+            }
+            // anything that is a real decimal or precision larger than 9
             ColumnType::Numeric(precision, scale) => {
                 if *precision <= 9 {
                     DataType::Decimal32(*precision as u8, *scale as i8)
@@ -207,6 +218,8 @@ pub fn build_arrow_transform_strategy(
                 )),
             }
         }
+        // numeric with scale 0 is an integer, check for physical match
+        (ColumnType::Numeric(_, s), _) if s == 0 && source_physical == &target_physical => Ok(None),
         _ if arrow::compute::can_cast_types(source_physical, &target_physical) => {
             Ok(Some(ArrowColumnTransformStrategy::ArrowCast {
                 target_type: target_physical,
@@ -675,5 +688,27 @@ mod tests {
                     .with_data_type(DataType::Decimal64(18, 2)),
             ),
         )
+    }
+
+    #[test_log::test]
+    fn test_numeric_precision1_scale0_int8_no_transform() {
+        assert_transform(
+            ColumnType::Numeric(1, 0),
+            ColumnType::Numeric(1, 0),
+            DataType::Int8,
+            Arc::new(Int8Array::from(vec![Some(1), Some(0), None])),
+            Arc::new(Int8Array::from(vec![Some(1), Some(0), None])),
+        );
+    }
+
+    #[test_log::test]
+    fn test_numeric_precision4_scale0_int8_widens() {
+        assert_transform(
+            ColumnType::Numeric(4, 0),
+            ColumnType::Numeric(4, 0),
+            DataType::Int8,
+            Arc::new(Int8Array::from(vec![Some(1), Some(0), None])),
+            Arc::new(Int16Array::from(vec![Some(1), Some(0), None])),
+        );
     }
 }
