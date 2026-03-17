@@ -309,7 +309,7 @@ pub async fn create_ldrs_exec(
                         parq.bloom_filters,
                         src.stream_type,
                     )
-                    .await;
+                    .await?;
                     Ok(())
                 }
             },
