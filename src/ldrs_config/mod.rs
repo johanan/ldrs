@@ -19,7 +19,7 @@ use crate::{
     ldrs_arrow::build_source_and_target_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
     ldrs_env::{collect_params, collect_vars_by_prefix, setup_handlebars, LdrsExecutionContext},
-    ldrs_parquet::write_parquet,
+    ldrs_parquet::{default_writer_props, with_bloom_filters, write_parquet},
     ldrs_postgres::{client::check_for_role, postgres_execution::load_to_postgres},
     ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource},
     ldrs_storage::is_object_store_url,
@@ -302,11 +302,12 @@ pub async fn create_ldrs_exec(
                     } else {
                         schema
                     };
+                    let props = with_bloom_filters(default_writer_props(), parq.bloom_filters);
                     let _ = write_parquet(
                         &full_name.to_string(),
                         schema,
                         strategies,
-                        parq.bloom_filters,
+                        Some(props),
                         src.stream_type,
                     )
                     .await?;
