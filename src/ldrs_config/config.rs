@@ -1,4 +1,5 @@
 use crate::{
+    ldrs_delta::DeltaDestination,
     ldrs_postgres::postgres_destination::{from_serde_yaml, PgDestination},
     ldrs_snowflake::snowflake_source::{from_serde_yaml as from_sf_serde_yaml, SFSource},
     ldrs_storage::{FileSource, ParquetDestination},
@@ -38,6 +39,7 @@ impl LdrsSource {
 pub enum LdrsDestination {
     Pg(PgDestination),
     Pq(ParquetDestination),
+    Delta(DeltaDestination),
 }
 
 #[derive(Debug, PartialEq)]
@@ -132,6 +134,10 @@ pub fn get_parsed_config(
         "pq" => {
             let parsed = ParquetDestination::try_from(&dest_value)?;
             Ok(LdrsDestination::Pq(parsed))
+        }
+        "delta" => {
+            let parsed = DeltaDestination::try_from(&dest_value)?;
+            Ok(LdrsDestination::Delta(parsed))
         }
         _ => Err(anyhow::Error::msg("unsupported dest type")),
     }?;

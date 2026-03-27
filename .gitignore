@@ -24,5 +24,6 @@ target/
 test_data/delta/
 
 tests/test_data/parquet_writes/
+tests/test_data/delta_writes/
 
 .env
