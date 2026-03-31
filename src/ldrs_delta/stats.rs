@@ -1,7 +1,5 @@
 use std::cmp::Ordering;
 
-use chrono::Datelike;
-
 use arrow_schema::SchemaRef;
 use delta_kernel::expressions::Scalar;
 use parquet::data_type::AsBytes;
@@ -102,10 +100,8 @@ fn scalar_to_json_value(
             .map(|s| serde_json::json!(s)),
 
         (Scalar::Integer(days), Date32) | (Scalar::Date(days), Date32) => {
-            chrono::NaiveDate::from_num_days_from_ce_opt(
-                chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?.num_days_from_ce() + days,
-            )
-            .map(|d| serde_json::json!(d.format("%Y-%m-%d").to_string()))
+            chrono::NaiveDate::from_epoch_days(*days)
+                .map(|d| serde_json::json!(d.format("%Y-%m-%d").to_string()))
         }
 
         (Scalar::Long(micros), Timestamp(_, Some(_)))
@@ -241,5 +237,60 @@ pub fn parquet_metadata_to_delta_stats(
         num_records,
         tight_bounds,
         columns,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, TimeUnit};
+    use delta_kernel::expressions::Scalar;
+    use serde_json::json;
+
+    #[test]
+    fn test_scalar_to_json_dates() {
+        assert_eq!(
+            scalar_to_json_value(&Scalar::Integer(20177), &DataType::Date32),
+            Some(json!("2025-03-30"))
+        );
+        assert_eq!(
+            scalar_to_json_value(&Scalar::Integer(-1), &DataType::Date32),
+            Some(json!("1969-12-31"))
+        );
+    }
+
+    #[test]
+    fn test_scalar_to_json_timestamps() {
+        let micros = 1743342600_000_000;
+
+        assert_eq!(
+            scalar_to_json_value(
+                &Scalar::Long(micros),
+                &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            Some(json!("2025-03-30T13:50:00.000Z"))
+        );
+        assert_eq!(
+            scalar_to_json_value(
+                &Scalar::Long(micros),
+                &DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            Some(json!("2025-03-30T13:50:00.000"))
+        );
+        assert_eq!(
+            scalar_to_json_value(
+                &Scalar::TimestampNtz(micros),
+                &DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            Some(json!("2025-03-30T13:50:00.000"))
+        );
+    }
+
+    #[test]
+    fn test_scalar_to_json_unmatched_returns_none() {
+        assert_eq!(
+            scalar_to_json_value(&Scalar::Integer(42), &DataType::Float64),
+            None
+        );
     }
 }
