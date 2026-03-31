@@ -321,6 +321,43 @@ fn version_to_log_filename(version: Version) -> String {
 
 const DEFAULT_MAX_ROWS: usize = 1_000_000;
 const DEFAULT_MAX_BYTES: usize = 128 * 1024 * 1024; // 128MB
+const MAX_COMMIT_RETRIES: usize = 10;
+
+fn build_overwrite_commit(
+    table_state: &TableState,
+    schema: &SchemaRef,
+    adds: &[DeltaAdd],
+) -> Result<(String, Version), anyhow::Error> {
+    let next_version = table_state.version + 1;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let remove = DeltaRemove::from_scan_file(now_ms);
+    let removes: Vec<_> = table_state.active_files.iter().cloned().map(remove).collect();
+
+    let commit_info = DeltaCommitInfo {
+        timestamp: now_ms,
+        operation: "WRITE".to_string(),
+        operation_parameters: HashMap::from([("mode".to_string(), "Overwrite".to_string())]),
+        engine_info: format!("ldrs-{}", env!("CARGO_PKG_VERSION")),
+    };
+
+    let protocol = default_protocol();
+    let metadata = build_metadata(
+        schema,
+        Some(&table_state.table_id),
+        table_state.created_time,
+    )?;
+
+    let mut actions: Vec<DeltaAction> = vec![
+        DeltaAction::CommitInfo(&commit_info),
+        DeltaAction::Protocol(&protocol),
+        DeltaAction::MetaData(&metadata),
+    ];
+    actions.extend(removes.iter().map(DeltaAction::Remove));
+    actions.extend(adds.iter().map(DeltaAction::Add));
+
+    let commit_body = build_commit_jsonl(&actions)?;
+    Ok((commit_body, next_version))
+}
 
 pub async fn overwrite_delta<S>(
     table_path: &str,
@@ -338,11 +375,7 @@ where
     let storage = StorageProvider::try_from_string(table_path)?;
     let (store, base_path) = storage.get_store_and_path()?;
     let table_url = storage.get_url();
-
-    // check current snapshot
     let engine = build_engine(store.clone());
-    let table_state = snapshot_table_state(engine.as_ref(), &table_url)?;
-    let next_version = table_state.version + 1;
 
     let files = write_parquet_split(
         table_path,
@@ -355,14 +388,6 @@ where
         Some(default_writer_props()),
     )
     .await?;
-
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let remove = DeltaRemove::from_scan_file(now_ms);
-    let removes = table_state
-        .active_files
-        .into_iter()
-        .map(remove)
-        .collect::<Vec<_>>();
 
     let mut adds = Vec::with_capacity(files.len());
     for (filename, parquet_metadata) in files {
@@ -380,43 +405,28 @@ where
         });
     }
 
-    let commit_info = DeltaCommitInfo {
-        timestamp: now_ms,
-        operation: "WRITE".to_string(),
-        operation_parameters: HashMap::from([("mode".to_string(), "Overwrite".to_string())]),
-        engine_info: format!("ldrs-{}", env!("CARGO_PKG_VERSION")),
-    };
+    for _attempt in 0..MAX_COMMIT_RETRIES {
+        let table_state = snapshot_table_state(engine.as_ref(), &table_url)?;
+        let (commit_body, next_version) = build_overwrite_commit(&table_state, &schema, &adds)?;
+        let log_path = base_path
+            .child("_delta_log")
+            .child(version_to_log_filename(next_version));
 
-    let protocol = default_protocol();
-    let metadata = build_metadata(
-        &schema,
-        Some(&table_state.table_id),
-        table_state.created_time,
-    )?;
-
-    let mut actions: Vec<DeltaAction> = vec![
-        DeltaAction::CommitInfo(&commit_info),
-        DeltaAction::Protocol(&protocol),
-        DeltaAction::MetaData(&metadata),
-    ];
-    actions.extend(removes.iter().map(DeltaAction::Remove));
-    actions.extend(adds.iter().map(DeltaAction::Add));
-
-    let commit_body = build_commit_jsonl(&actions)?;
-    let log_path = base_path
-        .child("_delta_log")
-        .child(version_to_log_filename(next_version));
-
-    store
-        .put_opts(
-            &log_path,
-            PutPayload::from(commit_body),
-            PutOptions {
-                mode: PutMode::Create,
-                ..Default::default()
-            },
-        )
-        .await?;
-
-    Ok(())
+        match store
+            .put_opts(
+                &log_path,
+                PutPayload::from(commit_body),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(object_store::Error::AlreadyExists { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!("failed to commit delta overwrite after {MAX_COMMIT_RETRIES} attempts")
 }
