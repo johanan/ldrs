@@ -18,8 +18,9 @@ use crate::{
     },
     ldrs_arrow::build_source_and_target_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
+    ldrs_delta::overwrite_delta,
     ldrs_env::{collect_params, collect_vars_by_prefix, setup_handlebars, LdrsExecutionContext},
-    ldrs_parquet::write_parquet,
+    ldrs_parquet::{default_writer_props, with_bloom_filters, write_parquet},
     ldrs_postgres::{client::check_for_role, postgres_execution::load_to_postgres},
     ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource},
     ldrs_storage::is_object_store_url,
@@ -100,6 +101,7 @@ pub fn infer_env_type(env_type: &str, vars: &[(String, String)]) -> Option<Strin
     let url = src.and_then(|(_, value)| Url::parse(value).ok());
     match url {
         Some(u) => match u {
+            u if u.scheme().starts_with("delta+") => Some("delta".to_string()),
             u if is_object_store_url(&u) => Some("file".to_string()),
             u if u.scheme() == "postgres" => Some("pg".to_string()),
             _ => None,
@@ -302,12 +304,46 @@ pub async fn create_ldrs_exec(
                     } else {
                         schema
                     };
+                    let props = with_bloom_filters(default_writer_props(), parq.bloom_filters);
                     let _ = write_parquet(
                         &full_name.to_string(),
                         schema,
                         strategies,
-                        parq.bloom_filters,
+                        Some(props),
                         src.stream_type,
+                    )
+                    .await?;
+                    Ok(())
+                }
+                LdrsDestination::Delta(delta_dest) => {
+                    let dest_value = get_dest_url(ldrs_env, &delta_dest.name, "delta")?;
+                    let storage_url = dest_value.1.strip_prefix("delta+").unwrap_or(&dest_value.1);
+                    let storage_url = ensure_trailing_slash(storage_url);
+                    let table_path =
+                        ensure_trailing_slash(&format!("{}{}", storage_url, delta_dest.name));
+                    debug!("delta path: {:?}", table_path);
+                    let (target_cols, strategies) =
+                        column_helper(src.source_cols, delta_dest.columns, &schema)?;
+
+                    info!("Target columns: {:?}", target_cols);
+                    info!("Arrow Transforms: {:?}", strategies);
+                    let schema = if strategies.iter().any(|s| s.is_some()) {
+                        let fields = target_cols
+                            .iter()
+                            .map(|col| col.to_arrow_field())
+                            .collect::<Vec<_>>();
+                        Arc::new(Schema::new(fields))
+                    } else {
+                        schema
+                    };
+
+                    overwrite_delta(
+                        &table_path,
+                        schema,
+                        strategies,
+                        src.stream_type,
+                        delta_dest.max_rows,
+                        delta_dest.max_bytes,
                     )
                     .await?;
                     Ok(())

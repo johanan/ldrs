@@ -6,7 +6,7 @@ use parquet::arrow::async_writer::ParquetObjectWriter;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::LogicalType;
 use parquet::file::metadata::ParquetMetaData;
-use parquet::file::properties::WriterPropertiesBuilder;
+use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use std::pin::pin;
@@ -68,17 +68,35 @@ impl TryFrom<&Arc<parquet::schema::types::Type>> for ColumnSpec {
     }
 }
 
+pub fn default_writer_props() -> WriterProperties {
+    WriterPropertiesBuilder::default()
+        .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .set_encoding(parquet::basic::Encoding::PLAIN)
+        .build()
+}
+
+pub fn with_bloom_filters(
+    props: WriterProperties,
+    bloom_filters: Vec<Vec<String>>,
+) -> WriterProperties {
+    let mut builder = props.into_builder();
+    for filter in bloom_filters {
+        builder = builder.set_column_bloom_filter_enabled(ColumnPath::from(filter), true);
+    }
+    builder.build()
+}
+
 pub async fn write_parquet<S>(
     file_path: &str,
     schema: SchemaRef,
     transforms: Vec<Option<ArrowColumnTransformStrategy>>,
-    bloom_filters: Vec<Vec<String>>,
+    writer_props: Option<WriterProperties>,
     stream: S,
 ) -> Result<ParquetMetaData, anyhow::Error>
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
-    // determine if we need to transform the batches
     let transform_plan = if transforms.iter().any(|s| s.is_some()) {
         Some(transforms)
     } else {
@@ -88,28 +106,95 @@ where
     let storage = StorageProvider::try_from_string(file_path)?;
     let (store, path) = storage.get_store_and_path()?;
     let parq_writer = ParquetObjectWriter::new(store, path);
-    let mut writer_props = WriterPropertiesBuilder::default()
-        .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .set_encoding(parquet::basic::Encoding::PLAIN);
-    // add each bloom filter
-    for filter in bloom_filters {
-        writer_props = writer_props.set_column_bloom_filter_enabled(ColumnPath::from(filter), true);
-    }
+    let props = writer_props.unwrap_or(default_writer_props());
 
-    let mut writer =
-        AsyncArrowWriter::try_new(parq_writer, schema.clone(), Some(writer_props.build()))?;
+    let mut writer = AsyncArrowWriter::try_new(parq_writer, schema.clone(), Some(props))?;
 
-    // start reading the stream and writing to the parquet file
     let mut pinned_stream = pin!(stream);
     while let Some(batch) = pinned_stream.next().await {
         let batch = batch?;
         let batch = match &transform_plan {
-            Some(plan) => transform_batch(&batch, &plan, schema.clone())?,
+            Some(plan) => transform_batch(&batch, plan, schema.clone())?,
             None => batch,
         };
         writer.write(&batch).await?;
     }
     let metadata = writer.close().await?;
     Ok(metadata)
+}
+
+pub async fn write_parquet_split<S, F>(
+    dir_path: &str,
+    schema: SchemaRef,
+    transforms: Vec<Option<ArrowColumnTransformStrategy>>,
+    stream: S,
+    max_rows: Option<usize>,
+    max_bytes: Option<usize>,
+    name_file: F,
+    writer_props: Option<WriterProperties>,
+) -> Result<Vec<(String, ParquetMetaData)>, anyhow::Error>
+where
+    S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
+    F: Fn(usize) -> String,
+{
+    let transform_plan = if transforms.iter().any(|s| s.is_some()) {
+        Some(transforms)
+    } else {
+        None
+    };
+
+    let storage = StorageProvider::try_from_string(dir_path)?;
+    let (store, base_path) = storage.get_store_and_path()?;
+
+    let props = writer_props.unwrap_or_else(default_writer_props);
+
+    let mut results: Vec<(String, ParquetMetaData)> = Vec::new();
+    let mut file_index: usize = 0;
+    let mut current_rows: usize = 0;
+    let mut writer: Option<AsyncArrowWriter<ParquetObjectWriter>> = None;
+    let mut current_filename = String::new();
+
+    let mut pinned_stream = pin!(stream);
+    while let Some(batch) = pinned_stream.next().await {
+        let batch = batch?;
+        let batch = match &transform_plan {
+            Some(plan) => transform_batch(&batch, plan, schema.clone())?,
+            None => batch,
+        };
+
+        let w = match writer.as_mut() {
+            Some(w) => w,
+            None => {
+                current_filename = name_file(file_index);
+                let file_path = base_path.child(current_filename.as_str());
+                let parq_writer = ParquetObjectWriter::new(store.clone(), file_path);
+                writer = Some(AsyncArrowWriter::try_new(
+                    parq_writer,
+                    schema.clone(),
+                    Some(props.clone()),
+                )?);
+                writer.as_mut().unwrap()
+            }
+        };
+
+        w.write(&batch).await?;
+        current_rows += batch.num_rows();
+
+        let should_rotate = max_rows.map_or(false, |limit| current_rows >= limit)
+            || max_bytes.map_or(false, |limit| w.bytes_written() >= limit);
+
+        if should_rotate {
+            let metadata = writer.take().unwrap().close().await?;
+            results.push((current_filename.clone(), metadata));
+            file_index += 1;
+            current_rows = 0;
+        }
+    }
+
+    if let Some(w) = writer.take() {
+        let metadata = w.close().await?;
+        results.push((current_filename, metadata));
+    }
+
+    Ok(results)
 }

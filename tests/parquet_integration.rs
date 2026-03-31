@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use arrow_array::{Int8Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::{Int32Array, Int8Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use ldrs::{
     arrow_access::arrow_transforms::build_arrow_transform_strategy,
@@ -9,7 +9,7 @@ use ldrs::{
         config::{get_parsed_config, LdrsDestination, LdrsParsedConfig, LdrsSource},
         create_ldrs_exec,
     },
-    ldrs_parquet::write_parquet,
+    ldrs_parquet::{write_parquet, write_parquet_split},
     ldrs_snowflake::snowflake_source::{SFQuery, SFSource},
     ldrs_storage::{FileSource, ParquetDestination},
     parquet_provider::{self},
@@ -61,7 +61,7 @@ async fn test_parquet() {
             target_path
         );
         info!("schema: {:?}", schema);
-        write_parquet(&file_path, schema, Vec::new(), Vec::new(), stream)
+        write_parquet(&file_path, schema, Vec::new(), None, stream)
             .await
             .unwrap();
     }
@@ -217,13 +217,125 @@ async fn test_parquet_numeric_precision1_scale0() {
     );
 
     let stream = futures::stream::iter(vec![Ok(batch)]);
-    write_parquet(
-        &file_path,
-        target_schema,
-        vec![strategy],
+    write_parquet(&file_path, target_schema, vec![strategy], None, stream)
+        .await
+        .unwrap();
+}
+
+fn split_test_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]))
+}
+
+fn split_test_batches(schema: &SchemaRef) -> (RecordBatch, RecordBatch) {
+    let batch1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["alice", "bob", "carol"])),
+        ],
+    )
+    .unwrap();
+
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![4, 5])),
+            Arc::new(StringArray::from(vec!["dave", "eve"])),
+        ],
+    )
+    .unwrap();
+
+    (batch1, batch2)
+}
+
+#[tokio::test]
+#[test_log::test]
+async fn test_parquet_split_by_rows() {
+    let schema = split_test_schema();
+    let (batch1, batch2) = split_test_batches(&schema);
+
+    let cd = std::env::current_dir().unwrap();
+    let dir_path = format!(
+        "{}/tests/test_data/parquet_writes/split_test/",
+        cd.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_path);
+    std::fs::create_dir_all(&dir_path).unwrap();
+
+    let stream = futures::stream::iter(vec![Ok(batch1), Ok(batch2)]);
+    let results = write_parquet_split(
+        &dir_path,
+        schema,
         Vec::new(),
         stream,
+        Some(2),
+        None,
+        |i| format!("part_{:05}.parquet", i),
+        None,
     )
     .await
     .unwrap();
+
+    assert_eq!(results.len(), 2, "expected 2 files from split");
+    assert_eq!(results[0].0, "part_00000.parquet");
+    assert_eq!(results[1].0, "part_00001.parquet");
+
+    // verify files exist on disk
+    for (filename, _metadata) in &results {
+        let full = format!("{}{}", dir_path, filename);
+        assert!(
+            std::path::Path::new(&full).exists(),
+            "expected file not found: {}",
+            full
+        );
+    }
+}
+
+#[tokio::test]
+#[test_log::test]
+async fn test_parquet_split_by_size() {
+    let schema = split_test_schema();
+    let (batch1, batch2) = split_test_batches(&schema);
+
+    let cd = std::env::current_dir().unwrap();
+    let dir_path = format!(
+        "{}/tests/test_data/parquet_writes/split_size_test/",
+        cd.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_path);
+    std::fs::create_dir_all(&dir_path).unwrap();
+
+    let stream = futures::stream::iter(vec![Ok(batch1), Ok(batch2)]);
+    let results = write_parquet_split(
+        &dir_path,
+        schema,
+        Vec::new(),
+        stream,
+        None,
+        Some(1),
+        |i| format!("size_{:05}.parquet", i),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        results.len() >= 2,
+        "expected at least 2 files from size split, got {}",
+        results.len()
+    );
+
+    for (filename, _metadata) in &results {
+        let full = format!("{}{}", dir_path, filename);
+        assert!(
+            std::path::Path::new(&full).exists(),
+            "expected file not found: {}",
+            full
+        );
+    }
 }
