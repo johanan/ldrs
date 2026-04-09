@@ -1740,6 +1740,7 @@ dependencies = [
  "pg_bigdecimal",
  "postgres-native-tls",
  "postgres-types",
+ "roaring",
  "rstest",
  "serde",
  "serde_json",
@@ -1753,6 +1754,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "z85",
 ]
 
 [[package]]

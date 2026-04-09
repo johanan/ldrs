@@ -1,3 +1,5 @@
+mod dv;
+mod merge;
 mod stats;
 
 pub use stats::{delta_stats_to_json, parquet_metadata_to_delta_stats, ColumnStats, DeltaStats};
@@ -107,6 +109,8 @@ struct DeltaAdd {
     data_change: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stats: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deletion_vector: Option<dv::DeletionVectorDescriptor>,
 }
 
 #[derive(Serialize)]
@@ -131,12 +135,22 @@ impl DeltaRemove {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct DeltaTxn {
+    app_id: String,
+    version: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_updated: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 enum DeltaAction<'a> {
     CommitInfo(&'a DeltaCommitInfo),
     Protocol(&'a DeltaProtocol),
     MetaData(&'a DeltaMetadata),
     Add(&'a DeltaAdd),
     Remove(&'a DeltaRemove),
+    Txn(&'a DeltaTxn),
 }
 
 fn arrow_schema_to_delta_struct(schema: &SchemaRef) -> Result<StructType, anyhow::Error> {
@@ -207,10 +221,20 @@ fn default_protocol() -> DeltaProtocol {
     }
 }
 
+fn merge_protocol() -> DeltaProtocol {
+    DeltaProtocol {
+        min_reader_version: 3,
+        min_writer_version: 7,
+        reader_features: vec!["timestampNtz".to_string(), "deletionVectors".to_string()],
+        writer_features: vec!["timestampNtz".to_string(), "deletionVectors".to_string()],
+    }
+}
+
 fn build_metadata(
     schema: &SchemaRef,
     table_id: Option<&str>,
     created_time: Option<i64>,
+    configuration: HashMap<String, String>,
 ) -> Result<DeltaMetadata, anyhow::Error> {
     let delta_schema = arrow_schema_to_delta_struct(schema)?;
     let schema_string = serde_json::to_string(&delta_schema)?;
@@ -226,7 +250,7 @@ fn build_metadata(
         schema_string,
         partition_columns: vec![],
         created_time: created_time.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
-        configuration: HashMap::new(),
+        configuration,
     })
 }
 
@@ -244,7 +268,7 @@ pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), an
     };
 
     let protocol = default_protocol();
-    let metadata = build_metadata(schema, None, None)?;
+    let metadata = build_metadata(schema, None, None, HashMap::new())?;
 
     let actions = vec![
         DeltaAction::CommitInfo(&commit_info),
@@ -283,6 +307,7 @@ struct TableState {
     active_files: Vec<ScanFile>,
     table_id: String,
     created_time: Option<i64>,
+    has_deletion_vectors: bool,
 }
 
 fn snapshot_table_state(
@@ -294,6 +319,12 @@ fn snapshot_table_state(
     let metadata = snapshot.table_configuration().metadata();
     let table_id = metadata.id().to_string();
     let created_time = metadata.created_time();
+    // we can read the property if dvs have been added
+    // this either does not exist or has a value of true or false
+    let has_deletion_vectors = snapshot
+        .table_properties()
+        .enable_deletion_vectors
+        .unwrap_or(false);
 
     let scan = snapshot.clone().scan_builder().build()?;
 
@@ -312,6 +343,26 @@ fn snapshot_table_state(
         active_files,
         table_id,
         created_time,
+        has_deletion_vectors,
+    })
+}
+
+fn build_add(
+    filename: &str,
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    obj_meta: &object_store::ObjectMeta,
+    schema: &SchemaRef,
+) -> Result<DeltaAdd, anyhow::Error> {
+    let file_stats = parquet_metadata_to_delta_stats(metadata, schema);
+    let stats_json = delta_stats_to_json(&file_stats, schema)?;
+    Ok(DeltaAdd {
+        path: filename.to_string(),
+        partition_values: HashMap::new(),
+        size: obj_meta.size as i64,
+        modification_time: obj_meta.last_modified.timestamp_millis(),
+        data_change: true,
+        stats: Some(stats_json),
+        deletion_vector: None,
     })
 }
 
@@ -322,6 +373,7 @@ fn version_to_log_filename(version: Version) -> String {
 const DEFAULT_MAX_ROWS: usize = 1_000_000;
 const DEFAULT_MAX_BYTES: usize = 128 * 1024 * 1024; // 128MB
 const MAX_COMMIT_RETRIES: usize = 10;
+const MERGE_MAX_RETRIES: usize = 3;
 
 fn build_overwrite_commit(
     table_state: &TableState,
@@ -331,7 +383,12 @@ fn build_overwrite_commit(
     let next_version = table_state.version + 1;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let remove = DeltaRemove::from_scan_file(now_ms);
-    let removes: Vec<_> = table_state.active_files.iter().cloned().map(remove).collect();
+    let removes: Vec<_> = table_state
+        .active_files
+        .iter()
+        .cloned()
+        .map(remove)
+        .collect();
 
     let commit_info = DeltaCommitInfo {
         timestamp: now_ms,
@@ -345,6 +402,7 @@ fn build_overwrite_commit(
         schema,
         Some(&table_state.table_id),
         table_state.created_time,
+        HashMap::new(),
     )?;
 
     let mut actions: Vec<DeltaAction> = vec![
@@ -389,21 +447,21 @@ where
     )
     .await?;
 
-    let mut adds = Vec::with_capacity(files.len());
-    for (filename, parquet_metadata) in files {
-        let file_path = base_path.child(filename.as_str());
-        let obj_meta = store.head(&file_path).await?;
-        let file_stats = parquet_metadata_to_delta_stats(&parquet_metadata, &schema);
-        let stats_json = delta_stats_to_json(&file_stats, &schema)?;
-        adds.push(DeltaAdd {
-            path: filename,
-            partition_values: HashMap::new(),
-            size: obj_meta.size as i64,
-            modification_time: obj_meta.last_modified.timestamp_millis(),
-            data_change: true,
-            stats: Some(stats_json),
-        });
-    }
+    let file_paths: Vec<_> = files
+        .iter()
+        .map(|(filename, _)| base_path.child(filename.as_str()))
+        .collect();
+
+    let obj_metas = futures::future::try_join_all(
+        file_paths.iter().map(|path| store.head(path)),
+    )
+    .await?;
+
+    let adds = files
+        .iter()
+        .zip(obj_metas.iter())
+        .map(|((filename, metadata), obj_meta)| build_add(filename, metadata, obj_meta, &schema))
+        .collect::<Result<Vec<_>, _>>()?;
 
     for _attempt in 0..MAX_COMMIT_RETRIES {
         let table_state = snapshot_table_state(engine.as_ref(), &table_url)?;
