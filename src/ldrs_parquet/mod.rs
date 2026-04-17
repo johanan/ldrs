@@ -1,9 +1,12 @@
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, SchemaRef};
 use futures::stream::StreamExt;
 use futures::Stream;
+use object_store::ObjectStore;
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::async_writer::ParquetObjectWriter;
-use parquet::arrow::AsyncArrowWriter;
+use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder};
 use parquet::basic::LogicalType;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
@@ -11,6 +14,8 @@ use parquet::schema::types::ColumnPath;
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use std::pin::pin;
 use std::sync::Arc;
+
+use parquet::arrow::RowNumber;
 
 use crate::arrow_access::arrow_transforms::{transform_batch, ArrowColumnTransformStrategy};
 use crate::storage::StorageProvider;
@@ -197,4 +202,48 @@ where
     }
 
     Ok(results)
+}
+
+pub const ROW_NUMBER_COLUMN: &str = "_row_number";
+
+/// Read just the parquet footer metadata from a file in object store.
+/// No data is read — only the file's footer (typically < 100KB).
+pub async fn read_parquet_metadata(
+    store: Arc<dyn ObjectStore>,
+    path: &object_store::path::Path,
+) -> Result<Arc<ParquetMetaData>, anyhow::Error> {
+    let reader = ParquetObjectReader::new(store, path.clone());
+    let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+    Ok(builder.metadata().clone())
+}
+
+pub async fn stream_projected_parquet(
+    store: Arc<dyn ObjectStore>,
+    path: &object_store::path::Path,
+    columns: &[String],
+    row_groups: Option<Vec<usize>>,
+) -> Result<
+    parquet::arrow::async_reader::ParquetRecordBatchStream<ParquetObjectReader>,
+    anyhow::Error,
+> {
+    let row_number_field = Arc::new(
+        Field::new(ROW_NUMBER_COLUMN, DataType::Int64, false).with_extension_type(RowNumber),
+    );
+    let options = ArrowReaderOptions::new().with_virtual_columns(vec![row_number_field])?;
+
+    let reader = ParquetObjectReader::new(store, path.clone());
+    let mut builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
+
+    let mask = parquet::arrow::ProjectionMask::columns(
+        builder.parquet_schema(),
+        columns.iter().map(|s| s.as_str()),
+    );
+
+    builder = builder.with_projection(mask);
+    if let Some(groups) = row_groups {
+        builder = builder.with_row_groups(groups);
+    }
+
+    let stream = builder.build()?;
+    Ok(stream)
 }

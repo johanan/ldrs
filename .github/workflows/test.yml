@@ -17,7 +17,18 @@ jobs:
           fetch-depth: 0
       - name: Set up Rust
         uses: actions/setup-go@v5
-      - name: Setup Postegres
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Install DuckDB CLI
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL -o /tmp/duckdb.zip \
+            https://github.com/duckdb/duckdb/releases/download/v1.5.2/duckdb_cli-linux-amd64.zip
+          unzip -o /tmp/duckdb.zip -d "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/duckdb" --version
+        shell: bash
+      - name: Setup Postgres
         run: scripts/setup_test.sh
         shell: bash
       - run: cargo test

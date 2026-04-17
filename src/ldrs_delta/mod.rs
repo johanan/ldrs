@@ -1,5 +1,8 @@
+mod dv;
+mod merge;
 mod stats;
 
+pub use merge::{merge_delta, MergeConfig, MergeStats, TxnConfig};
 pub use stats::{delta_stats_to_json, parquet_metadata_to_delta_stats, ColumnStats, DeltaStats};
 
 use crate::types::ColumnSpec;
@@ -28,6 +31,37 @@ pub struct DeltaDestination {
     pub columns: Vec<ColumnSpec>,
     pub max_rows: Option<usize>,
     pub max_bytes: Option<usize>,
+    pub mode: DeltaMode,
+}
+
+#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+pub enum DeltaMode {
+    Overwrite,
+    Merge {
+        merge_keys: Vec<String>,
+        allow_null_keys: bool,
+        txn: Option<MergeTxnConfig>,
+    },
+}
+
+/// Raw (unrendered) txn config from YAML. String templates are rendered at dispatch
+/// time against the execution context before constructing the runtime `TxnConfig`.
+#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+pub enum MergeTxnConfig {
+    SourceWatermark {
+        app_id: String,
+        watermark_column: String,
+    },
+    ProcessingTime {
+        app_id: String,
+        batch_version: Option<String>,
+    },
+}
+
+/// Look up a key under a namespaced form first (`prefix.key`), then fall back to bare `key`.
+fn get_ns<'a>(value: &'a Value, prefix: &str, key: &str) -> Option<&'a Value> {
+    let ns_key = format!("{}.{}", prefix, key);
+    value.get(&ns_key).or(value.get(key))
 }
 
 impl TryFrom<&Value> for DeltaDestination {
@@ -38,25 +72,72 @@ impl TryFrom<&Value> for DeltaDestination {
             .get("name")
             .and_then(|v| String::deserialize(v).ok())
             .ok_or(anyhow::anyhow!("Missing name"))?;
-        let columns = value
-            .get("delta.columns")
-            .or(value.get("columns"))
+        let columns = get_ns(value, "delta", "columns")
             .and_then(|c| Vec::<ColumnSpec>::deserialize(c).ok())
             .unwrap_or_default();
-        let max_rows = value
-            .get("delta.max_rows")
-            .or(value.get("max_rows"))
+        let max_rows = get_ns(value, "delta", "max_rows")
             .and_then(|v| usize::deserialize(v).ok());
-        let max_bytes = value
-            .get("delta.max_bytes")
-            .or(value.get("max_bytes"))
+        let max_bytes = get_ns(value, "delta", "max_bytes")
             .and_then(|v| usize::deserialize(v).ok());
+
+        // Merge mode detected by presence of merge_keys (namespaced or bare)
+        let mode = if let Some(keys_value) = get_ns(value, "delta", "merge_keys") {
+            let merge_keys = Vec::<String>::deserialize(keys_value)
+                .map_err(|e| anyhow::anyhow!("merge_keys must be a list of strings: {}", e))?;
+            if merge_keys.is_empty() {
+                anyhow::bail!("merge_keys cannot be empty");
+            }
+
+            let allow_null_keys = get_ns(value, "delta", "allow_null_keys")
+                .and_then(|v| bool::deserialize(v).ok())
+                .unwrap_or(false);
+
+            let app_id = get_ns(value, "delta", "app_id")
+                .and_then(|v| String::deserialize(v).ok())
+                .unwrap_or_else(|| "ldrs-merge-{{ name }}".to_string());
+
+            let txn_mode = get_ns(value, "delta", "txn_mode")
+                .and_then(|v| String::deserialize(v).ok());
+
+            let txn = match txn_mode.as_deref() {
+                Some("source_watermark") => {
+                    let watermark_column = get_ns(value, "delta", "watermark_column")
+                        .and_then(|v| String::deserialize(v).ok())
+                        .ok_or(anyhow::anyhow!(
+                            "source_watermark requires watermark_column"
+                        ))?;
+                    Some(MergeTxnConfig::SourceWatermark {
+                        app_id,
+                        watermark_column,
+                    })
+                }
+                Some("processing_time") => {
+                    let batch_version = get_ns(value, "delta", "batch_version")
+                        .and_then(|v| String::deserialize(v).ok());
+                    Some(MergeTxnConfig::ProcessingTime {
+                        app_id,
+                        batch_version,
+                    })
+                }
+                Some(other) => anyhow::bail!("unknown txn_mode: {}", other),
+                None => None,
+            };
+
+            DeltaMode::Merge {
+                merge_keys,
+                allow_null_keys,
+                txn,
+            }
+        } else {
+            DeltaMode::Overwrite
+        };
 
         Ok(DeltaDestination {
             name,
             columns,
             max_rows,
             max_bytes,
+            mode,
         })
     }
 }
@@ -107,6 +188,8 @@ struct DeltaAdd {
     data_change: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stats: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deletion_vector: Option<dv::DeletionVectorDescriptor>,
 }
 
 #[derive(Serialize)]
@@ -116,6 +199,8 @@ struct DeltaRemove {
     deletion_timestamp: i64,
     data_change: bool,
     size: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deletion_vector: Option<dv::DeletionVectorDescriptor>,
 }
 
 impl DeltaRemove {
@@ -125,8 +210,18 @@ impl DeltaRemove {
             deletion_timestamp: ts,
             data_change: true,
             size: file.size,
+            deletion_vector: None,
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeltaTxn {
+    app_id: String,
+    version: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_updated: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -137,6 +232,7 @@ enum DeltaAction<'a> {
     MetaData(&'a DeltaMetadata),
     Add(&'a DeltaAdd),
     Remove(&'a DeltaRemove),
+    Txn(&'a DeltaTxn),
 }
 
 fn arrow_schema_to_delta_struct(schema: &SchemaRef) -> Result<StructType, anyhow::Error> {
@@ -207,10 +303,20 @@ fn default_protocol() -> DeltaProtocol {
     }
 }
 
+fn merge_protocol() -> DeltaProtocol {
+    DeltaProtocol {
+        min_reader_version: 3,
+        min_writer_version: 7,
+        reader_features: vec!["timestampNtz".to_string(), "deletionVectors".to_string()],
+        writer_features: vec!["timestampNtz".to_string(), "deletionVectors".to_string()],
+    }
+}
+
 fn build_metadata(
     schema: &SchemaRef,
     table_id: Option<&str>,
     created_time: Option<i64>,
+    configuration: HashMap<String, String>,
 ) -> Result<DeltaMetadata, anyhow::Error> {
     let delta_schema = arrow_schema_to_delta_struct(schema)?;
     let schema_string = serde_json::to_string(&delta_schema)?;
@@ -226,7 +332,7 @@ fn build_metadata(
         schema_string,
         partition_columns: vec![],
         created_time: created_time.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
-        configuration: HashMap::new(),
+        configuration,
     })
 }
 
@@ -244,7 +350,7 @@ pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), an
     };
 
     let protocol = default_protocol();
-    let metadata = build_metadata(schema, None, None)?;
+    let metadata = build_metadata(schema, None, None, HashMap::new())?;
 
     let actions = vec![
         DeltaAction::CommitInfo(&commit_info),
@@ -283,6 +389,7 @@ struct TableState {
     active_files: Vec<ScanFile>,
     table_id: String,
     created_time: Option<i64>,
+    has_deletion_vectors: bool,
 }
 
 fn snapshot_table_state(
@@ -294,6 +401,12 @@ fn snapshot_table_state(
     let metadata = snapshot.table_configuration().metadata();
     let table_id = metadata.id().to_string();
     let created_time = metadata.created_time();
+    // we can read the property if dvs have been added
+    // this either does not exist or has a value of true or false
+    let has_deletion_vectors = snapshot
+        .table_properties()
+        .enable_deletion_vectors
+        .unwrap_or(false);
 
     let scan = snapshot.clone().scan_builder().build()?;
 
@@ -312,6 +425,26 @@ fn snapshot_table_state(
         active_files,
         table_id,
         created_time,
+        has_deletion_vectors,
+    })
+}
+
+fn build_add(
+    filename: &str,
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    obj_meta: &object_store::ObjectMeta,
+    schema: &SchemaRef,
+) -> Result<DeltaAdd, anyhow::Error> {
+    let file_stats = parquet_metadata_to_delta_stats(metadata, schema);
+    let stats_json = delta_stats_to_json(&file_stats, schema)?;
+    Ok(DeltaAdd {
+        path: filename.to_string(),
+        partition_values: HashMap::new(),
+        size: obj_meta.size as i64,
+        modification_time: obj_meta.last_modified.timestamp_millis(),
+        data_change: true,
+        stats: Some(stats_json),
+        deletion_vector: None,
     })
 }
 
@@ -322,6 +455,7 @@ fn version_to_log_filename(version: Version) -> String {
 const DEFAULT_MAX_ROWS: usize = 1_000_000;
 const DEFAULT_MAX_BYTES: usize = 128 * 1024 * 1024; // 128MB
 const MAX_COMMIT_RETRIES: usize = 10;
+const MERGE_MAX_RETRIES: usize = 3;
 
 fn build_overwrite_commit(
     table_state: &TableState,
@@ -331,7 +465,12 @@ fn build_overwrite_commit(
     let next_version = table_state.version + 1;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let remove = DeltaRemove::from_scan_file(now_ms);
-    let removes: Vec<_> = table_state.active_files.iter().cloned().map(remove).collect();
+    let removes: Vec<_> = table_state
+        .active_files
+        .iter()
+        .cloned()
+        .map(remove)
+        .collect();
 
     let commit_info = DeltaCommitInfo {
         timestamp: now_ms,
@@ -345,6 +484,7 @@ fn build_overwrite_commit(
         schema,
         Some(&table_state.table_id),
         table_state.created_time,
+        HashMap::new(),
     )?;
 
     let mut actions: Vec<DeltaAction> = vec![
@@ -389,21 +529,21 @@ where
     )
     .await?;
 
-    let mut adds = Vec::with_capacity(files.len());
-    for (filename, parquet_metadata) in files {
-        let file_path = base_path.child(filename.as_str());
-        let obj_meta = store.head(&file_path).await?;
-        let file_stats = parquet_metadata_to_delta_stats(&parquet_metadata, &schema);
-        let stats_json = delta_stats_to_json(&file_stats, &schema)?;
-        adds.push(DeltaAdd {
-            path: filename,
-            partition_values: HashMap::new(),
-            size: obj_meta.size as i64,
-            modification_time: obj_meta.last_modified.timestamp_millis(),
-            data_change: true,
-            stats: Some(stats_json),
-        });
-    }
+    let file_paths: Vec<_> = files
+        .iter()
+        .map(|(filename, _)| base_path.child(filename.as_str()))
+        .collect();
+
+    let obj_metas = futures::future::try_join_all(
+        file_paths.iter().map(|path| store.head(path)),
+    )
+    .await?;
+
+    let adds = files
+        .iter()
+        .zip(obj_metas.iter())
+        .map(|((filename, metadata), obj_meta)| build_add(filename, metadata, obj_meta, &schema))
+        .collect::<Result<Vec<_>, _>>()?;
 
     for _attempt in 0..MAX_COMMIT_RETRIES {
         let table_state = snapshot_table_state(engine.as_ref(), &table_url)?;
@@ -429,4 +569,145 @@ where
         }
     }
     anyhow::bail!("failed to commit delta overwrite after {MAX_COMMIT_RETRIES} attempts")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(yaml: &str) -> DeltaDestination {
+        let value: Value = serde_yaml::from_str(yaml).unwrap();
+        DeltaDestination::try_from(&value).unwrap()
+    }
+
+    #[test]
+    fn overwrite_default_no_merge_keys() {
+        let dest = parse("name: public.users");
+        assert_eq!(dest.name, "public.users");
+        assert_eq!(dest.mode, DeltaMode::Overwrite);
+    }
+
+    #[test]
+    fn merge_mode_from_namespaced_keys() {
+        let dest = parse(
+            r#"
+name: public.users
+delta.merge_keys: [id]
+"#,
+        );
+        match dest.mode {
+            DeltaMode::Merge {
+                merge_keys,
+                allow_null_keys,
+                txn,
+            } => {
+                assert_eq!(merge_keys, vec!["id".to_string()]);
+                assert!(!allow_null_keys);
+                assert!(txn.is_none());
+            }
+            _ => panic!("expected Merge mode"),
+        }
+    }
+
+    #[test]
+    fn merge_mode_from_bare_keys() {
+        let dest = parse(
+            r#"
+name: public.users
+merge_keys: [id, name]
+"#,
+        );
+        match dest.mode {
+            DeltaMode::Merge { merge_keys, .. } => {
+                assert_eq!(merge_keys, vec!["id".to_string(), "name".to_string()]);
+            }
+            _ => panic!("expected Merge mode"),
+        }
+    }
+
+    #[test]
+    fn merge_source_watermark_parses() {
+        let dest = parse(
+            r#"
+name: public.users
+delta.merge_keys: [id]
+delta.txn_mode: source_watermark
+delta.watermark_column: updated_at
+delta.app_id: "my-app"
+"#,
+        );
+        match dest.mode {
+            DeltaMode::Merge {
+                txn: Some(MergeTxnConfig::SourceWatermark { app_id, watermark_column }),
+                ..
+            } => {
+                assert_eq!(app_id, "my-app");
+                assert_eq!(watermark_column, "updated_at");
+            }
+            _ => panic!("expected SourceWatermark txn"),
+        }
+    }
+
+    #[test]
+    fn merge_processing_time_parses() {
+        let dest = parse(
+            r#"
+name: public.users
+delta.merge_keys: [id]
+delta.txn_mode: processing_time
+delta.batch_version: "{{ run_id }}"
+"#,
+        );
+        match dest.mode {
+            DeltaMode::Merge {
+                txn: Some(MergeTxnConfig::ProcessingTime { app_id, batch_version }),
+                ..
+            } => {
+                // app_id defaulted to ldrs-merge-{{ name }} template (rendered later)
+                assert_eq!(app_id, "ldrs-merge-{{ name }}");
+                assert_eq!(batch_version.as_deref(), Some("{{ run_id }}"));
+            }
+            _ => panic!("expected ProcessingTime txn"),
+        }
+    }
+
+    #[test]
+    fn merge_allow_null_keys_parses() {
+        let dest = parse(
+            r#"
+name: public.users
+delta.merge_keys: [id]
+delta.allow_null_keys: true
+"#,
+        );
+        match dest.mode {
+            DeltaMode::Merge { allow_null_keys, .. } => assert!(allow_null_keys),
+            _ => panic!("expected Merge mode"),
+        }
+    }
+
+    #[test]
+    fn unknown_txn_mode_errors() {
+        let value: Value = serde_yaml::from_str(
+            r#"
+name: public.users
+delta.merge_keys: [id]
+delta.txn_mode: bogus
+"#,
+        )
+        .unwrap();
+        assert!(DeltaDestination::try_from(&value).is_err());
+    }
+
+    #[test]
+    fn empty_merge_keys_errors() {
+        let value: Value = serde_yaml::from_str(
+            r#"
+name: public.users
+delta.merge_keys: []
+"#,
+        )
+        .unwrap();
+        assert!(DeltaDestination::try_from(&value).is_err());
+    }
 }

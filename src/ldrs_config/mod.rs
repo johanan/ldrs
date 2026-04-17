@@ -18,7 +18,9 @@ use crate::{
     },
     ldrs_arrow::build_source_and_target_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
-    ldrs_delta::overwrite_delta,
+    ldrs_delta::{
+        merge_delta, overwrite_delta, DeltaMode, MergeConfig, MergeTxnConfig, TxnConfig,
+    },
     ldrs_env::{collect_params, collect_vars_by_prefix, setup_handlebars, LdrsExecutionContext},
     ldrs_parquet::{default_writer_props, with_bloom_filters, write_parquet},
     ldrs_postgres::{client::check_for_role, postgres_execution::load_to_postgres},
@@ -107,6 +109,40 @@ pub fn infer_env_type(env_type: &str, vars: &[(String, String)]) -> Option<Strin
             _ => None,
         },
         None => None,
+    }
+}
+
+fn resolve_txn_config(
+    yaml: Option<MergeTxnConfig>,
+    context: &LdrsExecutionContext,
+) -> Result<TxnConfig, anyhow::Error> {
+    match yaml {
+        None => Ok(TxnConfig::None),
+        Some(MergeTxnConfig::SourceWatermark {
+            app_id,
+            watermark_column,
+        }) => Ok(TxnConfig::SourceWatermark {
+            app_id: context.render_template(&app_id)?,
+            watermark_column,
+        }),
+        Some(MergeTxnConfig::ProcessingTime {
+            app_id,
+            batch_version,
+        }) => {
+            let batch_version = batch_version
+                .map(|s| context.render_template(&s))
+                .transpose()?
+                .map(|s| {
+                    s.parse::<i64>().map_err(|e| {
+                        anyhow::anyhow!("batch_version must parse as i64: {}", e)
+                    })
+                })
+                .transpose()?;
+            Ok(TxnConfig::ProcessingTime {
+                app_id: context.render_template(&app_id)?,
+                batch_version,
+            })
+        }
     }
 }
 
@@ -337,15 +373,41 @@ pub async fn create_ldrs_exec(
                         schema
                     };
 
-                    overwrite_delta(
-                        &table_path,
-                        schema,
-                        strategies,
-                        src.stream_type,
-                        delta_dest.max_rows,
-                        delta_dest.max_bytes,
-                    )
-                    .await?;
+                    match delta_dest.mode {
+                        DeltaMode::Overwrite => {
+                            overwrite_delta(
+                                &table_path,
+                                schema,
+                                strategies,
+                                src.stream_type,
+                                delta_dest.max_rows,
+                                delta_dest.max_bytes,
+                            )
+                            .await?;
+                        }
+                        DeltaMode::Merge {
+                            merge_keys,
+                            allow_null_keys,
+                            txn,
+                        } => {
+                            let txn_config = resolve_txn_config(txn, &context)?;
+                            let merge_config = MergeConfig {
+                                merge_keys,
+                                allow_null_keys,
+                                max_rows: delta_dest.max_rows,
+                                max_bytes: delta_dest.max_bytes,
+                                txn_config,
+                            };
+                            merge_delta(
+                                &table_path,
+                                schema,
+                                strategies,
+                                src.stream_type,
+                                merge_config,
+                            )
+                            .await?;
+                        }
+                    }
                     Ok(())
                 }
             },
