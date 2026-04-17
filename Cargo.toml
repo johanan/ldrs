@@ -22,6 +22,7 @@ chrono = "0.4.39"
 clap = { version = "4.5.54", features = ["derive"] }
 delta_kernel = { version = "0.20.0", features = ["internal-api", "default-engine-rustls", "arrow-57"] }
 dotenvy = "0.15.7"
+crc = "3.4"
 futures = "0.3.31"
 mlua = { version = "0.11.5", features = ["lua54", "vendored", "serialize"] }
 native-tls = { version = "0.2.14", features = ["vendored"] }
@@ -51,6 +52,7 @@ nom = { version = "8.0.0" }
 handlebars = { version = "6.4.0", features = ["string_helpers"] }
 
 [dev-dependencies]
+bytes = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 rstest = "0.26.1"
 test-log = { version = "0.2.19", features = ["default", "trace"] }
@@ -59,7 +61,7 @@ tokio-util = { version = "0.7.14", features = ["io", "io-util"] }
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
-lto = "thin"
+lto = "fat"
 
 [[bench]]
 name = "arrow_extraction"

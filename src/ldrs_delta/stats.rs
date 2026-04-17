@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use delta_kernel::expressions::Scalar;
 use parquet::data_type::AsBytes;
 use parquet::file::metadata::ParquetMetaData;
@@ -53,6 +53,23 @@ fn stats_to_scalars(stats: &Statistics) -> (Option<Scalar>, Option<Scalar>) {
             s.min_opt().map(|v| Scalar::Binary(v.as_bytes().to_vec())),
             s.max_opt().map(|v| Scalar::Binary(v.as_bytes().to_vec())),
         ),
+    }
+}
+
+/// Coerce a physical-type Scalar from parquet stats to the logical-type Scalar
+/// expected by delta-kernel for a column of the given DataType.
+/// Most cases pass through; only a few need conversion (Binary→String for Utf8,
+/// Long→Timestamp, Integer→Date).
+fn coerce_to_logical(scalar: Option<Scalar>, data_type: &DataType) -> Option<Scalar> {
+    use arrow_schema::DataType::*;
+    match (scalar?, data_type) {
+        (Scalar::Binary(bytes), Utf8 | LargeUtf8 | Utf8View) => std::str::from_utf8(&bytes)
+            .ok()
+            .map(|s| Scalar::String(s.to_string())),
+        (Scalar::Long(v), Timestamp(_, Some(_))) => Some(Scalar::Timestamp(v)),
+        (Scalar::Long(v), Timestamp(_, None)) => Some(Scalar::TimestampNtz(v)),
+        (Scalar::Integer(v), Date32) => Some(Scalar::Date(v)),
+        (scalar, _) => Some(scalar),
     }
 }
 
@@ -188,6 +205,109 @@ pub fn delta_stats_to_json(
     });
 
     serde_json::to_string(&stats_obj).map_err(Into::into)
+}
+
+fn scalar_to_i64(scalar: &Scalar) -> Result<i64, anyhow::Error> {
+    match scalar {
+        Scalar::Byte(v) => Ok(*v as i64),
+        Scalar::Short(v) => Ok(*v as i64),
+        Scalar::Integer(v) => Ok(*v as i64),
+        Scalar::Long(v) => Ok(*v),
+        Scalar::Timestamp(micros) => Ok(*micros),
+        Scalar::TimestampNtz(micros) => Ok(*micros),
+        Scalar::Date(days) => Ok(*days as i64),
+        other => anyhow::bail!(
+            "watermark column type {:?} cannot be converted to i64",
+            other
+        ),
+    }
+}
+
+pub(crate) fn max_stat_as_i64(
+    source_files: &[(String, ParquetMetaData)],
+    col_name: &str,
+    schema: &SchemaRef,
+) -> Result<i64, anyhow::Error> {
+    let col_idx = schema.index_of(col_name)?;
+
+    let max_scalar = source_files
+        .iter()
+        .flat_map(|(_, m)| m.row_groups())
+        .filter_map(|rg| rg.column(col_idx).statistics())
+        .fold(None, |acc, stats| {
+            let (_, new_max) = stats_to_scalars(stats);
+            pick_bound(acc, new_max, Ordering::Greater)
+        })
+        .ok_or_else(|| anyhow::anyhow!("no stats for watermark column '{}'", col_name))?;
+
+    scalar_to_i64(&max_scalar)
+}
+
+pub(crate) fn key_bounds_as_scalars(
+    source_files: &[(String, ParquetMetaData)],
+    key_col_name: &str,
+    schema: &SchemaRef,
+) -> Option<(Scalar, Scalar)> {
+    let col_idx = schema.index_of(key_col_name).ok()?;
+    let data_type = schema.field(col_idx).data_type();
+
+    let (min, max) = source_files
+        .iter()
+        .flat_map(|(_, m)| m.row_groups())
+        .filter_map(|rg| rg.column(col_idx).statistics())
+        .fold(None, |acc, stats| {
+            let (new_min, new_max) = stats_to_scalars(stats);
+            match acc {
+                None => Some((new_min?, new_max?)),
+                Some((cur_min, cur_max)) => Some((
+                    pick_bound(Some(cur_min), new_min, Ordering::Less)?,
+                    pick_bound(Some(cur_max), new_max, Ordering::Greater)?,
+                )),
+            }
+        })?;
+
+    Some((
+        coerce_to_logical(Some(min), data_type)?,
+        coerce_to_logical(Some(max), data_type)?,
+    ))
+}
+
+pub(crate) fn select_row_groups_by_scalars(
+    metadata: &ParquetMetaData,
+    key_col_name: &str,
+    schema: &SchemaRef,
+    min_key: &Scalar,
+    max_key: &Scalar,
+) -> Vec<usize> {
+    let col_idx = match schema.index_of(key_col_name) {
+        Ok(idx) => idx,
+        Err(_) => return (0..metadata.num_row_groups()).collect(),
+    };
+
+    metadata
+        .row_groups()
+        .iter()
+        .enumerate()
+        .filter(|(_, rg)| {
+            let stats = match rg.column(col_idx).statistics() {
+                Some(s) => s,
+                None => return true,
+            };
+            let (rg_min, rg_max) = stats_to_scalars(stats);
+            // rg_max >= min_key
+            let max_ge_min = rg_max
+                .as_ref()
+                .and_then(|m| m.logical_partial_cmp(min_key))
+                .is_none_or(|ord| ord != Ordering::Less);
+            // rg_min <= max_key
+            let min_le_max = rg_min
+                .as_ref()
+                .and_then(|m| m.logical_partial_cmp(max_key))
+                .is_none_or(|ord| ord != Ordering::Greater);
+            max_ge_min && min_le_max
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 pub fn parquet_metadata_to_delta_stats(

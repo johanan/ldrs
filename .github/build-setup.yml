@@ -1,3 +1,11 @@
+- name: Set target-cpu for optimized builds
+  shell: bash
+  run: |
+    case "${{ join(matrix.targets, ' ') }}" in
+      *x86_64*)          echo "RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=x86-64-v3" >> $GITHUB_ENV ;;
+      *aarch64*apple*)   echo "RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=apple-m1" >> $GITHUB_ENV ;;
+      *aarch64*linux*)   echo "RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=neoverse-n1" >> $GITHUB_ENV ;;
+    esac
 - name: Set up Go
   uses: actions/setup-go@v5
   with:

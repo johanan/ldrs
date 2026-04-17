@@ -206,6 +206,17 @@ where
 
 pub const ROW_NUMBER_COLUMN: &str = "_row_number";
 
+/// Read just the parquet footer metadata from a file in object store.
+/// No data is read — only the file's footer (typically < 100KB).
+pub async fn read_parquet_metadata(
+    store: Arc<dyn ObjectStore>,
+    path: &object_store::path::Path,
+) -> Result<Arc<ParquetMetaData>, anyhow::Error> {
+    let reader = ParquetObjectReader::new(store, path.clone());
+    let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+    Ok(builder.metadata().clone())
+}
+
 pub async fn stream_projected_parquet(
     store: Arc<dyn ObjectStore>,
     path: &object_store::path::Path,

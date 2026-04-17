@@ -526,3 +526,120 @@ tables:
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
+
+#[tokio::test]
+#[test_log::test]
+async fn test_delta_merge_with_config() {
+    let cd = std::env::current_dir().unwrap();
+
+    // Same config run twice:
+    //   1st run: ensure_table creates v0, merge inserts all source rows at v1
+    //   2nd run: merge finds same keys in target, writes DVs + new adds at v2
+    let config = r#"
+src: file
+dest: delta.merge
+src_defaults:
+  filename: tests/test_data/{{ name }}/{{ name }}.snappy.parquet
+
+tables:
+  - name: public.numbers
+    delta.merge_keys: [bigint_value]
+"#;
+
+    let src_url = "file://".to_string();
+    let delta_root = format!(
+        "{}/tests/test_data/delta_writes/config_delta_merge_root",
+        cd.display()
+    );
+    let dest_url = format!("file://{}/", delta_root);
+    let table_path = format!("{}/public.numbers/", delta_root);
+
+    // cleanup before test
+    let _ = std::fs::remove_dir_all(&table_path);
+
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), src_url),
+        ("LDRS_DEST".to_string(), dest_url),
+    ];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // First run: creates the table (v0) and commits the initial merge (v1)
+    create_ldrs_exec(config, &ldrs_env, None, &rt.handle())
+        .await
+        .unwrap();
+
+    let v0_path = format!("{}_delta_log/00000000000000000000.json", table_path);
+    let v1_path = format!("{}_delta_log/00000000000000000001.json", table_path);
+    assert!(
+        std::path::Path::new(&v0_path).exists(),
+        "first run should create v0 (ensure_table)"
+    );
+    assert!(
+        std::path::Path::new(&v1_path).exists(),
+        "first run should commit merge at v1"
+    );
+
+    let v1_content = std::fs::read_to_string(&v1_path).unwrap();
+    let v1_commit: serde_json::Value =
+        serde_json::from_str(v1_content.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        v1_commit["commitInfo"]["operation"], "MERGE",
+        "first run should dispatch to merge_delta"
+    );
+
+    // First merge into an empty table should have no remove actions — pure insert
+    let v1_removes = v1_content
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| v.get("remove").cloned())
+                .is_some()
+        })
+        .count();
+    assert_eq!(v1_removes, 0, "first merge on empty table has no removes");
+
+    // Second run: same source, same keys, so all rows match → DV path
+    create_ldrs_exec(config, &ldrs_env, None, &rt.handle())
+        .await
+        .unwrap();
+
+    let v2_path = format!("{}_delta_log/00000000000000000002.json", table_path);
+    assert!(
+        std::path::Path::new(&v2_path).exists(),
+        "second run should commit merge at v2"
+    );
+
+    let v2_content = std::fs::read_to_string(&v2_path).unwrap();
+    let v2_lines: Vec<&str> = v2_content.lines().collect();
+
+    let v2_commit: serde_json::Value = serde_json::from_str(v2_lines[0]).unwrap();
+    assert_eq!(v2_commit["commitInfo"]["operation"], "MERGE");
+
+    // Second merge should find the same keys → at least one remove + DV add
+    let v2_removes = v2_lines
+        .iter()
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| v.get("remove").cloned())
+                .is_some()
+        })
+        .count();
+    assert!(v2_removes > 0, "second merge should produce remove actions");
+
+    let has_dv_add = v2_lines.iter().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("add").and_then(|a| a.get("deletionVector")).cloned())
+            .is_some()
+    });
+    assert!(has_dv_add, "second merge should produce an add with a DV");
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
