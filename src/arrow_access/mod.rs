@@ -7,7 +7,6 @@ pub mod extracted_values;
 
 use std::borrow::Cow;
 
-use arrow::datatypes::ArrowNativeType;
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal32Array, Decimal64Array,
@@ -16,10 +15,9 @@ use arrow_array::{
     TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
-use bigdecimal::FromPrimitive;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use pg_bigdecimal::{BigDecimal, BigInt, PgNumeric};
-use serde_json::Value;
+
+use crate::ldrs_postgres::pg_numeric::PgFixedNumeric;
 
 macro_rules! define_column_accessor {
     ($(($variant:ident, $array_type:ty, $value_type:ty)),*) => {
@@ -99,92 +97,76 @@ define_column_accessor!(
 );
 
 impl<'a> TypedColumnAccessor<'a> {
-    pub fn as_serde(&self, row: usize) -> Option<Value> {
-        match self {
-            Self::Utf8(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    let v = arr.value(row);
-                    serde_json::from_str::<Value>(v)
-                        .map(Some)
-                        .unwrap_or_else(|e| panic!("Failed to parse JSON for row {}: {}", row, e))
-                }
-            }
-            _ => panic!("Not a Utf8 array"),
-        }
-    }
-
-    pub fn as_pg_numeric(&self, row: usize, scale: i32) -> Option<PgNumeric> {
+    pub fn as_pg_numeric(&self, row: usize, scale: i32) -> Option<PgFixedNumeric> {
         match self {
             Self::Decimal128(arr, _, scale) => {
                 if arr.is_null(row) {
                     None
                 } else {
-                    let big_int = BigInt::from_i128(arr.value(row));
-                    Some(pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
-                        BigDecimal::new(bi, (*scale).to_i64().expect("Scale failed"))
-                    })))
+                    Some(PgFixedNumeric {
+                        value: arr.value(row),
+                        scale: *scale as i16,
+                    })
                 }
             }
             Self::Decimal64(arr, _, scale) => {
                 if arr.is_null(row) {
                     None
                 } else {
-                    let big_int = BigInt::from_i64(arr.value(row) as i64);
-                    Some(pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
-                        BigDecimal::new(bi, (*scale).to_i64().expect("Scale failed"))
-                    })))
+                    Some(PgFixedNumeric {
+                        value: arr.value(row) as i128,
+                        scale: *scale as i16,
+                    })
                 }
             }
             Self::Decimal32(arr, _, scale) => {
                 if arr.is_null(row) {
                     None
                 } else {
-                    let big_int = BigInt::from_i64(arr.value(row) as i64);
-                    Some(pg_bigdecimal::PgNumeric::new(big_int.map(|bi| {
-                        BigDecimal::new(bi, (*scale).to_i64().expect("Scale failed"))
-                    })))
+                    Some(PgFixedNumeric {
+                        value: arr.value(row) as i128,
+                        scale: *scale as i16,
+                    })
                 }
             }
             Self::Int64(arr) => {
                 if arr.is_null(row) {
                     None
                 } else {
-                    let big_int = BigInt::from_i64(arr.value(row));
-                    Some(pg_bigdecimal::PgNumeric::new(
-                        big_int.map(|bi| BigDecimal::new(bi, i64::from(scale))),
-                    ))
+                    Some(PgFixedNumeric {
+                        value: arr.value(row) as i128,
+                        scale: scale as i16,
+                    })
                 }
             }
             Self::Int32(arr) => {
                 if arr.is_null(row) {
                     None
                 } else {
-                    let big_int = BigInt::from_i32(arr.value(row));
-                    Some(pg_bigdecimal::PgNumeric::new(
-                        big_int.map(|bi| BigDecimal::new(bi, i64::from(scale))),
-                    ))
+                    Some(PgFixedNumeric {
+                        value: arr.value(row) as i128,
+                        scale: scale as i16,
+                    })
                 }
             }
             Self::Int16(arr) => {
                 if arr.is_null(row) {
                     None
                 } else {
-                    let big_int = BigInt::from_i16(arr.value(row));
-                    Some(pg_bigdecimal::PgNumeric::new(
-                        big_int.map(|bi| BigDecimal::new(bi, i64::from(scale))),
-                    ))
+                    Some(PgFixedNumeric {
+                        value: arr.value(row) as i128,
+                        scale: scale as i16,
+                    })
                 }
             }
             Self::Int8(arr) => {
                 if arr.is_null(row) {
                     None
                 } else {
-                    let big_int = BigInt::from_i8(arr.value(row));
-                    Some(pg_bigdecimal::PgNumeric::new(
-                        big_int.map(|bi| BigDecimal::new(bi, i64::from(scale))),
-                    ))
+                    Some(PgFixedNumeric {
+                        value: arr.value(row) as i128,
+                        scale: scale as i16,
+                    })
                 }
             }
             _ => panic!("Not a Decimal128 or Integer array"),
@@ -367,12 +349,6 @@ impl<'a> TypedColumnAccessor<'a> {
             }
             _ => panic!("Not a FixedSizeBinary array"),
         }
-    }
-
-    #[inline]
-    pub fn Struct(&self) -> Option<Value> {
-        // to be implemented later
-        None
     }
 
     #[inline]

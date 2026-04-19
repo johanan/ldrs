@@ -7,8 +7,10 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "ldrs-sf",
-	Short: "A helper for ldrs to run Snowflake queries",
+	Use:           "ldrs-sf",
+	Short:         "A helper for ldrs to run Snowflake queries",
+	SilenceErrors: true,
+	SilenceUsage:  true,
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()
 	},

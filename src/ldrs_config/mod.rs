@@ -18,9 +18,7 @@ use crate::{
     },
     ldrs_arrow::build_source_and_target_schema,
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
-    ldrs_delta::{
-        merge_delta, overwrite_delta, DeltaMode, MergeConfig, MergeTxnConfig, TxnConfig,
-    },
+    ldrs_delta::{merge_delta, overwrite_delta, DeltaMode, MergeConfig, MergeTxnConfig, TxnConfig},
     ldrs_env::{collect_params, collect_vars_by_prefix, setup_handlebars, LdrsExecutionContext},
     ldrs_parquet::{default_writer_props, with_bloom_filters, write_parquet},
     ldrs_postgres::{client::check_for_role, postgres_execution::load_to_postgres},
@@ -133,9 +131,8 @@ fn resolve_txn_config(
                 .map(|s| context.render_template(&s))
                 .transpose()?
                 .map(|s| {
-                    s.parse::<i64>().map_err(|e| {
-                        anyhow::anyhow!("batch_version must parse as i64: {}", e)
-                    })
+                    s.parse::<i64>()
+                        .map_err(|e| anyhow::anyhow!("batch_version must parse as i64: {}", e))
                 })
                 .transpose()?;
             Ok(TxnConfig::ProcessingTime {
@@ -241,7 +238,8 @@ pub async fn create_ldrs_exec(
                 let file_md = builder.metadata().clone();
                 let fields = get_fields(file_md.file_metadata())?;
 
-                let stream = builder.with_batch_size(1024).build()?;
+                // matches DuckDB STANDARD_VECTOR_SIZE
+                let stream = builder.with_batch_size(2048).build()?;
                 let source_cols = fields
                     .iter()
                     .filter_map(|pq| ColumnSpec::try_from(pq).ok())

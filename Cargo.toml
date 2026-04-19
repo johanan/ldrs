@@ -1,6 +1,6 @@
 [package]
 name = "ldrs"
-version = "0.17.1"
+version = "0.17.2"
 edition = "2021"
 repository = "https://github.com/johanan/ldrs"
 authors = ["Joshua Johanan"]
@@ -17,7 +17,7 @@ anyhow = "1.0.100"
 arrow = { version = "57", features = ["chrono-tz"] }
 arrow-array = "57"
 arrow-schema = { version = "57", features = ["serde"] }
-bigdecimal = "0.4.10"
+bytes = "1"
 chrono = "0.4.39"
 clap = { version = "4.5.54", features = ["derive"] }
 delta_kernel = { version = "0.20.0", features = ["internal-api", "default-engine-rustls", "arrow-57"] }
@@ -31,7 +31,6 @@ parking_lot = "0.12"
 parquet = { version = "57", features = ["async", "arrow", "object_store", "arrow_canonical_extension_types"] }
 roaring = "0.11"
 z85 = "3.0"
-pg_bigdecimal = "0.1.5"
 postgres-native-tls = "0.5.2"
 postgres-types = "0.2.12"
 serde = { version = "1.0.228", features = ["serde_derive"] }
@@ -41,7 +40,6 @@ tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "macros"] }
 tokio-postgres = { version = "0.7.16", features = [
     "with-chrono-0_4",
     "with-uuid-1",
-    "with-serde_json-1",
 ] }
 tokio-stream = "0.1.18"
 tracing = "0.1.44"
@@ -52,7 +50,6 @@ nom = { version = "8.0.0" }
 handlebars = { version = "6.4.0", features = ["string_helpers"] }
 
 [dev-dependencies]
-bytes = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 rstest = "0.26.1"
 test-log = { version = "0.2.19", features = ["default", "trace"] }

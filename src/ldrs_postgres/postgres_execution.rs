@@ -161,8 +161,7 @@ where
                         .iter()
                         .zip(final_cols.iter())
                         .map(|(accessor, col_schema)| ColumnConverter::new(accessor, col_schema))
-                        .collect::<Result<Vec<_>, _>>()
-                        .unwrap();
+                        .collect::<Result<Vec<_>, _>>()?;
 
                     let mut batch_buffer =
                         Vec::<ExtractedValue>::with_capacity(batch.columns().len());
@@ -176,16 +175,14 @@ where
                             .as_mut()
                             .write_raw(&batch_buffer)
                             .await
-                            .with_context(|| "Failed to write row to PostgreSQL")
-                            .unwrap();
+                            .with_context(|| "Failed to write row to PostgreSQL")?;
                     }
                 }
 
                 pinned_writer
                     .finish()
                     .await
-                    .with_context(|| "Could not finish copy")
-                    .unwrap();
+                    .with_context(|| "Could not finish copy")?;
             }
         }
     }

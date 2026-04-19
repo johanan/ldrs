@@ -135,6 +135,9 @@ impl ColumnType {
     }
 }
 
+// Parquet/Snowflake store some decimals with a physical int
+// Arrow cast sees these as ints and we lose the scale
+// which is why we test for int backed decimals and have variants to capture the scale
 pub fn build_arrow_transform_strategy(
     source_logical: impl Into<ColumnType>,
     target_logical: impl Into<ColumnType>,
