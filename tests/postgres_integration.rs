@@ -129,3 +129,169 @@ async fn test_postgres_env_role() {
     assert!(ex.is_err());
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
+
+#[tokio::test]
+#[test_log::test]
+async fn test_postgres_all_parquets() {
+    let file_url = "file://";
+    let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), file_url.to_string()),
+        ("LDRS_DEST".to_string(), pg_url.to_string()),
+    ];
+
+    let config = "
+dest: pg.drop_replace
+src: file
+
+tables:
+  - name: public_test_all.users
+    filename: tests/test_data/public.users/public.users.snappy.parquet
+  - name: public_test_all.strings
+    filename: tests/test_data/public.string_values/public.strings.snappy.parquet
+  - name: public_test_all.numbers
+    filename: tests/test_data/public.numbers/public.numbers.snappy.parquet
+";
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let client = create_connection(pg_url).await.unwrap();
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_all CASCADE")
+        .await;
+    let _ = client.batch_execute("CREATE SCHEMA public_test_all").await;
+
+    let ex = create_ldrs_exec(config, &ldrs_env, None, &rt.handle()).await;
+    assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
+
+    for table in ["users", "strings", "numbers"] {
+        let rows = client
+            .query(&format!("SELECT * FROM public_test_all.{}", table), &[])
+            .await
+            .unwrap();
+        assert!(
+            !rows.is_empty(),
+            "public_test_all.{} should have rows after load",
+            table
+        );
+    }
+
+    // JSONB round-trip value checks. PG operators (->>, jsonb_typeof) reject
+    // malformed JSONB, so these double as wire-format validation.
+    let empty_type: String = client
+        .query_one(
+            "SELECT jsonb_typeof(jsonb_value) FROM public_test_all.strings \
+             WHERE varchar_value = 'a'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        empty_type, "object",
+        "empty jsonb '{{}}' should be an object"
+    );
+
+    let nested_value: String = client
+        .query_one(
+            "SELECT jsonb_value->>'key' FROM public_test_all.strings \
+             WHERE varchar_value = 'b'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(nested_value, "value", "jsonb key extraction round-trip");
+
+    // Numeric round-trip value checks. Cast to text so assertions are type-neutral —
+    for (smallint, expected_decimal) in [
+        (3i32, "3.000000000000000"),
+        (0, "468797.177024568000000"),
+        (32767, "507531.111989867000000"),
+    ] {
+        let actual: String = client
+            .query_one(
+                "SELECT decimal_value::text FROM public_test_all.numbers \
+                 WHERE smallint_value = $1",
+                &[&smallint],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            actual, expected_decimal,
+            "decimal round-trip for smallint_value={}",
+            smallint
+        );
+    }
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+#[tokio::test]
+#[test_log::test]
+async fn test_postgres_numeric_edge_cases() {
+    let file_url = "file://";
+    let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), file_url.to_string()),
+        ("LDRS_DEST".to_string(), pg_url.to_string()),
+    ];
+
+    let config = "
+dest: pg.drop_replace
+src: file
+
+tables:
+  - name: public_test_edge.numbers_edge
+    filename: tests/test_data/public.numbers_edge/numbers_edge.snappy.parquet
+";
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let client = create_connection(pg_url).await.unwrap();
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_edge CASCADE")
+        .await;
+    let _ = client.batch_execute("CREATE SCHEMA public_test_edge").await;
+
+    let ex = create_ldrs_exec(config, &ldrs_env, None, &rt.handle()).await;
+    assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
+
+    // Edge cases covering PgFixedNumeric branches not exercised by the main fixture:
+    //   id=1 → zero (ndigits=0 fast path)
+    //   id=2 → negative, multi-group fractional
+    //   id=3 → value < 1 (negative weight)
+    //   id=4 → negative AND value < 1
+    for (id, expected) in [
+        (1i32, "0.000000000000000"),
+        (2, "-123.456789012345000"),
+        (3, "0.000000000000005"),
+        (4, "-0.123456789012345"),
+    ] {
+        let actual: String = client
+            .query_one(
+                "SELECT decimal_value::text FROM public_test_edge.numbers_edge \
+                 WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            actual, expected,
+            "decimal edge-case round-trip for id={}",
+            id
+        );
+    }
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}

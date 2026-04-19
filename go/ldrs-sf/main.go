@@ -26,7 +26,7 @@ func main() {
 		}
 	}()
 	if err := cmd.Execute(ctx); err != nil {
-		fmt.Printf("Failed to run command: %v", err)
+		fmt.Fprintf(os.Stderr, "Failed to run command: %v\n", err)
 		os.Exit(1)
 	}
 }

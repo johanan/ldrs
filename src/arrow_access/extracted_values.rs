@@ -1,8 +1,8 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
-use pg_bigdecimal::PgNumeric;
-use serde_json::Value;
 
-use crate::{arrow_access::TypedColumnAccessor, types::ColumnSpec};
+use crate::{
+    arrow_access::TypedColumnAccessor, ldrs_postgres::pg_numeric::PgFixedNumeric, types::ColumnSpec,
+};
 
 #[derive(Debug)]
 pub enum ExtractedValue<'a> {
@@ -11,7 +11,7 @@ pub enum ExtractedValue<'a> {
     Int32(Option<i32>),
     Double(Option<f64>),
     Real(Option<f32>),
-    Decimal(Option<PgNumeric>),
+    Decimal(Option<PgFixedNumeric>),
     Uuid(Option<uuid::Uuid>),
     Utf8(Option<&'a str>),
     TimestampSeconds(Option<NaiveDateTime>),
@@ -22,7 +22,7 @@ pub enum ExtractedValue<'a> {
     TimestampTzMillis(Option<DateTime<Utc>>),
     TimestampTzMicros(Option<DateTime<Utc>>),
     TimestampTzNanos(Option<DateTime<Utc>>),
-    Jsonb(Option<Value>),
+    Jsonb(Option<&'a str>),
 }
 
 #[derive(Debug)]
@@ -121,6 +121,9 @@ impl<'a> ColumnConverter<'a> {
             ExtractionStrategy::Double => unsafe {
                 ExtractedValue::Double(self.accessor.Float64(row_idx))
             },
+            ExtractionStrategy::Real => unsafe {
+                ExtractedValue::Real(self.accessor.Float32(row_idx))
+            },
             ExtractionStrategy::Text => unsafe {
                 ExtractedValue::Utf8(self.accessor.Utf8(row_idx))
             },
@@ -130,7 +133,9 @@ impl<'a> ColumnConverter<'a> {
             ExtractionStrategy::Uuid => unsafe {
                 ExtractedValue::Uuid(self.accessor.as_uuid(row_idx))
             },
-            ExtractionStrategy::Jsonb => ExtractedValue::Jsonb(self.accessor.as_serde(row_idx)),
+            ExtractionStrategy::Jsonb => unsafe {
+                ExtractedValue::Jsonb(self.accessor.Utf8(row_idx))
+            },
             ExtractionStrategy::TimestampMillis => {
                 ExtractedValue::TimestampMillis(self.accessor.as_chrono_naive(row_idx))
             }

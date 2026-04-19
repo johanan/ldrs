@@ -1,4 +1,5 @@
 pub mod client;
+pub mod pg_numeric;
 pub mod postgres_destination;
 pub mod postgres_execution;
 pub mod schema;
@@ -7,6 +8,7 @@ pub mod schema_change;
 use crate::arrow_access::extracted_values::ExtractedValue;
 use crate::types::ColumnSpec;
 use crate::types::ColumnType;
+use bytes::BufMut;
 use postgres_types::{to_sql_checked, ToSql, Type};
 
 pub fn map_colspec_to_pg_type(pq: &ColumnSpec) -> postgres_types::Type {
@@ -55,7 +57,14 @@ impl<'a> ToSql for ExtractedValue<'a> {
             ExtractedValue::Real(v) => v.to_sql(ty, out),
             ExtractedValue::Decimal(v) => v.to_sql(ty, out),
             ExtractedValue::Utf8(v) => v.to_sql(ty, out),
-            ExtractedValue::Jsonb(v) => v.to_sql(ty, out),
+            ExtractedValue::Jsonb(v) => match v {
+                None => Ok(postgres_types::IsNull::Yes),
+                Some(s) => {
+                    out.put_u8(0x01);
+                    out.put_slice(s.as_bytes());
+                    Ok(postgres_types::IsNull::No)
+                }
+            },
         }
     }
 

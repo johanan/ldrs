@@ -134,11 +134,10 @@ pub async fn sf_arrow_stream(
 > {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let (schema_tx, schema_rx) = tokio::sync::oneshot::channel();
-    let (status_tx, status_rx) = tokio::sync::oneshot::channel();
     let sql = sql.to_string();
     let conn_url = conn.to_string();
 
-    task::spawn_blocking(move || {
+    let command_handle = task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("ldrs-sf");
         let args = vec!["query", "--sql", &sql];
         let cmd = cmd.args(args);
@@ -166,45 +165,43 @@ pub async fn sf_arrow_stream(
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
 
-        // No SyncIoBridge needed - stdout is already synchronous
         let buf_reader = std::io::BufReader::new(stdout);
-        let mut stream_reader = StreamReader::try_new(buf_reader, None)
-            .with_context(|| "Failed to create StreamReader")?;
+        let stream_reader = StreamReader::try_new(buf_reader, None).ok();
+        let stream_opened = stream_reader.is_some();
 
-        let schema = stream_reader.schema();
-        if schema_tx.send(schema).is_err() {
-            return Err(anyhow::anyhow!("Failed to send schema: receiver dropped"));
-        }
+        if let Some(mut stream_reader) = stream_reader {
+            let schema = stream_reader.schema();
+            if schema_tx.send(schema).is_err() {
+                return Err(anyhow::anyhow!("Failed to send schema: receiver dropped"));
+            }
 
-        // Stream batches
-        while let Some(batch_result) = stream_reader.next() {
-            trace!("Processing batch");
-            if tx
-                .blocking_send(batch_result.map_err(anyhow::Error::from))
-                .is_err()
-            {
-                return Err(anyhow::anyhow!("Failed to send batch"));
+            // Stream batches
+            while let Some(batch_result) = stream_reader.next() {
+                trace!("Processing batch");
+                if tx
+                    .blocking_send(batch_result.map_err(anyhow::Error::from))
+                    .is_err()
+                {
+                    return Err(anyhow::anyhow!("Failed to send batch"));
+                }
             }
         }
         let status = child.wait()?;
 
-        if !status.success() {
-            // Read stderr synchronously if command failed
-            let mut stderr_output = String::new();
-            std::io::Read::read_to_string(&mut stderr, &mut stderr_output)?;
-
-            let _ = status_tx.send(Err(anyhow::anyhow!("ldrs-sf stderr: {}", stderr_output)));
-        } else {
-            let _ = status_tx.send(Ok(()));
-        }
-
-        Ok::<(), anyhow::Error>(())
-    });
-
-    let command_handle = tokio::spawn(async move {
-        match status_rx.await {
-            Ok(result) => result,
-            Err(e) => Err(anyhow::anyhow!("Command monitoring task failed: {}", e)),
+        match (status.success(), stream_opened) {
+            (true, true) => Ok(()),
+            (true, false) => Err(anyhow::anyhow!(
+                "Command succeeded but failed to open Arrow stream"
+            )),
+            (false, _) => {
+                let mut stderr_output = String::new();
+                std::io::Read::read_to_string(&mut stderr, &mut stderr_output)?;
+                Err(anyhow::anyhow!(
+                    "ldrs-sf command failed with status: {}. Stderr: {}",
+                    status,
+                    stderr_output
+                ))
+            }
         }
     });
 

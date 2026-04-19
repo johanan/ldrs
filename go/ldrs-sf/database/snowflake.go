@@ -98,7 +98,6 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 
 	conn, err := sf.Snowflake.Conn(sf_ctx)
 	if err != nil {
-		writeEmptyStream(pool)
 		return err
 	}
 	defer conn.Close()
@@ -110,15 +109,12 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 		return err
 	})
 	if err != nil {
-		writeEmptyStream(pool)
 		return err
 	}
 	defer rows.Close()
 
 	batches, err := rows.(gosnowflake.SnowflakeRows).GetArrowBatches()
 	if err != nil {
-		// write an empty ipc stream and exit
-		writeEmptyStream(pool)
 		return err
 	}
 
@@ -155,6 +151,7 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 
 		if buffer[0] == nil {
 			// write an empty ipc stream and exit
+			// no rows so no schema and nothing to do, but we did not error
 			writeEmptyStream(pool)
 			return
 		}
@@ -256,7 +253,7 @@ func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []
 	}
 
 	readersWG.Add(numReaders)
-	for i := 0; i < numReaders; i++ {
+	for range numReaders {
 		go readerWorker()
 	}
 
