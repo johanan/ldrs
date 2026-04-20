@@ -171,7 +171,7 @@ where
             Some(w) => w,
             None => {
                 current_filename = name_file(file_index);
-                let file_path = base_path.child(current_filename.as_str());
+                let file_path = base_path.clone().join(current_filename.as_str());
                 let parq_writer = ParquetObjectWriter::new(store.clone(), file_path);
                 writer = Some(AsyncArrowWriter::try_new(
                     parq_writer,

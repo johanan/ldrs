@@ -5,7 +5,7 @@ use arrow::row::{RowConverter, SortField};
 use arrow_array::{cast::AsArray, types::Int64Type, ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use futures::{Stream, StreamExt};
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::file::metadata::ParquetMetaData;
 use uuid::Uuid;
 
@@ -118,7 +118,7 @@ pub(crate) async fn build_key_set(
     let mut key_set: HashSet<Vec<u8>> = HashSet::with_capacity(total_rows);
 
     for (filename, _) in source_files {
-        let path = base_path.child(filename.as_str());
+        let path = base_path.clone().join(filename.as_str());
         let mut stream = stream_projected_parquet(store.clone(), &path, merge_keys, None).await?;
 
         while let Some(batch) = stream.next().await {
@@ -372,7 +372,7 @@ where
         // Add actions for new source files
         let file_paths: Vec<_> = source_files
             .iter()
-            .map(|(filename, _)| base_path.child(filename.as_str()))
+            .map(|(filename, _)| base_path.clone().join(filename.as_str()))
             .collect();
 
         let obj_metas =
@@ -403,8 +403,8 @@ where
         let commit_body = build_commit_jsonl(&actions)?;
         let next_version = version + 1;
         let log_path = base_path
-            .child("_delta_log")
-            .child(version_to_log_filename(next_version));
+            .clone().join("_delta_log")
+            .clone().join(version_to_log_filename(next_version));
 
         match store
             .put_opts(
@@ -475,7 +475,7 @@ async fn probe_targets_for_matches(
     let mut matched_rows: usize = 0;
 
     for probe in probes {
-        let path = base_path.child(probe.scan_file.path.as_str());
+        let path = base_path.clone().join(probe.scan_file.path.as_str());
 
         let mut deleted_rows = if probe.scan_file.dv_info.has_vector() {
             probe
@@ -552,7 +552,7 @@ async fn narrow_to_eligible_row_groups(
     let mut file_probes: Vec<FileProbe> = Vec::new();
 
     for candidate in candidates {
-        let path = base_path.child(candidate.path.as_str());
+        let path = base_path.clone().join(candidate.path.as_str());
         let metadata = read_parquet_metadata(store.clone(), &path).await?;
 
         let mut eligible_rgs: Vec<usize> = (0..metadata.num_row_groups()).collect();
@@ -658,7 +658,7 @@ async fn cleanup_source_files(
     source_files: &[(String, ParquetMetaData)],
 ) {
     for (filename, _) in source_files {
-        let path = base_path.child(filename.as_str());
+        let path = base_path.clone().join(filename.as_str());
         let _ = store.delete(&path).await;
     }
 }
@@ -674,7 +674,7 @@ async fn load_existing_dvs(
 ) -> Result<HashMap<String, super::dv::DeletionVectorDescriptor>, anyhow::Error> {
     use futures::TryStreamExt;
 
-    let log_dir = base_path.child("_delta_log");
+    let log_dir = base_path.clone().join("_delta_log");
     let mut log_files: Vec<object_store::ObjectMeta> = store
         .list(Some(&log_dir))
         .try_filter(|m| {

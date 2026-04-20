@@ -18,7 +18,7 @@ use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{DataType as DeltaDataType, StructField, StructType};
 use delta_kernel::{Engine, Snapshot, Version};
 use futures::Stream;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use uuid::Uuid;
 
 use crate::arrow_access::arrow_transforms::ArrowColumnTransformStrategy;
@@ -360,8 +360,8 @@ pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), an
 
     let commit_body = build_commit_jsonl(&actions)?;
     let log_path = base_path
-        .child("_delta_log")
-        .child("00000000000000000000.json");
+        .clone().join("_delta_log")
+        .clone().join("00000000000000000000.json");
 
     match store
         .put_opts(
@@ -531,7 +531,7 @@ where
 
     let file_paths: Vec<_> = files
         .iter()
-        .map(|(filename, _)| base_path.child(filename.as_str()))
+        .map(|(filename, _)| base_path.clone().join(filename.as_str()))
         .collect();
 
     let obj_metas = futures::future::try_join_all(
@@ -549,8 +549,8 @@ where
         let table_state = snapshot_table_state(engine.as_ref(), &table_url)?;
         let (commit_body, next_version) = build_overwrite_commit(&table_state, &schema, &adds)?;
         let log_path = base_path
-            .child("_delta_log")
-            .child(version_to_log_filename(next_version));
+            .clone().join("_delta_log")
+            .clone().join(version_to_log_filename(next_version));
 
         match store
             .put_opts(

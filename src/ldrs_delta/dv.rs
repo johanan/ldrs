@@ -1,5 +1,5 @@
 use crc::{Crc, CRC_32_ISO_HDLC};
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -42,7 +42,7 @@ pub(crate) async fn build_dv_file(
     cardinality: i64,
 ) -> anyhow::Result<DeletionVectorDescriptor> {
     let uuid = Uuid::new_v4();
-    let dv_path = base_path.child(format!("deletion_vector_{}.bin", uuid));
+    let dv_path = base_path.clone().join(format!("deletion_vector_{}.bin", uuid));
 
     // File format:
     // [version: 1 byte] [dv_size: 4 bytes BE] [bytes: magic + bitmap] [crc32: 4 bytes BE]
