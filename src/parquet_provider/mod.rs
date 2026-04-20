@@ -1,5 +1,5 @@
 use anyhow::{Context, Error};
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use parquet::arrow::{
     arrow_reader::ArrowReaderBuilder,
     async_reader::{AsyncReader, ParquetObjectReader},
