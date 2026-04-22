@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-pub mod lua_args;
 pub mod parquet_types;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,7 +1,11 @@
+use bytes::BufMut;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use postgres_types::{to_sql_checked, ToSql, Type};
 
 use crate::{
-    arrow_access::TypedColumnAccessor, ldrs_postgres::pg_numeric::PgFixedNumeric, types::ColumnSpec,
+    arrow_access::TypedColumnAccessor,
+    ldrs_postgres::{arrow_bridge::ToPgNumeric, pg_numeric::PgFixedNumeric},
+    types::ColumnSpec,
 };
 
 #[derive(Debug)]
@@ -156,5 +160,47 @@ impl<'a> ColumnConverter<'a> {
             },
             _ => panic!("Unsupported conversion strategy: {:?}", self.strategy),
         }
+    }
+}
+
+impl<'a> ToSql for ExtractedValue<'a> {
+    #[inline]
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match self {
+            ExtractedValue::Boolean(v) => v.to_sql(ty, out),
+            ExtractedValue::Int64(v) => v.to_sql(ty, out),
+            ExtractedValue::Int32(v) => v.to_sql(ty, out),
+            ExtractedValue::Double(v) => v.to_sql(ty, out),
+            ExtractedValue::Uuid(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampSeconds(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampMillis(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampMicros(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampNanos(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampTzSeconds(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampTzMillis(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampTzMicros(v) => v.to_sql(ty, out),
+            ExtractedValue::TimestampTzNanos(v) => v.to_sql(ty, out),
+            ExtractedValue::Real(v) => v.to_sql(ty, out),
+            ExtractedValue::Decimal(v) => v.to_sql(ty, out),
+            ExtractedValue::Utf8(v) => v.to_sql(ty, out),
+            ExtractedValue::Jsonb(v) => match v {
+                None => Ok(postgres_types::IsNull::Yes),
+                Some(s) => {
+                    out.put_u8(0x01);
+                    out.put_slice(s.as_bytes());
+                    Ok(postgres_types::IsNull::No)
+                }
+            },
+        }
+    }
+
+    to_sql_checked!();
+
+    fn accepts(_ty: &Type) -> bool {
+        true
     }
 }

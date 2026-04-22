@@ -1,8 +1,9 @@
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
-use crate::path_pattern::{build_module_path_from_pattern, PathPattern};
-use crate::{path_pattern, storage::StorageProvider};
+use crate::path_pattern::{self, build_module_path_from_pattern, PathPattern};
+use crate::storage;
 
 #[derive(Args, Debug)]
 pub struct LuaArgs {
@@ -67,12 +68,12 @@ pub fn modules_from_args<'a>(
     args: LuaArgs,
     file_url: &'a str,
     pattern_str: &'a str,
-) -> Result<(PathPattern<'a>, StorageProvider, Vec<String>), anyhow::Error> {
+) -> Result<(PathPattern<'a>, Url, Vec<String>), anyhow::Error> {
     let module_config = ModuleConfig::try_from(args)?;
 
     let pattern = path_pattern::PathPattern::new(&pattern_str)?;
 
-    let storage = StorageProvider::try_from_string(file_url)?;
+    let storage_url = storage::base_or_relative_path(file_url)?;
 
     let mut all_paths = Vec::new();
     for module in &module_config.modules {
@@ -80,5 +81,5 @@ pub fn modules_from_args<'a>(
         all_paths.extend(paths);
     }
 
-    Ok((pattern, storage, all_paths))
+    Ok((pattern, storage_url, all_paths))
 }

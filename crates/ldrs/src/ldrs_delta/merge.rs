@@ -26,7 +26,7 @@ use crate::ldrs_parquet::{
     default_writer_props, read_parquet_metadata, stream_projected_parquet, with_bloom_filters,
     write_parquet_split, ROW_NUMBER_COLUMN,
 };
-use crate::storage::StorageProvider;
+use crate::storage::{base_or_relative_path, build_store};
 use delta_kernel::expressions::{Expression as Expr, Predicate as Pred};
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::Snapshot;
@@ -182,8 +182,8 @@ where
 {
     ensure_table(table_path, &schema).await?;
 
-    let storage = StorageProvider::try_from_string(table_path)?;
-    let (store, base_path) = storage.get_store_and_path()?;
+    let url = base_or_relative_path(table_path)?;
+    let (store, base_path, _) = build_store(&url)?;
 
     let bloom_columns: Vec<Vec<String>> = merge_config
         .merge_keys
@@ -224,7 +224,6 @@ where
     )
     .await?;
 
-    let table_url = storage.get_url();
     let engine = build_engine(store.clone());
 
     // get the app_id and batch_version from either
@@ -237,7 +236,7 @@ where
     // Retry loop
     for _attempt in 0..MERGE_MAX_RETRIES {
         // get a fresh snapshot, this is either the first pass or we failed and we need fresh metadata
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
         let version = snapshot.version();
         let metadata = snapshot.table_configuration().metadata();
         let table_id = metadata.id().to_string();
@@ -281,7 +280,7 @@ where
             &store,
             &base_path,
             engine.as_ref(),
-            &table_url,
+            &url,
             &merge_config.merge_keys,
             &key_set,
             &converter,
@@ -403,8 +402,10 @@ where
         let commit_body = build_commit_jsonl(&actions)?;
         let next_version = version + 1;
         let log_path = base_path
-            .clone().join("_delta_log")
-            .clone().join(version_to_log_filename(next_version));
+            .clone()
+            .join("_delta_log")
+            .clone()
+            .join(version_to_log_filename(next_version));
 
         match store
             .put_opts(

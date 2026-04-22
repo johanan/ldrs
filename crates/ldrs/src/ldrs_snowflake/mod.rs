@@ -14,7 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, trace};
 use url::Url;
 
-use crate::types::{lua_args::LuaArgs, ColumnType};
+use crate::{lua_logic::lua_args::LuaArgs, types::ColumnType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

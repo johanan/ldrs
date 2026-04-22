@@ -5,6 +5,7 @@ mod stats;
 pub use merge::{merge_delta, MergeConfig, MergeStats, TxnConfig};
 pub use stats::{delta_stats_to_json, parquet_metadata_to_delta_stats, ColumnStats, DeltaStats};
 
+use crate::storage::{base_or_relative_path, build_store};
 use crate::types::ColumnSpec;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -23,7 +24,6 @@ use uuid::Uuid;
 
 use crate::arrow_access::arrow_transforms::ArrowColumnTransformStrategy;
 use crate::ldrs_parquet::{default_writer_props, write_parquet_split};
-use crate::storage::StorageProvider;
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaDestination {
@@ -75,10 +75,9 @@ impl TryFrom<&Value> for DeltaDestination {
         let columns = get_ns(value, "delta", "columns")
             .and_then(|c| Vec::<ColumnSpec>::deserialize(c).ok())
             .unwrap_or_default();
-        let max_rows = get_ns(value, "delta", "max_rows")
-            .and_then(|v| usize::deserialize(v).ok());
-        let max_bytes = get_ns(value, "delta", "max_bytes")
-            .and_then(|v| usize::deserialize(v).ok());
+        let max_rows = get_ns(value, "delta", "max_rows").and_then(|v| usize::deserialize(v).ok());
+        let max_bytes =
+            get_ns(value, "delta", "max_bytes").and_then(|v| usize::deserialize(v).ok());
 
         // Merge mode detected by presence of merge_keys (namespaced or bare)
         let mode = if let Some(keys_value) = get_ns(value, "delta", "merge_keys") {
@@ -96,8 +95,8 @@ impl TryFrom<&Value> for DeltaDestination {
                 .and_then(|v| String::deserialize(v).ok())
                 .unwrap_or_else(|| "ldrs-merge-{{ name }}".to_string());
 
-            let txn_mode = get_ns(value, "delta", "txn_mode")
-                .and_then(|v| String::deserialize(v).ok());
+            let txn_mode =
+                get_ns(value, "delta", "txn_mode").and_then(|v| String::deserialize(v).ok());
 
             let txn = match txn_mode.as_deref() {
                 Some("source_watermark") => {
@@ -337,8 +336,8 @@ fn build_metadata(
 }
 
 pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), anyhow::Error> {
-    let storage = StorageProvider::try_from_string(table_path)?;
-    let (store, base_path) = storage.get_store_and_path()?;
+    let url = base_or_relative_path(table_path)?;
+    let (store, base_path, _) = build_store(&url)?;
 
     let now_ms = chrono::Utc::now().timestamp_millis();
 
@@ -360,8 +359,10 @@ pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), an
 
     let commit_body = build_commit_jsonl(&actions)?;
     let log_path = base_path
-        .clone().join("_delta_log")
-        .clone().join("00000000000000000000.json");
+        .clone()
+        .join("_delta_log")
+        .clone()
+        .join("00000000000000000000.json");
 
     match store
         .put_opts(
@@ -512,9 +513,9 @@ where
 {
     ensure_table(table_path, &schema).await?;
 
-    let storage = StorageProvider::try_from_string(table_path)?;
-    let (store, base_path) = storage.get_store_and_path()?;
-    let table_url = storage.get_url();
+    let url = base_or_relative_path(table_path)?;
+    let (store, base_path, _) = build_store(&url)?;
+
     let engine = build_engine(store.clone());
 
     let files = write_parquet_split(
@@ -534,10 +535,8 @@ where
         .map(|(filename, _)| base_path.clone().join(filename.as_str()))
         .collect();
 
-    let obj_metas = futures::future::try_join_all(
-        file_paths.iter().map(|path| store.head(path)),
-    )
-    .await?;
+    let obj_metas =
+        futures::future::try_join_all(file_paths.iter().map(|path| store.head(path))).await?;
 
     let adds = files
         .iter()
@@ -546,11 +545,13 @@ where
         .collect::<Result<Vec<_>, _>>()?;
 
     for _attempt in 0..MAX_COMMIT_RETRIES {
-        let table_state = snapshot_table_state(engine.as_ref(), &table_url)?;
+        let table_state = snapshot_table_state(engine.as_ref(), &url)?;
         let (commit_body, next_version) = build_overwrite_commit(&table_state, &schema, &adds)?;
         let log_path = base_path
-            .clone().join("_delta_log")
-            .clone().join(version_to_log_filename(next_version));
+            .clone()
+            .join("_delta_log")
+            .clone()
+            .join(version_to_log_filename(next_version));
 
         match store
             .put_opts(
@@ -638,7 +639,11 @@ delta.app_id: "my-app"
         );
         match dest.mode {
             DeltaMode::Merge {
-                txn: Some(MergeTxnConfig::SourceWatermark { app_id, watermark_column }),
+                txn:
+                    Some(MergeTxnConfig::SourceWatermark {
+                        app_id,
+                        watermark_column,
+                    }),
                 ..
             } => {
                 assert_eq!(app_id, "my-app");
@@ -660,7 +665,11 @@ delta.batch_version: "{{ run_id }}"
         );
         match dest.mode {
             DeltaMode::Merge {
-                txn: Some(MergeTxnConfig::ProcessingTime { app_id, batch_version }),
+                txn:
+                    Some(MergeTxnConfig::ProcessingTime {
+                        app_id,
+                        batch_version,
+                    }),
                 ..
             } => {
                 // app_id defaulted to ldrs-merge-{{ name }} template (rendered later)
@@ -681,7 +690,9 @@ delta.allow_null_keys: true
 "#,
         );
         match dest.mode {
-            DeltaMode::Merge { allow_null_keys, .. } => assert!(allow_null_keys),
+            DeltaMode::Merge {
+                allow_null_keys, ..
+            } => assert!(allow_null_keys),
             _ => panic!("expected Merge mode"),
         }
     }

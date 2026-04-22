@@ -21,9 +21,9 @@ target/
 #.idea/
 
 # delta test
-test_data/delta/
+**/test_data/delta/
 
-tests/test_data/parquet_writes/
-tests/test_data/delta_writes/
+**/test_data/parquet_writes/
+**/test_data/delta_writes/
 
 .env
