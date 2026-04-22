@@ -1,5 +1,5 @@
 [workspace]
-members = ["cargo:."]
+members = ["cargo:./crates/ldrs"]
 
 # Config for 'dist'
 [dist]

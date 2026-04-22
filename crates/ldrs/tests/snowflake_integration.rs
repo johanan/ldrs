@@ -3,19 +3,19 @@ use ldrs::{
     lua_logic::{LuaFunctionLoader, StorageData, UrlData},
     parquet_provider::builder_from_string,
     path_pattern::{self, build_module_path_from_pattern},
-    storage::StorageProvider,
+    storage::{base_or_relative_path, build_store},
     types::parquet_types::ParquetSchema,
 };
 
 //#[tokio::test]
 async fn test_snowflake_lua_integration() {
     let file = "tests/test_data/public.string_values/public.strings.snappy.parquet";
-    let storage = StorageProvider::try_from_string(&file).unwrap();
+    let url = base_or_relative_path(file).unwrap();
     let pattern_string = "{_}/{_}/{_}/{_}/tests/test_data/{schema}.{table}/*";
     let pattern = path_pattern::PathPattern::new(pattern_string).unwrap();
-    let (_, file_path) = storage.get_store_and_path().unwrap();
-    let file_path = file_path.to_string();
-    let extracted = pattern.parse_path(&file_path).unwrap();
+    let (_, file_path, scheme) = build_store(&url).unwrap();
+    let file_path_str = file_path.to_string();
+    let extracted = pattern.parse_path(&file_path_str).unwrap();
     let segments_value = path_pattern::extracted_segments_to_value(&extracted);
     println!("segments_value: {:?}", segments_value);
 
@@ -38,8 +38,8 @@ async fn test_snowflake_lua_integration() {
 
     loader.setup_execution_context(Some(lua_schema)).unwrap();
 
-    let url_data: UrlData = storage.get_url().into();
-    let storage_data: StorageData = storage.into();
+    let url_data: UrlData = url.clone().into();
+    let storage_data = StorageData::from_parts(&url, &file_path, scheme);
     let context = serde_json::json!({"destination": "snowflake"});
 
     let process_result = loader

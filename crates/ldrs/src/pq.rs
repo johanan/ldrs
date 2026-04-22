@@ -20,7 +20,7 @@ mod tests {
     async fn test_get_file_metadata() {
         let cd = std::env::current_dir().unwrap();
         let path = format!(
-            "file://{}/test_data/public.users.snappy.parquet",
+            "file://{}/tests/test_data/public.users/public.users.snappy.parquet",
             cd.display()
         );
         let rt = create_runtime();

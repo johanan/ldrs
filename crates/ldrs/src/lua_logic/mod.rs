@@ -1,10 +1,12 @@
+pub mod lua_args;
+
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::storage::{azure::AzureUrl, StorageProvider};
 use crate::types::parquet_types::ParquetSchema;
 use arrow::datatypes::SchemaRef;
 use mlua::{Lua, LuaSerdeExt};
+use object_store::{path::Path as StorePath, ObjectStoreScheme};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 use url::Url;
@@ -86,23 +88,33 @@ impl From<Url> for UrlData {
     }
 }
 
-impl From<AzureUrl> for AzureData {
-    fn from(azure_url: AzureUrl) -> Self {
-        AzureData {
-            storage_account: azure_url.storage_account.clone(),
-            container: azure_url.container.clone(),
-            path: azure_url.path.clone(),
-        }
-    }
+fn path_for_lua(path: &StorePath) -> String {
+    path.to_string().trim_start_matches('/').to_string()
 }
 
-impl From<StorageProvider> for StorageData {
-    fn from(provider: StorageProvider) -> Self {
-        match provider {
-            StorageProvider::Azure(azure_url) => StorageData::Azure(AzureData::from(azure_url)),
-            StorageProvider::Local(url, path) => StorageData::Local(LocalData {
+impl StorageData {
+    pub fn from_parts(url: &Url, path: &StorePath, scheme: ObjectStoreScheme) -> Self {
+        match scheme {
+            ObjectStoreScheme::MicrosoftAzure => {
+                let host = url.host_str().unwrap_or("");
+                let storage_account = host
+                    .split_once('.')
+                    .map(|(a, _)| a.to_string())
+                    .unwrap_or_else(|| host.to_string());
+                let full_url_path = url.path().trim_start_matches('/');
+                let container = full_url_path
+                    .split_once('/')
+                    .map(|(c, _)| c.to_string())
+                    .unwrap_or_else(|| full_url_path.to_string());
+                StorageData::Azure(AzureData {
+                    storage_account,
+                    container,
+                    path: path_for_lua(path),
+                })
+            }
+            _ => StorageData::Local(LocalData {
                 url: url.to_string(),
-                path: path.to_string(),
+                path: url.path().to_string(),
             }),
         }
     }

@@ -8,26 +8,20 @@ use parquet::arrow::{
 use tokio::runtime::Handle;
 use url::Url;
 
-use crate::storage::{base_or_relative_path, StorageProvider};
+use crate::storage::{base_or_relative_path, build_store};
 
 pub async fn builder_from_url(
     url: Url,
     handle: tokio::runtime::Handle,
 ) -> Result<ArrowReaderBuilder<AsyncReader<ParquetObjectReader>>, anyhow::Error> {
-    let storage = StorageProvider::try_from_url(url)?;
-    let (store, path) = storage.get_store_and_path()?;
+    let (store, path, _) = build_store(&url)?;
 
     let meta = store
         .head(&path)
         .await
         .with_context(|| "Could not find file in store")?;
 
-    let reader = match storage {
-        StorageProvider::Azure(_) => {
-            ParquetObjectReader::new(store, meta.location).with_runtime(handle)
-        }
-        StorageProvider::Local(_, _) => ParquetObjectReader::new(store, meta.location),
-    };
+    let reader = ParquetObjectReader::new(store, meta.location).with_runtime(handle);
 
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await

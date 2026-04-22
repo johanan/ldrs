@@ -6,9 +6,10 @@ use dotenvy::dotenv;
 use ldrs::ldrs_config::create_ldrs_exec;
 use ldrs::ldrs_env::get_all_ldrs_env_vars;
 use ldrs::ldrs_snowflake::{SnowflakeResult, SnowflakeStrategy};
+use ldrs::lua_logic::lua_args::modules_from_args;
 use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
 use ldrs::path_pattern;
-use ldrs::types::lua_args::modules_from_args;
+use ldrs::storage::build_store;
 use serde::Deserialize;
 use tracing::info;
 
@@ -116,16 +117,17 @@ fn main() -> Result<(), anyhow::Error> {
                     lua_args,
                 } => match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
                     Ok(sf_url) => {
-                        let (pattern, storage, modules) =
+                        let (pattern, url, modules) =
                             modules_from_args(lua_args, file_url.as_str(), pattern.as_str())?;
 
-                        let (_, file_path) = storage.get_store_and_path()?;
-                        let file_path = file_path.to_string();
-                        let extracted = pattern.parse_path(&file_path)?;
+                        let (_, file_path, scheme) = build_store(&url)?;
+                        let url_data: UrlData = url.clone().into();
+                        let storage_data = StorageData::from_parts(&url, &file_path, scheme);
+
+                        let file_path_str = file_path.to_string();
+                        let extracted = pattern.parse_path(&file_path_str)?;
                         let segments_value = path_pattern::extracted_segments_to_value(&extracted);
 
-                        let url_data: UrlData = storage.get_url().into();
-                        let storage_data: StorageData = storage.into();
                         let context = serde_json::json!({});
 
                         let mut loader = LuaFunctionLoader::new().unwrap();

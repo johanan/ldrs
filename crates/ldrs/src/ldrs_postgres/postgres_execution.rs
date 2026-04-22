@@ -11,12 +11,14 @@ use tracing::debug;
 use crate::{
     arrow_access::{
         arrow_transforms::{transform_batch, ArrowColumnTransformStrategy},
-        extracted_values::{ColumnConverter, ExtractedValue},
         TypedColumnAccessor,
     },
     ldrs_env::{get_params_for_stmt_with_default, LdrsExecutionContext},
     ldrs_postgres::{
-        client::create_connection, map_colspec_to_pg_type, schema_change::map_colspec_to_pg_ddl,
+        client::create_connection,
+        extracted_values::{ColumnConverter, ExtractedValue},
+        map_colspec_to_pg_type,
+        schema_change::map_colspec_to_pg_ddl,
     },
     types::{ColumnSpec, ColumnType},
 };

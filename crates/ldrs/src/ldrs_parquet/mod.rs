@@ -18,7 +18,7 @@ use std::sync::Arc;
 use parquet::arrow::RowNumber;
 
 use crate::arrow_access::arrow_transforms::{transform_batch, ArrowColumnTransformStrategy};
-use crate::storage::StorageProvider;
+use crate::storage::{base_or_relative_path, build_store};
 use crate::types::{ColumnSpec, TimeUnit};
 
 impl TryFrom<&Arc<parquet::schema::types::Type>> for ColumnSpec {
@@ -108,8 +108,8 @@ where
         None
     };
 
-    let storage = StorageProvider::try_from_string(file_path)?;
-    let (store, path) = storage.get_store_and_path()?;
+    let url = base_or_relative_path(file_path)?;
+    let (store, path, _) = build_store(&url)?;
     let parq_writer = ParquetObjectWriter::new(store, path);
     let props = writer_props.unwrap_or(default_writer_props());
 
@@ -148,8 +148,8 @@ where
         None
     };
 
-    let storage = StorageProvider::try_from_string(dir_path)?;
-    let (store, base_path) = storage.get_store_and_path()?;
+    let url = base_or_relative_path(dir_path)?;
+    let (store, base_path, _) = build_store(&url)?;
 
     let props = writer_props.unwrap_or_else(default_writer_props);
 

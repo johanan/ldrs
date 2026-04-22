@@ -3,7 +3,6 @@
 #![allow(non_snake_case)]
 
 pub mod arrow_transforms;
-pub mod extracted_values;
 
 use std::borrow::Cow;
 
@@ -16,8 +15,6 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, TimeUnit};
 use chrono::{DateTime, NaiveDateTime, Utc};
-
-use crate::ldrs_postgres::pg_numeric::PgFixedNumeric;
 
 macro_rules! define_column_accessor {
     ($(($variant:ident, $array_type:ty, $value_type:ty)),*) => {
@@ -97,82 +94,6 @@ define_column_accessor!(
 );
 
 impl<'a> TypedColumnAccessor<'a> {
-    pub fn as_pg_numeric(&self, row: usize, scale: i32) -> Option<PgFixedNumeric> {
-        match self {
-            Self::Decimal128(arr, _, scale) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(PgFixedNumeric {
-                        value: arr.value(row),
-                        scale: *scale as i16,
-                    })
-                }
-            }
-            Self::Decimal64(arr, _, scale) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(PgFixedNumeric {
-                        value: arr.value(row) as i128,
-                        scale: *scale as i16,
-                    })
-                }
-            }
-            Self::Decimal32(arr, _, scale) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(PgFixedNumeric {
-                        value: arr.value(row) as i128,
-                        scale: *scale as i16,
-                    })
-                }
-            }
-            Self::Int64(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(PgFixedNumeric {
-                        value: arr.value(row) as i128,
-                        scale: scale as i16,
-                    })
-                }
-            }
-            Self::Int32(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(PgFixedNumeric {
-                        value: arr.value(row) as i128,
-                        scale: scale as i16,
-                    })
-                }
-            }
-            Self::Int16(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(PgFixedNumeric {
-                        value: arr.value(row) as i128,
-                        scale: scale as i16,
-                    })
-                }
-            }
-            Self::Int8(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(PgFixedNumeric {
-                        value: arr.value(row) as i128,
-                        scale: scale as i16,
-                    })
-                }
-            }
-            _ => panic!("Not a Decimal128 or Integer array"),
-        }
-    }
-
     pub unsafe fn as_uuid(&self, row: usize) -> Option<uuid::Uuid> {
         match self {
             Self::FixedSizeBinary(arr, _) => {

@@ -1,0 +1,60 @@
+[package]
+name = "ldrs"
+version = "0.17.2"
+edition = "2021"
+repository = "https://github.com/johanan/ldrs"
+authors = ["Joshua Johanan"]
+description = "A simple and fast data loader"
+
+[package.metadata.wix]
+upgrade-guid = "8C9C4D06-8A69-41CD-97A4-2C623BEE72A3"
+path-guid = "004BAE91-11D1-4A69-B9EF-CA72B0773731"
+license = false
+eula = false
+
+[dependencies]
+anyhow = "1.0.102"
+arrow = { version = "58", features = ["chrono-tz"] }
+arrow-array = "58"
+arrow-schema = { version = "58", features = ["serde"] }
+bytes = "1"
+chrono = "0.4.44"
+clap = { version = "4.6.1", features = ["derive"] }
+delta_kernel = { version = "0.21.0", features = ["internal-api", "default-engine-rustls", "arrow-58"] }
+dotenvy = "0.15.7"
+crc = "3.4"
+futures = "0.3.32"
+mlua = { version = "0.11.6", features = ["lua54", "vendored", "serialize"] }
+native-tls = { version = "0.2.18", features = ["vendored"] }
+object_store = { version = "0.13.1", features = ["azure"] }
+parking_lot = "0.12.5"
+parquet = { version = "58", features = ["async", "arrow", "object_store", "arrow_canonical_extension_types"] }
+roaring = "0.11.3"
+z85 = "3.0.7"
+postgres-native-tls = "0.5.3"
+postgres-types = "0.2.13"
+serde = { version = "1.0.228", features = ["serde_derive"] }
+serde_json = "1.0.149"
+serde_yaml = "0.9.34"
+tokio = { version = "1.52.1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio-postgres = { version = "0.7.17", features = [
+    "with-chrono-0_4",
+    "with-uuid-1",
+] }
+tokio-stream = "0.1.18"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+url = "2.5.8"
+uuid = { version = "1.20.0", features = ["v4"] }
+nom = { version = "8.0.0" }
+handlebars = { version = "6.4.0", features = ["string_helpers"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rstest = "0.26.1"
+test-log = { version = "0.2.20", features = ["default", "trace"] }
+tokio-util = { version = "0.7.18", features = ["io", "io-util"] }
+
+[[bench]]
+name = "arrow_extraction"
+harness = false
