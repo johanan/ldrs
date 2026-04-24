@@ -21,7 +21,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: release-plz/action@v0
+      - uses: release-plz/action@v0.5
         with:
           command: release
         env:
@@ -39,7 +39,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: release-plz/action@v0
+      - uses: release-plz/action@v0.5
         with:
           command: release-pr
         env:
