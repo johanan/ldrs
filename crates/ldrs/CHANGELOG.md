@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.4](https://github.com/johanan/ldrs/compare/v0.17.3...v0.17.4) - 2026-05-08
+
+### Added
+
+- engine crate split and docs start
+
+### Other
+
+- release v0.17.3
+
 ## [0.17.3](https://github.com/johanan/ldrs/releases/tag/v0.17.3) - 2026-04-24
 
 ### Other
