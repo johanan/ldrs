@@ -4,17 +4,17 @@ use arrow_array::{Int32Array, Int8Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use ldrs::{
-    arrow_access::arrow_transforms::build_arrow_transform_strategy,
+    file_source::FileSource,
     ldrs_config::{
         config::{get_parsed_config, LdrsDestination, LdrsParsedConfig, LdrsSource},
         create_ldrs_exec,
     },
-    ldrs_parquet::{write_parquet, write_parquet_split},
     ldrs_snowflake::snowflake_source::{SFQuery, SFSource},
-    ldrs_storage::{FileSource, ParquetDestination},
-    parquet_provider::{self},
-    types::ColumnType,
+    parquet::ParquetDestination,
 };
+use ldrs_arrow::{build_arrow_transform_strategy, ColumnType};
+use ldrs_parquet::{builder_from_string, write_parquet, write_parquet_split};
+use ldrs_test_fixtures::{data_url, fixture, fixture_str};
 use tracing::info;
 
 const TEST_CASES: &[(&str, &str)] = &[
@@ -35,8 +35,6 @@ const TEST_CASES: &[(&str, &str)] = &[
 #[tokio::test]
 #[test_log::test]
 async fn test_parquet() {
-    let cd = std::env::current_dir().unwrap();
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -45,8 +43,8 @@ async fn test_parquet() {
 
     for case in TEST_CASES {
         let (source_path, target_path) = case;
-        let path = format!("{}/tests/test_data/{}", cd.display(), source_path);
-        let builder = parquet_provider::builder_from_string(path.clone(), rt.handle().clone())
+        let path = fixture(source_path).display().to_string();
+        let builder = builder_from_string(path.clone(), rt.handle().clone())
             .await
             .unwrap();
         let schema = builder.schema().clone();
@@ -55,11 +53,9 @@ async fn test_parquet() {
             .build()
             .unwrap()
             .map_err(|e| e.into());
-        let file_path = format!(
-            "{}/tests/test_data/parquet_writes/{}",
-            cd.display(),
-            target_path
-        );
+        let file_path = fixture(format!("parquet_writes/{}", target_path).as_str())
+            .display()
+            .to_string();
         info!("schema: {:?}", schema);
         write_parquet(&file_path, schema, Vec::new(), None, stream)
             .await
@@ -143,9 +139,9 @@ async fn test_parquet_full_round_trip() {
 src: file
 dest: pq
 src_defaults:
-  filename: tests/test_data/{{ name }}/{{ name }}.snappy.parquet
+  filename: "{{ name }}/{{ name }}.snappy.parquet"
 dest_defaults:
-  pq.filename: tests/test_data/parquet_writes/{{ name }}_roundtrip.snappy.parquet
+  pq.filename: parquet_writes/{{ name }}_roundtrip.snappy.parquet
 
 tables:
   - name: public.users
@@ -154,8 +150,8 @@ tables:
   - name: public.numbers
 "#;
 
-    let file_url = "file://";
-    let pq_url = "file://";
+    let file_url = data_url();
+    let pq_url = data_url();
     let ldrs_env = vec![
         ("LDRS_SRC".to_string(), file_url.to_string()),
         ("LDRS_DEST".to_string(), pq_url.to_string()),
@@ -166,8 +162,8 @@ tables:
         .build()
         .unwrap();
     let expected_files = vec![
-        "tests/test_data/parquet_writes/public.users_roundtrip.snappy.parquet",
-        "tests/test_data/parquet_writes/public.numbers_roundtrip.snappy.parquet",
+        fixture_str("parquet_writes/public.users_roundtrip.snappy.parquet"),
+        fixture_str("parquet_writes/public.numbers_roundtrip.snappy.parquet"),
     ];
     // delete before the test
     for file in &expected_files {

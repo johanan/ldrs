@@ -1,8 +1,9 @@
 use crate::{
-    ldrs_delta::DeltaDestination,
-    ldrs_postgres::postgres_destination::{from_serde_yaml, PgDestination},
+    delta::DeltaDestination,
+    file_source::FileSource,
     ldrs_snowflake::snowflake_source::{from_serde_yaml as from_sf_serde_yaml, SFSource},
-    ldrs_storage::{FileSource, ParquetDestination},
+    parquet::ParquetDestination,
+    postgres::postgres_destination::{from_serde_yaml, PgDestination},
 };
 
 use anyhow::Context;

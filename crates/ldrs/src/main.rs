@@ -1,15 +1,14 @@
 use std::fs;
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use dotenvy::dotenv;
 use ldrs::ldrs_config::create_ldrs_exec;
 use ldrs::ldrs_env::get_all_ldrs_env_vars;
-use ldrs::ldrs_snowflake::{SnowflakeResult, SnowflakeStrategy};
-use ldrs::lua_logic::lua_args::modules_from_args;
+use ldrs::lua_logic::lua_args::{modules_from_args, LuaArgs, SnowflakeResult, SnowflakeStrategy};
 use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
 use ldrs::path_pattern;
-use ldrs::storage::build_store;
+use ldrs_storage::build_store;
 use serde::Deserialize;
 use tracing::info;
 
@@ -39,6 +38,22 @@ struct ConfigArgs {
 }
 
 #[derive(Subcommand)]
+pub enum SnowflakeCommands {
+    /// Execute a SQL statement (non-data retrieval)
+    Exec { sql: String },
+    Ingest {
+        #[arg(long, short)]
+        file_url: String,
+
+        #[arg(long, short)]
+        pattern: String,
+
+        #[clap(flatten)]
+        lua_args: LuaArgs,
+    },
+}
+
+#[derive(Subcommand)]
 enum Destination {
     /// Load from a config file. All sources and destinations
     Ld(ConfigArgs),
@@ -50,21 +65,37 @@ enum Destination {
     /// Snowflake destination
     Sf {
         #[command(subcommand)]
-        command: ldrs::ldrs_snowflake::SnowflakeCommands,
+        command: SnowflakeCommands,
     },
 }
 
+const BANNER: &str = r#" ████      █████
+░░███     ░░███
+ ░███   ███████  ████████   █████
+ ░███  ███░░███ ░░███░░███ ███░░
+ ░███ ░███ ░███  ░███ ░░░ ░░█████
+ ░███ ░███ ░███  ░███      ░░░░███
+ █████░░████████ █████     ██████
+░░░░░  ░░░░░░░░ ░░░░░     ░░░░░░
+"#;
+
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None, before_help = BANNER)]
 struct Cli {
     #[command(subcommand)]
-    destination: Destination,
+    destination: Option<Destination>,
 }
 
 fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     let _ = dotenv();
+
+    let Some(destination) = cli.destination else {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
 
     let start = std::time::Instant::now();
 
@@ -83,7 +114,7 @@ fn main() -> Result<(), anyhow::Error> {
         .with_context(|| "Unable to create cloud io tokio runtime")?;
 
     let command_exec = main_rt.block_on(async {
-        match cli.destination {
+        match destination {
             Destination::Ld(args) => {
                 let config_string = fs::read_to_string(&args.config)
                     .with_context(|| format!("Failed to read config file: {}", args.config))?;
@@ -97,7 +128,7 @@ fn main() -> Result<(), anyhow::Error> {
                 }
             },
             Destination::Sf { command } => match command {
-                ldrs::ldrs_snowflake::SnowflakeCommands::Exec { sql } => {
+                SnowflakeCommands::Exec { sql } => {
                     match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
                         Ok(sf_url) => {
                             let conn =
@@ -111,7 +142,7 @@ fn main() -> Result<(), anyhow::Error> {
                         Err(e) => Err(e),
                     }
                 }
-                ldrs::ldrs_snowflake::SnowflakeCommands::Ingest {
+                SnowflakeCommands::Ingest {
                     file_url,
                     pattern,
                     lua_args,

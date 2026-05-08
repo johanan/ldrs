@@ -1,0 +1,76 @@
+---
+type Font = "dos-rebel" | "terminus" | "small-isometric";
+type As = "svg" | "pre";
+
+interface Props {
+  font: Font;
+  as?: As;
+}
+
+const { font, as = "pre" } = Astro.props as Props;
+
+const wordmarks: Record<Font, string> = {
+  "dos-rebel": String.raw` ████      █████
+░░███     ░░███
+ ░███   ███████  ████████   █████
+ ░███  ███░░███ ░░███░░███ ███░░
+ ░███ ░███ ░███  ░███ ░░░ ░░█████
+ ░███ ░███ ░███  ░███      ░░░░███
+ █████░░████████ █████     ██████
+░░░░░  ░░░░░░░░ ░░░░░     ░░░░░░  `,
+
+  terminus: ` ▀█       █
+  █   ▄▀▀▀█ █▄▀▀▀ ▄▀▀▀▀
+  █   █   █ █      ▀▀▀▄
+  ▀▄▄ ▀▄▄▄█ █     ▄▄▄▄▀ `,
+
+  "small-isometric": String.raw`    ___       ___       ___       ___
+   /\__\     /\  \     /\  \     /\  \
+  /:/  /    /::\  \   /::\  \   /::\  \
+ /:/__/    /:/\:\__\ /::\:\__\ /\:\:\__\
+ \:\  \    \:\/:/  / \;:::/  / \:\:\/__/
+  \:\__\    \::/  /   |:\/__/   \::/  /
+   \/__/     \/__/     \|__|     \/__/  `,
+};
+
+const text = wordmarks[font];
+const lines = text.split("\n");
+
+// SVG sizing — monospace approximation. Real char width depends on the font
+// the browser picks; this gets the viewBox close enough that the SVG scales
+// proportionally with the content.
+const lineHeight = 14;
+const charWidth = 8.4;
+const maxLen = Math.max(...lines.map((l) => l.length));
+const svgWidth = Math.ceil(maxLen * charWidth);
+// Add a small buffer below the last baseline for descenders (e.g. the
+// underscore/slash strokes in small-isometric's bottom row otherwise clip).
+const descenderPad = 4;
+const svgHeight = Math.ceil(lines.length * lineHeight + descenderPad);
+---
+
+{
+  as === "svg" ? (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox={`0 0 ${svgWidth} ${svgHeight}`}
+      class={`wordmark wordmark-svg wordmark-${font}`}
+      role="img"
+      aria-label="ldrs"
+    >
+      <g
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size={lineHeight}
+        fill="currentColor"
+      >
+        {lines.map((line, i) => (
+          <text x="0" y={(i + 1) * lineHeight - 2} xml:space="preserve">
+            {line}
+          </text>
+        ))}
+      </g>
+    </svg>
+  ) : (
+    <pre class={`wordmark wordmark-pre wordmark-${font}`}>{text}</pre>
+  )
+}

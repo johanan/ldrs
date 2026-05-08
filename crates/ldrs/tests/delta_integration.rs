@@ -1,22 +1,19 @@
 use delta_kernel::expressions::Scalar;
 use futures::TryStreamExt;
 use ldrs::ldrs_config::create_ldrs_exec;
-use ldrs::ldrs_delta::{delta_stats_to_json, overwrite_delta, parquet_metadata_to_delta_stats};
-use ldrs::parquet_provider;
+use ldrs_delta::{delta_stats_to_json, overwrite_delta, parquet_metadata_to_delta_stats};
+use ldrs_parquet::builder_from_string;
+use ldrs_test_fixtures::{data_url, fixture, fixture_url};
 
 #[tokio::test]
 async fn test_delta_stats_from_users_parquet() {
-    let cd = std::env::current_dir().unwrap();
-    let path = format!(
-        "{}/tests/test_data/public.users/public.users.snappy.parquet",
-        cd.display()
-    );
+    let path = fixture_url("public.users/public.users.snappy.parquet");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();
-    let builder = parquet_provider::builder_from_string(path, rt.handle().clone())
+    let builder = builder_from_string(path, rt.handle().clone())
         .await
         .unwrap();
 
@@ -77,17 +74,13 @@ async fn test_delta_stats_from_users_parquet() {
 
 #[tokio::test]
 async fn test_delta_stats_from_strings_parquet() {
-    let cd = std::env::current_dir().unwrap();
-    let path = format!(
-        "{}/tests/test_data/public.string_values/public.strings.snappy.parquet",
-        cd.display()
-    );
+    let path = fixture_url("public.string_values/public.strings.snappy.parquet");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();
-    let builder = parquet_provider::builder_from_string(path, rt.handle().clone())
+    let builder = builder_from_string(path, rt.handle().clone())
         .await
         .unwrap();
 
@@ -122,17 +115,13 @@ async fn test_delta_stats_from_strings_parquet() {
 
 #[tokio::test]
 async fn test_delta_stats_from_numbers_parquet() {
-    let cd = std::env::current_dir().unwrap();
-    let path = format!(
-        "{}/tests/test_data/public.numbers/public.numbers.snappy.parquet",
-        cd.display()
-    );
+    let path = fixture_url("public.numbers/public.numbers.snappy.parquet");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();
-    let builder = parquet_provider::builder_from_string(path, rt.handle().clone())
+    let builder = builder_from_string(path, rt.handle().clone())
         .await
         .unwrap();
 
@@ -194,17 +183,13 @@ async fn test_delta_stats_from_numbers_parquet() {
 
 #[tokio::test]
 async fn test_delta_stats_json_from_users_parquet() {
-    let cd = std::env::current_dir().unwrap();
-    let path = format!(
-        "{}/tests/test_data/public.users/public.users.snappy.parquet",
-        cd.display()
-    );
+    let path = fixture_url("public.users/public.users.snappy.parquet");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();
-    let builder = parquet_provider::builder_from_string(path, rt.handle().clone())
+    let builder = builder_from_string(path, rt.handle().clone())
         .await
         .unwrap();
 
@@ -247,17 +232,13 @@ async fn test_delta_stats_json_from_users_parquet() {
 
 #[tokio::test]
 async fn test_delta_stats_json_from_numbers_parquet() {
-    let cd = std::env::current_dir().unwrap();
-    let path = format!(
-        "{}/tests/test_data/public.numbers/public.numbers.snappy.parquet",
-        cd.display()
-    );
+    let path = fixture_url("public.numbers/public.numbers.snappy.parquet");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();
-    let builder = parquet_provider::builder_from_string(path, rt.handle().clone())
+    let builder = builder_from_string(path, rt.handle().clone())
         .await
         .unwrap();
 
@@ -293,14 +274,12 @@ async fn test_delta_stats_json_from_numbers_parquet() {
 }
 
 #[tokio::test]
+#[test_log::test]
 async fn test_overwrite_delta() {
-    let cd = std::env::current_dir().unwrap();
-    let source_path = format!(
-        "{}/tests/test_data/public.users/public.users.snappy.parquet",
-        cd.display()
-    );
+    let source_path = fixture_url("public.users/public.users.snappy.parquet");
 
-    let table_path = format!("{}/tests/test_data/delta_writes/users_delta/", cd.display());
+    let table_path = fixture("delta_writes/users_delta/").display().to_string();
+    let table_url = fixture_url("delta_writes/users_delta/");
     let _ = std::fs::remove_dir_all(&table_path);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -309,7 +288,7 @@ async fn test_overwrite_delta() {
         .build()
         .unwrap();
 
-    let builder = parquet_provider::builder_from_string(source_path.clone(), rt.handle().clone())
+    let builder = builder_from_string(source_path.clone(), rt.handle().clone())
         .await
         .unwrap();
     let schema = builder.schema().clone();
@@ -320,7 +299,7 @@ async fn test_overwrite_delta() {
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
 
     let transforms = vec![None; schema.fields().len()];
-    overwrite_delta(&table_path, schema.clone(), transforms, stream, None, None)
+    overwrite_delta(&table_url, schema.clone(), transforms, stream, None, None)
         .await
         .unwrap();
 
@@ -375,7 +354,7 @@ async fn test_overwrite_delta() {
 
     let first_parquet = add["path"].as_str().unwrap().to_string();
 
-    let builder2 = parquet_provider::builder_from_string(source_path, rt.handle().clone())
+    let builder2 = builder_from_string(source_path, rt.handle().clone())
         .await
         .unwrap();
     let stream2 = builder2
@@ -385,7 +364,7 @@ async fn test_overwrite_delta() {
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
 
     let transforms2 = vec![None; schema.fields().len()];
-    overwrite_delta(&table_path, schema, transforms2, stream2, None, None)
+    overwrite_delta(&table_url, schema, transforms2, stream2, None, None)
         .await
         .unwrap();
 
@@ -429,27 +408,24 @@ async fn test_overwrite_delta() {
 #[tokio::test]
 #[test_log::test]
 async fn test_delta_overwrite_with_config() {
-    let cd = std::env::current_dir().unwrap();
-
     let config = r#"
 src: file
 dest: delta.overwrite
 src_defaults:
-  filename: tests/test_data/{{ name }}/{{ name }}.snappy.parquet
+  filename: "{{ name }}/{{ name }}.snappy.parquet"
 
 tables:
   - name: public.users
   - name: public.numbers
   - name: public.string_values
-    filename: tests/test_data/public.string_values/public.strings.snappy.parquet
+    filename: public.string_values/public.strings.snappy.parquet
 "#;
 
-    let src_url = "file://".to_string();
-    let delta_root = format!(
-        "{}/tests/test_data/delta_writes/config_delta_root",
-        cd.display()
-    );
-    let dest_url = format!("file://{}/", delta_root);
+    let src_url = data_url();
+    let dest_url = fixture_url("delta_writes/config_delta_root/");
+    let delta_root = fixture("delta_writes/config_delta_root/")
+        .display()
+        .to_string();
 
     let table_names = ["public.users", "public.numbers", "public.string_values"];
 
@@ -530,8 +506,6 @@ tables:
 #[tokio::test]
 #[test_log::test]
 async fn test_delta_merge_with_config() {
-    let cd = std::env::current_dir().unwrap();
-
     // Same config run twice:
     //   1st run: ensure_table creates v0, merge inserts all source rows at v1
     //   2nd run: merge finds same keys in target, writes DVs + new adds at v2
@@ -539,19 +513,18 @@ async fn test_delta_merge_with_config() {
 src: file
 dest: delta.merge
 src_defaults:
-  filename: tests/test_data/{{ name }}/{{ name }}.snappy.parquet
+  filename: "{{ name }}/{{ name }}.snappy.parquet"
 
 tables:
   - name: public.numbers
     delta.merge_keys: [bigint_value]
 "#;
 
-    let src_url = "file://".to_string();
-    let delta_root = format!(
-        "{}/tests/test_data/delta_writes/config_delta_merge_root",
-        cd.display()
-    );
-    let dest_url = format!("file://{}/", delta_root);
+    let src_url = data_url();
+    let dest_url = fixture_url("delta_writes/config_delta_merge_root/");
+    let delta_root = fixture("delta_writes/config_delta_merge_root/")
+        .display()
+        .to_string();
     let table_path = format!("{}/public.numbers/", delta_root);
 
     // cleanup before test

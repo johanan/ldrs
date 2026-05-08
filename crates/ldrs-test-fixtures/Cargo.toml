@@ -1,0 +1,14 @@
+[package]
+name = "ldrs-test-fixtures"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Test fixtures for ldrs"
+
+[dependencies]
+
+[dev-dependencies]
+rstest.workspace = true
+test-log.workspace = true

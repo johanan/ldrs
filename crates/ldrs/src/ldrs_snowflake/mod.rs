@@ -3,10 +3,10 @@ pub mod snowflake_source;
 use anyhow::Context;
 use arrow::ipc::reader::StreamReader;
 use arrow_array::RecordBatch;
-use clap::Subcommand;
-use serde::{Deserialize, Serialize};
+use ldrs_arrow::ColumnType;
 use std::{
     future::Future,
+    path::PathBuf,
     process::{Command, Stdio},
 };
 use tokio::task;
@@ -14,42 +14,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, trace};
 use url::Url;
 
-use crate::{lua_logic::lua_args::LuaArgs, types::ColumnType};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SnowflakeStrategy {
-    Sql(Vec<String>),
-    Ingest,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnowflakeResult {
-    pub pre_sql: Vec<String>,
-    pub strategy: SnowflakeStrategy,
-    pub post_sql: Vec<String>,
-}
-
-#[derive(Subcommand)]
-pub enum SnowflakeCommands {
-    /// Execute a SQL statement (non-data retrieval)
-    Exec { sql: String },
-    Ingest {
-        #[arg(long, short)]
-        file_url: String,
-
-        #[arg(long, short)]
-        pattern: String,
-
-        #[clap(flatten)]
-        lua_args: LuaArgs,
-    },
-}
-
 #[derive(Clone)]
 pub struct SnowflakeConnection {
     pub conn_url: Url,
     pub raw_conn_url: String,
+    pub binary_path: PathBuf,
 }
 
 pub struct SnowflakeStreamResult<S> {
@@ -61,6 +30,8 @@ pub struct SnowflakeStreamResult<S> {
 impl SnowflakeConnection {
     pub fn create_connection(conn_url: &str) -> Result<SnowflakeConnection, anyhow::Error> {
         let parsed_url = Url::parse(conn_url).with_context(|| "Failed to parse connection URL")?;
+        let binary_path =
+            which::which("ldrs-sf").with_context(|| "Failed to find ldrs-sf binary in PATH")?;
 
         if parsed_url.scheme() != "snowflake" {
             return Err(anyhow::anyhow!(
@@ -71,15 +42,16 @@ impl SnowflakeConnection {
         return Ok(SnowflakeConnection {
             conn_url: parsed_url,
             raw_conn_url: conn_url.to_string(),
+            binary_path,
         });
     }
 
     /// Execute a SQL statement (typically DDL) and return success/failure
     pub fn exec(&self, sql: &str) -> Result<String, anyhow::Error> {
-        let mut cmd = Command::new("ldrs-sf");
+        let mut cmd = Command::new(&self.binary_path);
         let args = vec!["exec", "--sql", sql];
 
-        info!("Running command: ldrs-sf {:?}", args);
+        info!("Running command: {:?} {:?}", &self.binary_path, args);
 
         let output = cmd
             .args(args)
@@ -125,7 +97,7 @@ impl SnowflakeConnection {
 /// This uses the ldrs-sf binary to execute the query and stream the results.
 /// `bind_params` should already be sorted by key and this is the value and type of the parameter.
 pub async fn sf_arrow_stream(
-    conn: &str,
+    conn: &SnowflakeConnection,
     sql: &str,
     bind_params: Vec<(String, Option<ColumnType>)>,
 ) -> Result<
@@ -135,10 +107,11 @@ pub async fn sf_arrow_stream(
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let (schema_tx, schema_rx) = tokio::sync::oneshot::channel();
     let sql = sql.to_string();
-    let conn_url = conn.to_string();
+    let conn_url = conn.raw_conn_url.clone();
+    let binary_path = conn.binary_path.clone();
 
     let command_handle = task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("ldrs-sf");
+        let mut cmd = std::process::Command::new(&binary_path);
         let args = vec!["query", "--sql", &sql];
         let cmd = cmd.args(args);
         info!("Running command: {:?}", cmd);

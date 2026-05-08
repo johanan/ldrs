@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="#6D28D9">
+  <!-- dos-rebel wordmark, scaled 1.793x to fill 512px width -->
+  <g transform="scale(1.793)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">
+    <text x="0" y="12" xml:space="preserve"> ████      █████</text>
+    <text x="0" y="26" xml:space="preserve">░░███     ░░███</text>
+    <text x="0" y="40" xml:space="preserve"> ░███   ███████  ████████   █████</text>
+    <text x="0" y="54" xml:space="preserve"> ░███  ███░░███ ░░███░░███ ███░░ </text>
+    <text x="0" y="68" xml:space="preserve"> ░███ ░███ ░███  ░███ ░░░ ░░█████</text>
+    <text x="0" y="82" xml:space="preserve"> ░███ ░███ ░███  ░███      ░░░░███</text>
+    <text x="0" y="96" xml:space="preserve"> █████░░████████ █████     ██████</text>
+    <text x="0" y="110" xml:space="preserve">░░░░░  ░░░░░░░░ ░░░░░     ░░░░░░  </text>
+  </g>
+  <!-- aqueduct: zero wordmark gap, inter-tier gap 16, middle column body 96 (matches icon) -->
+  <g transform="translate(0,149.333)">
+    <path d="M0,58.667V112c17.673,0,32,14.327,32,32v21.333h64V144c0-17.673,14.327-32,32-32s32,14.327,32,32v21.333h64V144c0-17.673,14.328-32,32-32c17.673,0,32,14.327,32,32v21.333h64V144c0-17.673,14.328-32,32-32c17.673,0,32,14.327,32,32v21.333h64V144c0-17.673,14.328-32,32-32V58.667H0z"/>
+    <path transform="translate(0,-16)" d="M0,197.333v53.333c17.673,0,32,14.327,32,32v96h64V282.667c0-17.673,14.328-32,32-32s32,14.327,32,32v96h64V282.667c0-17.673,14.328-32,32-32c17.673,0,32,14.327,32,32v96h64V282.667c0-17.673,14.328-32,32-32c17.673,0,32,14.327,32,32v96h64V282.667c0-17.673,14.328-32,32-32v-53.333H0z"/>
+  </g>
+</svg>

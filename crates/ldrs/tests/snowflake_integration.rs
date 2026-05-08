@@ -1,11 +1,9 @@
 use ldrs::{
-    ldrs_snowflake::SnowflakeResult,
-    lua_logic::{LuaFunctionLoader, StorageData, UrlData},
-    parquet_provider::builder_from_string,
+    lua_logic::{lua_args::SnowflakeResult, LuaFunctionLoader, StorageData, UrlData},
     path_pattern::{self, build_module_path_from_pattern},
-    storage::{base_or_relative_path, build_store},
-    types::parquet_types::ParquetSchema,
 };
+use ldrs_parquet::{builder_from_string, ParquetSchema};
+use ldrs_storage::{base_or_relative_path, build_store};
 
 //#[tokio::test]
 async fn test_snowflake_lua_integration() {

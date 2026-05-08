@@ -1,0 +1,21 @@
+[package]
+name = "ldrs-arrow"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+anyhow.workspace = true
+chrono = "0.4.44"
+serde.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+test-log.workspace = true

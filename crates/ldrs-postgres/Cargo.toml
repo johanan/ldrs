@@ -1,0 +1,25 @@
+[package]
+name = "ldrs-postgres"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ldrs-arrow = { path = "../ldrs-arrow" }
+
+anyhow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+native-tls = { version = "0.2.18", features = ["vendored"] }
+postgres-native-tls.workspace = true
+postgres-types.workspace = true
+tokio-postgres.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true

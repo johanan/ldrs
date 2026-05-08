@@ -1,8 +1,7 @@
 use handlebars::handlebars_helper;
+use ldrs_arrow::ColumnType;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
-
-use crate::types::ColumnType;
 
 pub fn get_all_ldrs_env_vars() -> Vec<(String, String)> {
     std::env::vars()

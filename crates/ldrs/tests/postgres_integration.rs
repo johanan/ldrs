@@ -1,4 +1,6 @@
-use ldrs::{ldrs_config::create_ldrs_exec, ldrs_postgres::client::create_connection};
+use ldrs::ldrs_config::create_ldrs_exec;
+use ldrs_postgres::create_connection;
+use ldrs_test_fixtures::{data_dir, data_url};
 
 const TEST_CASES: &[&str] = &[
     "
@@ -7,7 +9,7 @@ src: file
 
 tables:
   - name: public_test.users
-    filename: tests/test_data/public.users/public.users.snappy.parquet
+    filename: public.users/public.users.snappy.parquet
     post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
 ",
     // test the defaults
@@ -15,7 +17,7 @@ tables:
 dest: pg.drop_replace
 src: file
 src_defaults:
-  filename: tests/test_data/public.users/public.{{ table }}.snappy.parquet
+  filename: public.users/public.{{ table }}.snappy.parquet
 
 tables:
 - name: public_test.users
@@ -26,7 +28,7 @@ tables:
 tables:
   - name: public_test.users
     dest: pg.drop_replace
-    filename: tests/test_data/public.users/public.users.snappy.parquet
+    filename: public.users/public.users.snappy.parquet
     post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
 ",
     // now test truncate insert
@@ -34,28 +36,28 @@ tables:
 tables:
   - name: public_test.users
     dest: pg.truncate_insert
-    filename: tests/test_data/public.users/public.users.snappy.parquet
+    filename: public.users/public.users.snappy.parquet
     post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
 ",
     // should be able to infer based on delete_keys
     "
 tables:
   - name: public_test.users
-    filename: tests/test_data/public.users/public.users.snappy.parquet
+    filename: public.users/public.users.snappy.parquet
     delete_keys: [created]
 ",
     // test with param types
     "
 tables:
   - name: public_test.users
-    filename: tests/test_data/public.users/public.users.snappy.parquet
+    filename: public.users/public.users.snappy.parquet
     delete_keys: [created]
     param_keys: [ { name: created, type: timestamp } ]
 ",
     "
 tables:
   - name: public_test.users
-    filename: tests/test_data/public.users/public.users.snappy.parquet
+    filename: public.users/public.users.snappy.parquet
     merge_keys: [unique_id]
 ",
 ];
@@ -63,7 +65,7 @@ tables:
 #[tokio::test]
 #[test_log::test]
 async fn test_postgres_file_drop() {
-    let file_url = "file://";
+    let file_url = data_url();
     let pg_role_url =
         "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable&role=test_role";
     let ldrs_env = vec![
@@ -109,7 +111,7 @@ async fn test_postgres_file_drop() {
 
 #[tokio::test]
 async fn test_postgres_env_role() {
-    let file_url = "file://";
+    let file_url = data_url();
     let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
     let ldrs_env = vec![
         ("LDRS_SRC".to_string(), file_url.to_string()),
@@ -133,10 +135,10 @@ async fn test_postgres_env_role() {
 #[tokio::test]
 #[test_log::test]
 async fn test_postgres_all_parquets() {
-    let file_url = "file://";
+    let file_url = data_url();
     let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
     let ldrs_env = vec![
-        ("LDRS_SRC".to_string(), file_url.to_string()),
+        ("LDRS_SRC".to_string(), file_url),
         ("LDRS_DEST".to_string(), pg_url.to_string()),
     ];
 
@@ -146,11 +148,11 @@ src: file
 
 tables:
   - name: public_test_all.users
-    filename: tests/test_data/public.users/public.users.snappy.parquet
+    filename: public.users/public.users.snappy.parquet
   - name: public_test_all.strings
-    filename: tests/test_data/public.string_values/public.strings.snappy.parquet
+    filename: public.string_values/public.strings.snappy.parquet
   - name: public_test_all.numbers
-    filename: tests/test_data/public.numbers/public.numbers.snappy.parquet
+    filename: public.numbers/public.numbers.snappy.parquet
 ";
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -235,10 +237,10 @@ tables:
 #[tokio::test]
 #[test_log::test]
 async fn test_postgres_numeric_edge_cases() {
-    let file_url = "file://";
+    let file_url = data_url();
     let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
     let ldrs_env = vec![
-        ("LDRS_SRC".to_string(), file_url.to_string()),
+        ("LDRS_SRC".to_string(), file_url),
         ("LDRS_DEST".to_string(), pg_url.to_string()),
     ];
 
@@ -248,7 +250,7 @@ src: file
 
 tables:
   - name: public_test_edge.numbers_edge
-    filename: tests/test_data/public.numbers_edge/numbers_edge.snappy.parquet
+    filename: public.numbers_edge/numbers_edge.snappy.parquet
 ";
 
     let rt = tokio::runtime::Builder::new_multi_thread()

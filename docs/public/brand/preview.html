@@ -1,0 +1,93 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ldrs brand assets</title>
+<style>
+  body { font-family: ui-monospace, Menlo, Consolas, monospace; margin: 2rem; background: #f5f5f5; color: #222; }
+  h1 { font-weight: normal; font-size: 1rem; margin: 0 0 1.5rem; }
+  h2 { font-size: 0.85rem; font-weight: normal; color: #888; margin: 2rem 0 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  p.note { color: #666; font-size: 0.85rem; margin: 0 0 1rem; }
+  .row { display: flex; gap: 2rem; align-items: flex-end; margin-bottom: 1rem; flex-wrap: wrap; }
+  .col { display: flex; flex-direction: column; align-items: center; gap: 0.5rem; }
+  .col span { font-size: 0.75rem; color: #666; }
+  .light, .dark { padding: 1.5rem; border-radius: 8px; }
+  .light { background: #ffffff; }
+  .dark { background: #1a1a1a; }
+  .panel { display: flex; gap: 2rem; align-items: flex-end; padding: 1.5rem; }
+</style>
+</head>
+<body>
+
+<h1>ldrs brand assets</h1>
+<p class="note">Three artifacts. All three share the same aqueduct geometry: column body 96, inter-tier gap 16 where applicable.</p>
+
+<h2>icon — aqueduct alone, 512×304 (~1.68:1)</h2>
+<p class="note">Standalone mark. Use for favicon (with letterboxing or square crop), in-page small marks, anywhere the wordmark is unwanted.</p>
+<div class="row">
+  <div class="light panel">
+    <div class="col"><img src="aqueduct-full.svg" width="128" height="76"><span>128</span></div>
+    <div class="col"><img src="aqueduct-full.svg" width="256" height="152"><span>256</span></div>
+    <div class="col"><img src="aqueduct-full.svg" width="384" height="228"><span>384</span></div>
+  </div>
+  <div class="dark panel">
+    <div class="col"><img src="aqueduct-full.svg" width="256" height="152"><span style="color:#888">256</span></div>
+    <div class="col"><img src="aqueduct-full.svg" width="384" height="228"><span style="color:#888">384</span></div>
+  </div>
+</div>
+
+<h2>primary lockup — wordmark + middle aqueduct, 32px gap, 512×421 (~1.22:1)</h2>
+<p class="note">Default lockup. Single-tier aqueduct under wordmark. Use for masthead, README banner, social cards.</p>
+<div class="row">
+  <div class="light panel">
+    <div class="col"><img src="aqueduct-lockup.svg" width="256" height="211"><span>256</span></div>
+    <div class="col"><img src="aqueduct-lockup.svg" width="384" height="316"><span>384</span></div>
+  </div>
+  <div class="dark panel">
+    <div class="col"><img src="aqueduct-lockup.svg" width="256" height="211"><span style="color:#888">256</span></div>
+    <div class="col"><img src="aqueduct-lockup.svg" width="384" height="316"><span style="color:#888">384</span></div>
+  </div>
+</div>
+
+<h2>square lockup — wordmark + full aqueduct, 512×512 (1:1)</h2>
+<p class="note">Square variant. Two-tier aqueduct, zero wordmark gap, inter-tier gap 16. Same column body as the icon. Use for app icons, GitHub avatars, anywhere a square is required.</p>
+<div class="row">
+  <div class="light panel">
+    <div class="col"><img src="aqueduct-lockup-full.svg" width="256" height="256"><span>256</span></div>
+    <div class="col"><img src="aqueduct-lockup-full.svg" width="384" height="384"><span>384</span></div>
+  </div>
+  <div class="dark panel">
+    <div class="col"><img src="aqueduct-lockup-full.svg" width="256" height="256"><span style="color:#888">256</span></div>
+    <div class="col"><img src="aqueduct-lockup-full.svg" width="384" height="384"><span style="color:#888">384</span></div>
+  </div>
+</div>
+
+<h2>white-fill variants — for use on colored / dark backgrounds</h2>
+<p class="note">Same SVGs with fill changed to #FFFFFF. The figlet "shadow" survives the recolor because it's a glyph pattern, not a different fill. Demonstrated on royal violet (#6D28D9), royal violet dark (#8B5CF6), and dark gray (#1a1a1a).</p>
+
+<div class="row">
+  <div style="background:#6D28D9; padding:1.5rem; border-radius:8px; display:flex; gap:2rem; align-items:flex-end;">
+    <div class="col"><img src="aqueduct-full-white.svg" width="192" height="114"><span style="color:#fff">icon</span></div>
+    <div class="col"><img src="aqueduct-lockup-white.svg" width="192" height="158"><span style="color:#fff">primary</span></div>
+    <div class="col"><img src="aqueduct-lockup-full-white.svg" width="192" height="192"><span style="color:#fff">square</span></div>
+  </div>
+</div>
+
+<div class="row">
+  <div style="background:#8B5CF6; padding:1.5rem; border-radius:8px; display:flex; gap:2rem; align-items:flex-end;">
+    <div class="col"><img src="aqueduct-full-white.svg" width="192" height="114"><span style="color:#fff">icon</span></div>
+    <div class="col"><img src="aqueduct-lockup-white.svg" width="192" height="158"><span style="color:#fff">primary</span></div>
+    <div class="col"><img src="aqueduct-lockup-full-white.svg" width="192" height="192"><span style="color:#fff">square</span></div>
+  </div>
+</div>
+
+<div class="row">
+  <div style="background:#1a1a1a; padding:1.5rem; border-radius:8px; display:flex; gap:2rem; align-items:flex-end;">
+    <div class="col"><img src="aqueduct-full-white.svg" width="192" height="114"><span style="color:#888">icon</span></div>
+    <div class="col"><img src="aqueduct-lockup-white.svg" width="192" height="158"><span style="color:#888">primary</span></div>
+    <div class="col"><img src="aqueduct-lockup-full-white.svg" width="192" height="192"><span style="color:#888">square</span></div>
+  </div>
+</div>
+
+</body>
+</html>

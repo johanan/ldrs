@@ -1,4 +1,4 @@
-use crate::types::ColumnSpec;
+use ldrs_arrow::ColumnSpec;
 
 pub enum SchemaMode {
     Strict,
