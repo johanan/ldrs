@@ -16,19 +16,24 @@ publish = false
 [[package]]
 name = "ldrs-arrow"
 release = false
+publish = false
 
 [[package]]
 name = "ldrs-storage"
 release = false
+publish = false
 
 [[package]]
 name = "ldrs-parquet"
 release = false
+publish = false
 
 [[package]]
 name = "ldrs-postgres"
 release = false
+publish = false
 
 [[package]]
 name = "ldrs-delta"
 release = false
+publish = false
