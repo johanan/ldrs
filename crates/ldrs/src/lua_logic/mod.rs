@@ -3,8 +3,8 @@ pub mod lua_args;
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::types::parquet_types::ParquetSchema;
 use arrow::datatypes::SchemaRef;
+use ldrs_parquet::ParquetSchema;
 use mlua::{Lua, LuaSerdeExt};
 use object_store::{path::Path as StorePath, ObjectStoreScheme};
 use serde::{Deserialize, Serialize};

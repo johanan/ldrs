@@ -1,10 +1,8 @@
+use ldrs_arrow::ColumnType;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
-use crate::{
-    ldrs_env::{get_env_values_by_keys, get_params_for_stmt_with_default},
-    types::ColumnType,
-};
+use crate::ldrs_env::{get_env_values_by_keys, get_params_for_stmt_with_default};
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct SFQuery {

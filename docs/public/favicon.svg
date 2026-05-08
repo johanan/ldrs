@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <style>
+    text { fill: #6D28D9; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #8B5CF6; }
+    }
+  </style>
+  <!-- dos-rebel wordmark, scaled 1.793x, centered vertically in 512×512 -->
+  <g transform="translate(0,152) scale(1.793)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">
+    <text x="0" y="12" xml:space="preserve"> ████      █████</text>
+    <text x="0" y="26" xml:space="preserve">░░███     ░░███</text>
+    <text x="0" y="40" xml:space="preserve"> ░███   ███████  ████████   █████</text>
+    <text x="0" y="54" xml:space="preserve"> ░███  ███░░███ ░░███░░███ ███░░ </text>
+    <text x="0" y="68" xml:space="preserve"> ░███ ░███ ░███  ░███ ░░░ ░░█████</text>
+    <text x="0" y="82" xml:space="preserve"> ░███ ░███ ░███  ░███      ░░░░███</text>
+    <text x="0" y="96" xml:space="preserve"> █████░░████████ █████     ██████</text>
+    <text x="0" y="110" xml:space="preserve">░░░░░  ░░░░░░░░ ░░░░░     ░░░░░░  </text>
+  </g>
+</svg>

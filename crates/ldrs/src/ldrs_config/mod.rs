@@ -6,6 +6,17 @@ use anyhow::Context;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use futures::Stream;
+use ldrs_arrow::{
+    build_arrow_transform_strategy, build_source_and_target_schema, ArrowColumnTransformStrategy,
+    ColumnSpec,
+};
+use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, TxnConfig};
+use ldrs_parquet::{
+    builder_from_url, columnspec_from_parquet, default_writer_props, get_fields,
+    with_bloom_filters, write_parquet,
+};
+use ldrs_postgres::check_for_role;
+use ldrs_storage::{base_or_relative_path, ensure_trailing_slash};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -13,21 +24,11 @@ use tracing::{debug, info};
 use url::Url;
 
 use crate::{
-    arrow_access::arrow_transforms::{
-        build_arrow_transform_strategy, ArrowColumnTransformStrategy,
-    },
-    ldrs_arrow::build_source_and_target_schema,
+    delta::{DeltaMode, MergeTxnConfig},
     ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
-    ldrs_delta::{merge_delta, overwrite_delta, DeltaMode, MergeConfig, MergeTxnConfig, TxnConfig},
     ldrs_env::{collect_params, collect_vars_by_prefix, setup_handlebars, LdrsExecutionContext},
-    ldrs_parquet::{default_writer_props, with_bloom_filters, write_parquet},
-    ldrs_postgres::{client::check_for_role, postgres_execution::load_to_postgres},
-    ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource},
-    ldrs_storage::is_object_store_url,
-    parquet_provider::builder_from_url,
-    pq::get_fields,
-    storage::{base_or_relative_path, ensure_trailing_slash},
-    types::ColumnSpec,
+    ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource, SnowflakeConnection},
+    postgres::execute::load_to_postgres,
 };
 
 enum StreamType {
@@ -92,6 +93,13 @@ pub fn get_dest_url<'a>(
             prefix_key
         )
     })
+}
+
+fn is_object_store_url(url: &Url) -> bool {
+    matches!(
+        url.scheme(),
+        "file" | "az" | "adl" | "azure" | "abfs" | "abfss" | "https"
+    )
 }
 
 pub fn infer_env_type(env_type: &str, vars: &[(String, String)]) -> Option<String> {
@@ -242,7 +250,7 @@ pub async fn create_ldrs_exec(
                 let stream = builder.with_batch_size(2048).build()?;
                 let source_cols = fields
                     .iter()
-                    .filter_map(|pq| ColumnSpec::try_from(pq).ok())
+                    .filter_map(|pq| columnspec_from_parquet(pq).ok())
                     .collect::<Vec<_>>();
                 (
                     LdrsSrcStream {
@@ -267,8 +275,8 @@ pub async fn create_ldrs_exec(
                 let sf_params = sf.try_get_env_params(&handled_name, &env_params)?;
                 debug!("Snowflake Params: {:?}", sf_params);
                 let rendered_sql = ldrs_context.render_template(&sf_sql)?;
-                let arrow_stream =
-                    sf_arrow_stream(sf_src.1.as_str(), &rendered_sql, sf_params).await?;
+                let conn = SnowflakeConnection::create_connection(&sf_src.1)?;
+                let arrow_stream = sf_arrow_stream(&conn, &rendered_sql, sf_params).await?;
                 let schema = arrow_stream.schema_stream.await;
                 (
                     LdrsSrcStream {
@@ -431,7 +439,8 @@ pub async fn create_ldrs_exec(
 
 #[cfg(test)]
 mod tests {
-    use crate::types::ColumnType;
+
+    use ldrs_arrow::{ColumnType, TimeUnit};
 
     use super::*;
 
@@ -495,7 +504,7 @@ mod tests {
             (
                 "P2".to_string(),
                 "2023-01-01T00:00:00Z".to_string(),
-                Some(ColumnType::Timestamp(crate::types::TimeUnit::Micros))
+                Some(ColumnType::Timestamp(TimeUnit::Micros))
             )
         );
     }

@@ -6,7 +6,7 @@ use arrow_array::builder::Int64Builder;
 use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use futures::stream;
-use ldrs::ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, MergeStats, TxnConfig};
+use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, TxnConfig};
 
 // 2026-01-01T00:00:00Z in microseconds
 const TARGET_BASE_TS: i64 = 1_767_225_600_000_000;
@@ -68,10 +68,7 @@ fn cleanup_table(path: &str) {
 }
 
 fn read_log_actions(table_path: &str, version: u64) -> Vec<serde_json::Value> {
-    let log_path = format!(
-        "{}/_delta_log/{:020}.json",
-        table_path, version
-    );
+    let log_path = format!("{}/_delta_log/{:020}.json", table_path, version);
     let content = std::fs::read_to_string(&log_path)
         .unwrap_or_else(|_| panic!("Failed to read log version {}", version));
     content
@@ -81,10 +78,16 @@ fn read_log_actions(table_path: &str, version: u64) -> Vec<serde_json::Value> {
 }
 
 fn count_actions(actions: &[serde_json::Value], action_type: &str) -> usize {
-    actions.iter().filter(|a| a.get(action_type).is_some()).count()
+    actions
+        .iter()
+        .filter(|a| a.get(action_type).is_some())
+        .count()
 }
 
-fn find_action<'a>(actions: &'a [serde_json::Value], action_type: &str) -> Option<&'a serde_json::Value> {
+fn find_action<'a>(
+    actions: &'a [serde_json::Value],
+    action_type: &str,
+) -> Option<&'a serde_json::Value> {
     actions.iter().find_map(|a| a.get(action_type))
 }
 
@@ -114,7 +117,10 @@ fn verify_duckdb_count(table_path: &str, expected: i64) {
         .trim()
         .parse()
         .unwrap_or_else(|_| panic!("could not parse duckdb output: {stdout:?}"));
-    assert_eq!(actual, expected, "duckdb row count mismatch for {table_path}");
+    assert_eq!(
+        actual, expected,
+        "duckdb row count mismatch for {table_path}"
+    );
 }
 
 #[tokio::test]
@@ -129,7 +135,16 @@ async fn test_merge_basic_int_key() {
     // Write target: ids 1..=1000 via overwrite
     let target = make_target_batch(1..1001);
     let target_stream = stream::iter(vec![Ok(target)]);
-    overwrite_delta(&table_url, schema.clone(), vec![], target_stream, None, None).await.unwrap();
+    overwrite_delta(
+        &table_url,
+        schema.clone(),
+        vec![],
+        target_stream,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     // Merge source: ids 501..=1500
     // 500 updates (501..=1000), 500 inserts (1001..=1500)
@@ -149,8 +164,14 @@ async fn test_merge_basic_int_key() {
 
     // Verify MergeStats
     assert_eq!(stats.source_rows, 1000, "source should have 1000 rows");
-    assert_eq!(stats.matched_rows, 500, "500 rows should match (ids 501..=1000)");
-    assert_eq!(stats.inserted_rows, 500, "500 rows should be inserts (ids 1001..=1500)");
+    assert_eq!(
+        stats.matched_rows, 500,
+        "500 rows should match (ids 501..=1000)"
+    );
+    assert_eq!(
+        stats.inserted_rows, 500,
+        "500 rows should be inserts (ids 1001..=1500)"
+    );
     assert!(stats.files_with_dvs > 0, "should have files with DVs");
     assert!(stats.files_written > 0, "should have written source files");
     assert!(!stats.skipped, "should not be skipped");
@@ -179,13 +200,14 @@ async fn test_merge_basic_int_key() {
 
     // Remove actions — matched target files get removed
     let remove_count = count_actions(&actions, "remove");
-    assert!(remove_count > 0, "should have remove actions for matched files");
+    assert!(
+        remove_count > 0,
+        "should have remove actions for matched files"
+    );
 
     // Add actions — should have both DV re-adds and new source file adds
-    let add_actions: Vec<&serde_json::Value> = actions
-        .iter()
-        .filter_map(|a| a.get("add"))
-        .collect();
+    let add_actions: Vec<&serde_json::Value> =
+        actions.iter().filter_map(|a| a.get("add")).collect();
     assert!(add_actions.len() > 0, "should have add actions");
 
     // DV adds: same number as removes (re-adding matched files with DVs)
@@ -194,7 +216,8 @@ async fn test_merge_basic_int_key() {
         .filter(|a| a.get("deletionVector").is_some())
         .collect();
     assert_eq!(
-        dv_adds.len(), remove_count,
+        dv_adds.len(),
+        remove_count,
         "each removed file should be re-added with a DV"
     );
 
@@ -259,15 +282,14 @@ async fn test_merge_empty_table() {
 
     // No removes
     assert_eq!(
-        count_actions(&actions, "remove"), 0,
+        count_actions(&actions, "remove"),
+        0,
         "no remove actions on empty table merge"
     );
 
     // Add actions: source files only, no DVs
-    let add_actions: Vec<&serde_json::Value> = actions
-        .iter()
-        .filter_map(|a| a.get("add"))
-        .collect();
+    let add_actions: Vec<&serde_json::Value> =
+        actions.iter().filter_map(|a| a.get("add")).collect();
     assert!(add_actions.len() > 0, "should have add actions");
     for add in &add_actions {
         assert!(
@@ -277,8 +299,7 @@ async fn test_merge_empty_table() {
     }
 
     // Protocol upgrade happens on first merge even with no matches
-    let protocol = find_action(&actions, "protocol")
-        .expect("first merge should upgrade protocol");
+    let protocol = find_action(&actions, "protocol").expect("first merge should upgrade protocol");
     let reader_features = protocol["readerFeatures"].as_array().unwrap();
     assert!(
         reader_features.iter().any(|f| f == "deletionVectors"),
@@ -298,7 +319,16 @@ async fn test_merge_all_matches() {
     // Target: ids 1..=1000
     let target = make_target_batch(1..1001);
     let target_stream = stream::iter(vec![Ok(target)]);
-    overwrite_delta(&table_url, schema.clone(), vec![], target_stream, None, None).await.unwrap();
+    overwrite_delta(
+        &table_url,
+        schema.clone(),
+        vec![],
+        target_stream,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     // Source: same ids 1..=1000 — all updates, no inserts
     let source = make_source_batch(1..1001);
@@ -327,18 +357,20 @@ async fn test_merge_all_matches() {
     assert_eq!(commit_info["operation"], "MERGE");
 
     let remove_count = count_actions(&actions, "remove");
-    assert!(remove_count > 0, "should have remove actions for matched files");
+    assert!(
+        remove_count > 0,
+        "should have remove actions for matched files"
+    );
 
-    let add_actions: Vec<&serde_json::Value> = actions
-        .iter()
-        .filter_map(|a| a.get("add"))
-        .collect();
+    let add_actions: Vec<&serde_json::Value> =
+        actions.iter().filter_map(|a| a.get("add")).collect();
     let dv_adds: Vec<&&serde_json::Value> = add_actions
         .iter()
         .filter(|a| a.get("deletionVector").is_some())
         .collect();
     assert_eq!(
-        dv_adds.len(), remove_count,
+        dv_adds.len(),
+        remove_count,
         "each removed file should be re-added with a DV"
     );
 
@@ -409,7 +441,10 @@ async fn test_merge_with_existing_dvs() {
     )
     .await
     .unwrap();
-    assert_eq!(stats2.matched_rows, 500, "second merge should match 500 new rows");
+    assert_eq!(
+        stats2.matched_rows, 500,
+        "second merge should match 500 new rows"
+    );
     assert_eq!(stats2.inserted_rows, 0);
 
     // Second merge commit at v3 (v0=create, v1=overwrite, v2=first merge, v3=second merge)
@@ -488,7 +523,10 @@ async fn test_merge_string_key() {
     .unwrap();
 
     assert_eq!(stats.source_rows, 1000);
-    assert_eq!(stats.matched_rows, 500, "names row-000501..row-001000 should match");
+    assert_eq!(
+        stats.matched_rows, 500,
+        "names row-000501..row-001000 should match"
+    );
     assert_eq!(stats.inserted_rows, 500);
     assert!(stats.files_with_dvs > 0);
 
@@ -702,7 +740,10 @@ async fn test_merge_txn_watermark_skip() {
     )
     .await
     .unwrap();
-    assert!(stats2.skipped, "second merge with same watermark should skip");
+    assert!(
+        stats2.skipped,
+        "second merge with same watermark should skip"
+    );
     assert_eq!(
         stats2.skipped_version,
         Some(committed_version),

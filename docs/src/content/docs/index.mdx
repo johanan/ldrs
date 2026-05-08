@@ -1,0 +1,45 @@
+---
+title: ldrs
+description: Fast, minimal-allocation Rust binary for the E&L of ETL.
+hero:
+  tagline: ""
+---
+
+import Wordmark from "../../components/Wordmark.astro";
+
+Simple data loader. Point at a source and a destination and ldrs will stream all the data between them with minimal configurations. Written in Rust the core data abstraction is Arrow RecordBatches. Fast and minimal memory allocations.
+
+Install:
+```
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johanan/ldrs/releases/latest/download/ldrs-installer.sh | sh
+```
+
+Snowflake binary. Install only if Snowflake is a source. [Why?](/ldrs-sf):
+```
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johanan/ldrs/raw/main/ldrs-sf-installer.sh | sh
+```
+
+## Features
+
+- Arrow streaming end-to-end. Never fully materializes.
+- Sources: Parquet (from anywhere [object_store](https://docs.rs/object_store/latest/object_store/) can read), Snowflake, or any Arrow IPC Stream (e.g. DuckDB, Polars, DataFusion)
+- Destinations: Postgres, Parquet, Delta Lake, Snowflake
+- YAML config, Handlebars templating, and Lua hooks
+- Single static binary 
+
+## Philosophy
+
+- **Arrow is the abstraction** - Arrow is already at the core of almost all data tooling and ldrs fits right into that ecosystem.
+- **Binary compatible** - Keeps the data in the same binary format that Arrow has. [^binary-edges]
+- **Minimal config** - Point to a source and a destination and ldrs will move the data. Or have a bunch of configs and have total control.
+- **Zero State** - No extra stores or external metadata. Data is moved based on the file (internal metadata or footers), the path, and the config.
+- **Development to Production Parity** - The same binary and config you use in development is what you use in production.
+
+In depth technical [vision](/vision).
+
+## Example
+
+Still working on the best way to show this while balancing with getting started.
+
+
+[^binary-edges]: Of course there are edges around types where they do not match, not even accounting for timestamps, so there are helpers to convert these, but the core is to keep the source binary type as the destination binary type.

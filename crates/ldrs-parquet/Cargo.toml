@@ -1,0 +1,26 @@
+[package]
+name = "ldrs-parquet"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ldrs-arrow = { path = "../ldrs-arrow" }
+ldrs-storage = { path = "../ldrs-storage" }
+
+anyhow.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+futures = "0.3.32"
+object_store.workspace = true
+parquet.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+ldrs-test-fixtures = { path = "../ldrs-test-fixtures" }

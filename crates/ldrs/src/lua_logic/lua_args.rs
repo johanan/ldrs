@@ -1,9 +1,23 @@
 use clap::Args;
+use ldrs_storage::base_or_relative_path;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::path_pattern::{self, build_module_path_from_pattern, PathPattern};
-use crate::storage;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SnowflakeStrategy {
+    Sql(Vec<String>),
+    Ingest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnowflakeResult {
+    pub pre_sql: Vec<String>,
+    pub strategy: SnowflakeStrategy,
+    pub post_sql: Vec<String>,
+}
 
 #[derive(Args, Debug)]
 pub struct LuaArgs {
@@ -73,7 +87,7 @@ pub fn modules_from_args<'a>(
 
     let pattern = path_pattern::PathPattern::new(&pattern_str)?;
 
-    let storage_url = storage::base_or_relative_path(file_url)?;
+    let storage_url = base_or_relative_path(file_url)?;
 
     let mut all_paths = Vec::new();
     for module in &module_config.modules {
