@@ -8,7 +8,7 @@ use arrow_schema::{Schema, SchemaRef};
 use futures::Stream;
 use ldrs_arrow::{
     build_arrow_transform_strategy, build_source_and_target_schema, ArrowColumnTransformStrategy,
-    ColumnSpec,
+    ColumnSpec, ColumnType,
 };
 use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, TxnConfig};
 use ldrs_parquet::{
@@ -25,7 +25,9 @@ use url::Url;
 
 use crate::{
     delta::{DeltaMode, MergeTxnConfig},
-    ldrs_config::config::{get_parsed_config, LdrsConfig, LdrsDestination, LdrsSource},
+    ldrs_config::config::{
+        get_parsed_config, LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource,
+    },
     ldrs_env::{collect_params, collect_vars_by_prefix, setup_handlebars, LdrsExecutionContext},
     ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource, SnowflakeConnection},
     postgres::execute::load_to_postgres,
@@ -225,215 +227,229 @@ pub async fn create_ldrs_exec(
         let task_start = std::time::Instant::now();
         debug!("Task: {:?}", task);
         info!("Running task: {}/{}", i + 1, total_tasks);
-        let (src, context) = match task.src {
-            LdrsSource::File(file) => {
-                let ldrs_context =
-                    LdrsExecutionContext::try_new(&file.name, &handlebars, &handlebars_vars)?;
-                // if the filename is not provided, use the name as the filename
-                let file_name = file.filename.as_deref().unwrap_or(file.name.as_str());
-                let src_value = get_src_url(ldrs_env, &file.name, "file")?;
-                // render the filename if it has tokens in the path
-                let joined = ldrs_context.render_template(&format!(
-                    "{}{}",
-                    src_value.1.as_str(),
-                    file_name
-                ))?;
-                let src_url = base_or_relative_path(&joined)?;
-                let builder = builder_from_url(src_url.clone(), cloud_io_rt.clone()).await?;
-
-                let schema = builder.schema().clone();
-
-                let file_md = builder.metadata().clone();
-                let fields = get_fields(file_md.file_metadata())?;
-
-                // matches DuckDB STANDARD_VECTOR_SIZE
-                let stream = builder.with_batch_size(2048).build()?;
-                let source_cols = fields
-                    .iter()
-                    .filter_map(|pq| columnspec_from_parquet(pq).ok())
-                    .collect::<Vec<_>>();
-                (
-                    LdrsSrcStream {
-                        schema: Some(schema),
-                        stream_type: StreamType::Parquet(stream),
-                        source_cols,
-                        cleanup_handle: None,
-                    },
-                    ldrs_context,
-                )
-            }
-            LdrsSource::SF(sf) => {
-                let sf_sql = match &sf {
-                    SFSource::Query(sql) => sql.sql.clone(),
-                    SFSource::Table(table) => format!("SELECT * FROM {}", table.name),
-                };
-                let name = sf.get_name();
-                let sf_src = get_src_url(ldrs_env, &name, "sf")?;
-                let ldrs_context =
-                    LdrsExecutionContext::try_new(&name, &handlebars, &handlebars_vars)?;
-                let handled_name = ldrs_context.render_template("{{ shoutySnakeCase name }}")?;
-                let sf_params = sf.try_get_env_params(&handled_name, &env_params)?;
-                debug!("Snowflake Params: {:?}", sf_params);
-                let rendered_sql = ldrs_context.render_template(&sf_sql)?;
-                let conn = SnowflakeConnection::create_connection(&sf_src.1)?;
-                let arrow_stream = sf_arrow_stream(&conn, &rendered_sql, sf_params).await?;
-                let schema = arrow_stream.schema_stream.await;
-                (
-                    LdrsSrcStream {
-                        schema,
-                        stream_type: StreamType::Receiver(arrow_stream.batch_stream),
-                        source_cols: vec![],
-                        cleanup_handle: Some(arrow_stream.command_handle),
-                    },
-                    ldrs_context,
-                )
-            }
-        };
-
-        let _ = match src.schema {
-            Some(schema) => match task.dest {
-                LdrsDestination::Pg(pg_dest) => {
-                    let dest_value = get_dest_url(ldrs_env, pg_dest.get_name(), "pg")?;
-                    let (pg_url, role) = check_for_role(dest_value.1.as_str())?;
-                    // check the environment for a pg role
-                    let role = role.or(get_env_value(
-                        ldrs_env,
-                        &[
-                            &format!("LDRS_PG_ROLE_{}", pg_dest.get_name()),
-                            "LDRS_PG_ROLE",
-                        ],
-                    )
-                    .map(|(_, v)| v.to_string()));
-                    let pg_commands = pg_dest.to_pg_commands();
-                    let (target_cols, strategies) =
-                        column_helper(src.source_cols, pg_dest.get_columns(), &schema)?;
-                    info!("Target columns: {:?}", target_cols);
-                    info!("Arrow Transforms: {:?}", strategies);
-                    // collect the params that can be bound
-                    let env_params = collect_params(ldrs_env);
-                    load_to_postgres(
-                        &pg_url,
-                        &pg_commands,
-                        &target_cols,
-                        &strategies,
-                        &env_params,
-                        role,
-                        &context,
-                        src.stream_type,
-                    )
-                    .await
-                }
-                LdrsDestination::Pq(parq) => {
-                    let dest_value = get_dest_url(ldrs_env, &parq.name, "pq")?;
-                    let dest_value = ensure_trailing_slash(dest_value.1.as_str());
-                    let handled_filename = context.render_template(&parq.filename)?;
-                    let full_path = format!("{}{}", dest_value, handled_filename);
-                    let full_name = base_or_relative_path(&full_path)?;
-                    debug!("full_name: {:?}", full_name);
-                    let (target_cols, strategies) =
-                        column_helper(src.source_cols, parq.columns, &schema)?;
-
-                    info!("Target columns: {:?}", target_cols);
-                    info!("Arrow Transforms: {:?}", strategies);
-                    // create the new schema if there are any type changes
-                    // adding and keeping the current metadata
-                    let schema = if strategies.iter().any(|s| s.is_some()) {
-                        let fields = target_cols
-                            .iter()
-                            .map(|col| col.to_arrow_field())
-                            .collect::<Vec<_>>();
-                        Arc::new(Schema::new(fields))
-                    } else {
-                        schema
-                    };
-                    let props = with_bloom_filters(default_writer_props(), parq.bloom_filters);
-                    let _ = write_parquet(
-                        &full_name.to_string(),
-                        schema,
-                        strategies,
-                        Some(props),
-                        src.stream_type,
-                    )
-                    .await?;
-                    Ok(())
-                }
-                LdrsDestination::Delta(delta_dest) => {
-                    let dest_value = get_dest_url(ldrs_env, &delta_dest.name, "delta")?;
-                    let storage_url = dest_value.1.strip_prefix("delta+").unwrap_or(&dest_value.1);
-                    let storage_url = ensure_trailing_slash(storage_url);
-                    let table_path =
-                        ensure_trailing_slash(&format!("{}{}", storage_url, delta_dest.name));
-                    debug!("delta path: {:?}", table_path);
-                    let (target_cols, strategies) =
-                        column_helper(src.source_cols, delta_dest.columns, &schema)?;
-
-                    info!("Target columns: {:?}", target_cols);
-                    info!("Arrow Transforms: {:?}", strategies);
-                    let schema = if strategies.iter().any(|s| s.is_some()) {
-                        let fields = target_cols
-                            .iter()
-                            .map(|col| col.to_arrow_field())
-                            .collect::<Vec<_>>();
-                        Arc::new(Schema::new(fields))
-                    } else {
-                        schema
-                    };
-
-                    match delta_dest.mode {
-                        DeltaMode::Overwrite => {
-                            overwrite_delta(
-                                &table_path,
-                                schema,
-                                strategies,
-                                src.stream_type,
-                                delta_dest.max_rows,
-                                delta_dest.max_bytes,
-                            )
-                            .await?;
-                        }
-                        DeltaMode::Merge {
-                            merge_keys,
-                            allow_null_keys,
-                            txn,
-                        } => {
-                            let txn_config = resolve_txn_config(txn, &context)?;
-                            let merge_config = MergeConfig {
-                                merge_keys,
-                                allow_null_keys,
-                                max_rows: delta_dest.max_rows,
-                                max_bytes: delta_dest.max_bytes,
-                                txn_config,
-                            };
-                            merge_delta(
-                                &table_path,
-                                schema,
-                                strategies,
-                                src.stream_type,
-                                merge_config,
-                            )
-                            .await?;
-                        }
-                    }
-                    Ok(())
-                }
-            },
-            None => {
-                info!("No schema found, most likely the load failed or no Arrow Record Batches were produced.");
-                Ok(())
-            }
-        }?;
-
-        if let Some(handle) = src.cleanup_handle {
-            match handle.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(e),
-                Err(e) => Err(anyhow::anyhow!("ldrs-sf task panicked: {}", e)),
-            }?
-        }
+        execute_task(
+            task,
+            ldrs_env,
+            &handlebars,
+            &handlebars_vars,
+            &env_params,
+            cloud_io_rt,
+        )
+        .await?;
         let task_end = std::time::Instant::now();
         info!("Task time: {:?}", task_end - task_start);
     }
 
+    Ok(())
+}
+
+pub async fn execute_task(
+    task: LdrsParsedConfig,
+    ldrs_env: &[(String, String)],
+    handlebars: &handlebars::Handlebars<'_>,
+    handlebars_vars: &[(String, String)],
+    env_params: &[(String, String, Option<ColumnType>)],
+    cloud_io_rt: &tokio::runtime::Handle,
+) -> Result<(), anyhow::Error> {
+    let (src, context) = match task.src {
+        LdrsSource::File(file) => {
+            let ldrs_context =
+                LdrsExecutionContext::try_new(&file.name, &handlebars, &handlebars_vars)?;
+            // if the filename is not provided, use the name as the filename
+            let file_name = file.filename.as_deref().unwrap_or(file.name.as_str());
+            let src_value = get_src_url(ldrs_env, &file.name, "file")?;
+            // render the filename if it has tokens in the path
+            let joined =
+                ldrs_context.render_template(&format!("{}{}", src_value.1.as_str(), file_name))?;
+            let src_url = base_or_relative_path(&joined)?;
+            let builder = builder_from_url(src_url.clone(), cloud_io_rt.clone()).await?;
+
+            let schema = builder.schema().clone();
+
+            let file_md = builder.metadata().clone();
+            let fields = get_fields(file_md.file_metadata())?;
+
+            // matches DuckDB STANDARD_VECTOR_SIZE
+            let stream = builder.with_batch_size(2048).build()?;
+            let source_cols = fields
+                .iter()
+                .filter_map(|pq| columnspec_from_parquet(pq).ok())
+                .collect::<Vec<_>>();
+            (
+                LdrsSrcStream {
+                    schema: Some(schema),
+                    stream_type: StreamType::Parquet(stream),
+                    source_cols,
+                    cleanup_handle: None,
+                },
+                ldrs_context,
+            )
+        }
+        LdrsSource::SF(sf) => {
+            let sf_sql = match &sf {
+                SFSource::Query(sql) => sql.sql.clone(),
+                SFSource::Table(table) => format!("SELECT * FROM {}", table.name),
+            };
+            let name = sf.get_name();
+            let sf_src = get_src_url(ldrs_env, &name, "sf")?;
+            let ldrs_context = LdrsExecutionContext::try_new(&name, &handlebars, &handlebars_vars)?;
+            let handled_name = ldrs_context.render_template("{{ shoutySnakeCase name }}")?;
+            let sf_params = sf.try_get_env_params(&handled_name, &env_params)?;
+            debug!("Snowflake Params: {:?}", sf_params);
+            let rendered_sql = ldrs_context.render_template(&sf_sql)?;
+            let conn = SnowflakeConnection::create_connection(&sf_src.1)?;
+            let arrow_stream = sf_arrow_stream(&conn, &rendered_sql, sf_params).await?;
+            let schema = arrow_stream.schema_stream.await;
+            (
+                LdrsSrcStream {
+                    schema,
+                    stream_type: StreamType::Receiver(arrow_stream.batch_stream),
+                    source_cols: vec![],
+                    cleanup_handle: Some(arrow_stream.command_handle),
+                },
+                ldrs_context,
+            )
+        }
+    };
+
+    let _ = match src.schema {
+        Some(schema) => match task.dest {
+            LdrsDestination::Pg(pg_dest) => {
+                let dest_value = get_dest_url(ldrs_env, pg_dest.get_name(), "pg")?;
+                let (pg_url, role) = check_for_role(dest_value.1.as_str())?;
+                // check the environment for a pg role
+                let role = role.or(get_env_value(
+                    ldrs_env,
+                    &[
+                        &format!("LDRS_PG_ROLE_{}", pg_dest.get_name()),
+                        "LDRS_PG_ROLE",
+                    ],
+                )
+                .map(|(_, v)| v.to_string()));
+                let pg_commands = pg_dest.to_pg_commands();
+                let (target_cols, strategies) =
+                    column_helper(src.source_cols, pg_dest.get_columns(), &schema)?;
+                debug!("Target columns: {:?}", target_cols);
+                debug!("Arrow Transforms: {:?}", strategies);
+                load_to_postgres(
+                    &pg_url,
+                    &pg_commands,
+                    &target_cols,
+                    &strategies,
+                    &env_params,
+                    role,
+                    &context,
+                    src.stream_type,
+                )
+                .await
+            }
+            LdrsDestination::Pq(parq) => {
+                let dest_value = get_dest_url(ldrs_env, &parq.name, "pq")?;
+                let dest_value = ensure_trailing_slash(dest_value.1.as_str());
+                let handled_filename = context.render_template(&parq.filename)?;
+                let full_path = format!("{}{}", dest_value, handled_filename);
+                let full_name = base_or_relative_path(&full_path)?;
+                debug!("full_name: {:?}", full_name);
+                let (target_cols, strategies) =
+                    column_helper(src.source_cols, parq.columns, &schema)?;
+
+                debug!("Target columns: {:?}", target_cols);
+                debug!("Arrow Transforms: {:?}", strategies);
+                // create the new schema if there are any type changes
+                // adding and keeping the current metadata
+                let schema = if strategies.iter().any(|s| s.is_some()) {
+                    let fields = target_cols
+                        .iter()
+                        .map(|col| col.to_arrow_field())
+                        .collect::<Vec<_>>();
+                    Arc::new(Schema::new(fields))
+                } else {
+                    schema
+                };
+                let props = with_bloom_filters(default_writer_props(), parq.bloom_filters);
+                let _ = write_parquet(
+                    &full_name.to_string(),
+                    schema,
+                    strategies,
+                    Some(props),
+                    src.stream_type,
+                )
+                .await?;
+                Ok(())
+            }
+            LdrsDestination::Delta(delta_dest) => {
+                let dest_value = get_dest_url(ldrs_env, &delta_dest.name, "delta")?;
+                let storage_url = dest_value.1.strip_prefix("delta+").unwrap_or(&dest_value.1);
+                let storage_url = ensure_trailing_slash(storage_url);
+                let table_path =
+                    ensure_trailing_slash(&format!("{}{}", storage_url, delta_dest.name));
+                debug!("delta path: {:?}", table_path);
+                let (target_cols, strategies) =
+                    column_helper(src.source_cols, delta_dest.columns, &schema)?;
+
+                debug!("Target columns: {:?}", target_cols);
+                debug!("Arrow Transforms: {:?}", strategies);
+                let schema = if strategies.iter().any(|s| s.is_some()) {
+                    let fields = target_cols
+                        .iter()
+                        .map(|col| col.to_arrow_field())
+                        .collect::<Vec<_>>();
+                    Arc::new(Schema::new(fields))
+                } else {
+                    schema
+                };
+
+                match delta_dest.mode {
+                    DeltaMode::Overwrite => {
+                        overwrite_delta(
+                            &table_path,
+                            schema,
+                            strategies,
+                            src.stream_type,
+                            delta_dest.max_rows,
+                            delta_dest.max_bytes,
+                        )
+                        .await?;
+                    }
+                    DeltaMode::Merge {
+                        merge_keys,
+                        allow_null_keys,
+                        txn,
+                    } => {
+                        let txn_config = resolve_txn_config(txn, &context)?;
+                        let merge_config = MergeConfig {
+                            merge_keys,
+                            allow_null_keys,
+                            max_rows: delta_dest.max_rows,
+                            max_bytes: delta_dest.max_bytes,
+                            txn_config,
+                        };
+                        merge_delta(
+                            &table_path,
+                            schema,
+                            strategies,
+                            src.stream_type,
+                            merge_config,
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
+            }
+        },
+        None => {
+            info!("No schema found, most likely the load failed or no Arrow Record Batches were produced.");
+            Ok(())
+        }
+    }?;
+
+    if let Some(handle) = src.cleanup_handle {
+        match handle.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(anyhow::anyhow!("ldrs-sf task panicked: {}", e)),
+        }?
+    }
     Ok(())
 }
 
