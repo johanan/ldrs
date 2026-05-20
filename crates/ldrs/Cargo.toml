@@ -33,6 +33,7 @@ parking_lot = "0.12.5"
 parquet.workspace = true
 postgres-native-tls.workspace = true
 postgres-types.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

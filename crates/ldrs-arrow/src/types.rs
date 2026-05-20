@@ -1,6 +1,7 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub enum TimeUnit {
     Second,
     Millis,
@@ -87,7 +88,7 @@ impl<'a> ColumnSchema<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, JsonSchema)]
 pub enum ColumnType {
     #[serde(alias = "VARCHAR")]
     Varchar(i32),
@@ -215,8 +216,8 @@ pub struct FileLoadData {
     pub path_parts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum ColumnSpec {
     #[serde(rename = "varchar", alias = "VARCHAR")]
     Varchar { name: String, length: i32 },

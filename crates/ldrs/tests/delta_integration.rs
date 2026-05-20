@@ -1,6 +1,6 @@
 use delta_kernel::expressions::Scalar;
 use futures::TryStreamExt;
-use ldrs::ldrs_config::create_ldrs_exec;
+use ldrs::ldrs_config::{execute_configs, parse_yaml_config};
 use ldrs_delta::{delta_stats_to_json, overwrite_delta, parquet_metadata_to_delta_stats};
 use ldrs_parquet::builder_from_string;
 use ldrs_test_fixtures::{data_url, fixture, fixture_url};
@@ -445,9 +445,14 @@ tables:
         .build()
         .unwrap();
 
-    create_ldrs_exec(config, &ldrs_env, None, &rt.handle())
-        .await
-        .unwrap();
+    execute_configs(
+        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+        &rt.handle(),
+    )
+    .await
+    .unwrap();
 
     for name in &table_names {
         let delta_table = format!("{}/{}/", delta_root, name);
@@ -542,9 +547,14 @@ tables:
         .unwrap();
 
     // First run: creates the table (v0) and commits the initial merge (v1)
-    create_ldrs_exec(config, &ldrs_env, None, &rt.handle())
-        .await
-        .unwrap();
+    execute_configs(
+        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+        &rt.handle(),
+    )
+    .await
+    .unwrap();
 
     let v0_path = format!("{}_delta_log/00000000000000000000.json", table_path);
     let v1_path = format!("{}_delta_log/00000000000000000001.json", table_path);
@@ -578,9 +588,14 @@ tables:
     assert_eq!(v1_removes, 0, "first merge on empty table has no removes");
 
     // Second run: same source, same keys, so all rows match → DV path
-    create_ldrs_exec(config, &ldrs_env, None, &rt.handle())
-        .await
-        .unwrap();
+    execute_configs(
+        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+        &rt.handle(),
+    )
+    .await
+    .unwrap();
 
     let v2_path = format!("{}_delta_log/00000000000000000002.json", table_path);
     assert!(

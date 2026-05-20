@@ -1,24 +1,31 @@
 use ldrs_arrow::ColumnType;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 use crate::ldrs_env::{get_env_values_by_keys, get_params_for_stmt_with_default};
 
-#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SFQuery {
     pub sql: String,
     pub name: String,
     #[serde(default)]
+    #[schemars(
+        description = "Names of the `LDRS_PARAM_<NAME>` env vars to bind into `sql`. Each entry names a distinct env var. Binding is positional in lexicographic order of the env-var names — array order in this field is ignored. Snowflake's driver uses `?` as the placeholder; this is part of the binding contract, not ldrs's surface. Optional per-position type coercion via the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix."
+    )]
     pub param_keys: Option<Vec<String>>,
 }
 
-#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SFTable {
     pub name: String,
 }
 
-#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "src")]
+#[schemars(
+    description = "Snowflake source. Reads via the LDRS_SRC connection URL; sf.query executes a SQL statement, sf.table reads a named table."
+)]
 pub enum SFSource {
     #[serde(rename = "sf.query")]
     Query(SFQuery),
@@ -103,7 +110,9 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<SFSource, anyh
                 Some(_) => Err(anyhow::Error::msg("Invalid tag")),
             }
         }
-        (None, _) => Err(anyhow::Error::msg("Missing 'name' key")),
+        (None, _) => Err(anyhow::Error::msg(
+            "Missing name for kind sf (see `ldrs schema sf` for required fields)",
+        )),
     }
 }
 

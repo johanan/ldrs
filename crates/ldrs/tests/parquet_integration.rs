@@ -6,8 +6,8 @@ use futures::TryStreamExt;
 use ldrs::{
     file_source::FileSource,
     ldrs_config::{
-        config::{get_parsed_config, LdrsDestination, LdrsParsedConfig, LdrsSource},
-        create_ldrs_exec,
+        config::{parse_dest, parse_src, LdrsDestination, LdrsParsedConfig, LdrsSource},
+        execute_configs, parse_yaml_config,
     },
     ldrs_snowflake::snowflake_source::{SFQuery, SFSource},
     parquet::ParquetDestination,
@@ -15,6 +15,7 @@ use ldrs::{
 use ldrs_arrow::{build_arrow_transform_strategy, ColumnType};
 use ldrs_parquet::{builder_from_string, write_parquet, write_parquet_split};
 use ldrs_test_fixtures::{data_url, fixture, fixture_str};
+use serde_yaml::Value;
 use tracing::info;
 
 const TEST_CASES: &[(&str, &str)] = &[
@@ -73,28 +74,26 @@ name: public.users
 pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
 "#;
 
-    let test_value = serde_yaml::from_str(test_yaml).unwrap();
-    let config = get_parsed_config(
-        &Some("file".into()),
-        &Some("pq".into()),
-        &None,
-        &None,
-        test_value,
-    )
-    .unwrap();
+    let test_value: Value = serde_yaml::from_str(test_yaml).unwrap();
+    let src = parse_src(test_value.clone(), &Some("file".into())).unwrap();
+    let dest = parse_dest(test_value, &Some("pq".into())).unwrap();
+    let config = LdrsParsedConfig {
+        src,
+        dest,
+        unknown_keys: Vec::new(),
+    };
     let expected_config = LdrsParsedConfig {
         src: LdrsSource::File(FileSource {
             name: "public.users".into(),
             filename: None,
         }),
-        src_prefix: "file".into(),
         dest: LdrsDestination::Pq(ParquetDestination {
             name: "public.users".into(),
             filename: "tests/test_data/parquet_writes/public.users.written.snappy.parquet".into(),
             columns: Vec::new(),
             bloom_filters: Vec::new(),
         }),
-        dest_prefix: "pq".into(),
+        unknown_keys: Vec::new(),
     };
     assert_eq!(config, expected_config);
 
@@ -105,29 +104,27 @@ sql: select * from users
 filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
 "#;
 
-    let test_value = serde_yaml::from_str(sf_yaml).unwrap();
-    let config = get_parsed_config(
-        &Some("sf".into()),
-        &Some("pq".into()),
-        &None,
-        &None,
-        test_value,
-    )
-    .unwrap();
+    let test_value: Value = serde_yaml::from_str(sf_yaml).unwrap();
+    let src = parse_src(test_value.clone(), &Some("sf".into())).unwrap();
+    let dest = parse_dest(test_value, &Some("pq".into())).unwrap();
+    let config = LdrsParsedConfig {
+        src,
+        dest,
+        unknown_keys: Vec::new(),
+    };
     let expected_config = LdrsParsedConfig {
         src: LdrsSource::SF(SFSource::Query(SFQuery {
             name: "public.users".into(),
             sql: "select * from users".into(),
             param_keys: None,
         })),
-        src_prefix: "sf".into(),
         dest: LdrsDestination::Pq(ParquetDestination {
             name: "public.users".into(),
             filename: "tests/test_data/parquet_writes/public.users.written.snappy.parquet".into(),
             columns: Vec::new(),
             bloom_filters: Vec::new(),
         }),
-        dest_prefix: "pq".into(),
+        unknown_keys: Vec::new(),
     };
     assert_eq!(config, expected_config);
 }
@@ -169,9 +166,14 @@ tables:
     for file in &expected_files {
         let _ = std::fs::remove_file(file);
     }
-    let _ = create_ldrs_exec(config, &ldrs_env, None, &rt.handle())
-        .await
-        .unwrap();
+    execute_configs(
+        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+        &rt.handle(),
+    )
+    .await
+    .unwrap();
     // ensure the expected files exist
     for file in &expected_files {
         assert!(

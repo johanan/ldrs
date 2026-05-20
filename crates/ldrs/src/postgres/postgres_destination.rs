@@ -1,8 +1,10 @@
+use anyhow::Context;
 use ldrs_arrow::{ColumnSpec, ColumnType};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct PgCommon {
     pub name: String,
     pub pre_sql: Option<String>,
@@ -11,7 +13,7 @@ pub struct PgCommon {
     pub columns: Vec<ColumnSpec>,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct PgDeleteInsert {
     pub name: String,
     pub pre_sql: Option<String>,
@@ -19,10 +21,13 @@ pub struct PgDeleteInsert {
     pub role: Option<String>,
     pub columns: Vec<ColumnSpec>,
     pub delete_keys: Vec<String>,
+    #[schemars(
+        description = "Positional column types for the prepared DELETE WHERE clause. Values come from `LDRS_PARAM_*` env vars (positional, lex-sorted by env-var name); the count of types here must match the count of bound values. When present, this overrides per-position type hints from the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix."
+    )]
     pub param_keys: Option<Vec<ColumnType>>,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct PgMerge {
     pub name: String,
     pub pre_sql: Option<String>,
@@ -32,7 +37,7 @@ pub struct PgMerge {
     pub merge_keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PgPreparedStmt {
     pub stmt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,14 +46,14 @@ pub struct PgPreparedStmt {
     pub types: Option<Vec<ColumnType>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PgMergeConfig {
     pub target: String,
     pub source: String,
     pub keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum PgDestCommand {
     CreateTable(String),
@@ -76,8 +81,11 @@ pub fn validate_execution_plan(commands: &[PgDestCommand]) -> Result<(), anyhow:
     }
 }
 
-#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "dest")]
+#[schemars(
+    description = "PostgreSQL destination. Writes rows to LDRS_DEST using the chosen sub-kind: merge / drop_replace / truncate_insert / delete_insert."
+)]
 pub enum PgDestination {
     #[serde(rename = "pg.drop_replace")]
     DropReplace(PgCommon),
@@ -212,7 +220,9 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
     let name = yaml
         .get("name")
         .and_then(|v| String::deserialize(v).ok())
-        .ok_or(anyhow::anyhow!("Missing name"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("Missing name for kind pg (see `ldrs schema pg` for required fields)")
+        })?;
     // get common values
     let pre_sql =
         get_either(yaml, "pg.pre_sql", "pre_sql").and_then(|v| String::deserialize(v).ok());
@@ -220,7 +230,9 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
         get_either(yaml, "pg.post_sql", "post_sql").and_then(|v| String::deserialize(v).ok());
     let role = get_either(yaml, "pg.role", "role").and_then(|v| String::deserialize(v).ok());
     let columns = get_either(yaml, "pg.columns", "columns")
-        .and_then(|v| Vec::<ColumnSpec>::deserialize(v).ok())
+        .map(|v| Vec::<ColumnSpec>::deserialize(v))
+        .transpose()
+        .context("failed to parse columns for kind pg")?
         .unwrap_or_default();
     // get discriminators
     let merge_keys = get_either(yaml, "pg.merge_keys", "merge_keys")

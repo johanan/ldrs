@@ -1,3 +1,4 @@
+pub mod cli_schema;
 pub mod delta;
 pub mod file_source;
 pub mod ldrs_config;
