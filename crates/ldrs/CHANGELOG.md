@@ -2,10 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.18.0] - 2026-05-20
 
-## [Unreleased]
+### Features
+
+- Ldrs run, arrow stdout, and ldrs schema
+- Config validation
+
+### Refactor
+
+- *(config)* Pulling out task executor
 
 ## [0.17.4](https://github.com/johanan/ldrs/compare/v0.17.3...v0.17.4) - 2026-05-08
 
