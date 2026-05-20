@@ -1,14 +1,19 @@
 pub mod config;
 
-use std::{pin::pin, sync::Arc};
+use std::{
+    io::{self, IsTerminal},
+    pin::pin,
+    sync::Arc,
+};
 
 use anyhow::Context;
+use arrow::ipc::writer::StreamWriter;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use futures::Stream;
 use ldrs_arrow::{
-    build_arrow_transform_strategy, build_source_and_target_schema, ArrowColumnTransformStrategy,
-    ColumnSpec, ColumnType,
+    build_arrow_transform_strategy, build_source_and_target_schema, transform_batch,
+    ArrowColumnTransformStrategy, ColumnSpec, ColumnType,
 };
 use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, TxnConfig};
 use ldrs_parquet::{
@@ -19,14 +24,15 @@ use ldrs_postgres::check_for_role;
 use ldrs_storage::{base_or_relative_path, ensure_trailing_slash};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::{debug, info};
 use url::Url;
 
 use crate::{
-    delta::{DeltaMode, MergeTxnConfig},
+    delta::{DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
     ldrs_config::config::{
-        get_parsed_config, LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource,
+        merge_with_defaults, parse_dest, parse_src, LdrsConfig, LdrsDestination, LdrsParsedConfig,
+        LdrsSource,
     },
     ldrs_env::{collect_params, collect_vars_by_prefix, setup_handlebars, LdrsExecutionContext},
     ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource, SnowflakeConnection},
@@ -59,6 +65,30 @@ struct LdrsSrcStream {
     stream_type: StreamType,
     source_cols: Vec<ColumnSpec>,
     cleanup_handle: Option<JoinHandle<Result<(), anyhow::Error>>>,
+}
+
+struct ExecutionEnv<'a> {
+    ldrs_env: &'a [(String, String)],
+    handlebars: handlebars::Handlebars<'a>,
+    handlebars_vars: Vec<(String, String)>,
+    typed_params: Vec<(String, String, Option<ColumnType>)>,
+}
+
+impl<'a> ExecutionEnv<'a> {
+    fn create(ldrs_env: &'a [(String, String)]) -> Self {
+        let env_params = collect_params(ldrs_env);
+        debug!("Environment Params: {:?}", env_params);
+        let mut handlebars = handlebars::Handlebars::new();
+        setup_handlebars(&mut handlebars);
+        let handlebars_vars = collect_vars_by_prefix(ldrs_env, "TEMPL");
+        debug!("Handlebars Vars: {:?}", handlebars_vars);
+        ExecutionEnv {
+            ldrs_env,
+            handlebars,
+            handlebars_vars,
+            typed_params: env_params,
+        }
+    }
 }
 
 pub fn get_env_value<'a>(
@@ -111,6 +141,7 @@ pub fn infer_env_type(env_type: &str, vars: &[(String, String)]) -> Option<Strin
     let url = src.and_then(|(_, value)| Url::parse(value).ok());
     match url {
         Some(u) => match u {
+            u if u.scheme().starts_with("snowflake") => Some("sf".to_string()),
             u if u.scheme().starts_with("delta+") => Some("delta".to_string()),
             u if is_object_store_url(&u) => Some("file".to_string()),
             u if u.scheme() == "postgres" => Some("pg".to_string()),
@@ -177,34 +208,38 @@ fn column_helper(
     Ok((target_cols, strategies))
 }
 
-pub async fn create_ldrs_exec(
+pub fn parse_yaml_config(
     config_string: &str,
     ldrs_env: &[(String, String)],
-    select: Option<Vec<String>>,
-    cloud_io_rt: &tokio::runtime::Handle,
-) -> Result<(), anyhow::Error> {
+) -> Result<Vec<LdrsParsedConfig>, anyhow::Error> {
     let config: LdrsConfig =
         serde_yaml::from_str(config_string).with_context(|| "Could not parse the config")?;
 
     let src_default = config.src.or(infer_env_type("LDRS_SRC", ldrs_env));
     let dest_default = config.dest.or(infer_env_type("LDRS_DEST", ldrs_env));
 
-    let table_tasks = config
+    config
         .tables
         .into_iter()
         .map(|t| {
-            get_parsed_config(
+            let src = parse_src(
+                merge_with_defaults(&config.src_defaults, t.clone()),
                 &src_default,
-                &dest_default,
-                &config.src_defaults,
-                &config.dest_defaults,
-                t,
-            )
+            )?;
+            let dest = parse_dest(merge_with_defaults(&config.dest_defaults, t), &dest_default)?;
+            Ok(LdrsParsedConfig { src, dest })
         })
-        .collect::<Result<Vec<_>, anyhow::Error>>()?;
+        .collect::<Result<Vec<_>, anyhow::Error>>()
+}
 
+pub async fn execute_configs(
+    tasks: Vec<LdrsParsedConfig>,
+    select: Option<Vec<String>>,
+    ldrs_env: &[(String, String)],
+    cloud_io_rt: &tokio::runtime::Handle,
+) -> Result<(), anyhow::Error> {
     let filtered_tasks: Vec<_> = match select {
-        Some(selected_tables) => table_tasks
+        Some(selected_tables) => tasks
             .into_iter()
             .filter(|t| {
                 selected_tables
@@ -212,16 +247,11 @@ pub async fn create_ldrs_exec(
                     .any(|s| s.eq_ignore_ascii_case(t.src.name()))
             })
             .collect(),
-        None => table_tasks,
+        None => tasks,
     };
     debug!("Tasks to be run {:?}", filtered_tasks);
-    // get all possible environment params
-    let env_params = collect_params(ldrs_env);
-    debug!("Environment Params: {:?}", env_params);
-    let mut handlebars = handlebars::Handlebars::new();
-    setup_handlebars(&mut handlebars);
-    let handlebars_vars = collect_vars_by_prefix(ldrs_env, "TEMPL");
 
+    let exec_env = ExecutionEnv::create(ldrs_env);
     let total_tasks = filtered_tasks.len();
     for (i, task) in filtered_tasks.into_iter().enumerate() {
         let task_start = std::time::Instant::now();
@@ -229,10 +259,10 @@ pub async fn create_ldrs_exec(
         info!("Running task: {}/{}", i + 1, total_tasks);
         execute_task(
             task,
-            ldrs_env,
-            &handlebars,
-            &handlebars_vars,
-            &env_params,
+            exec_env.ldrs_env,
+            &exec_env.handlebars,
+            &exec_env.handlebars_vars,
+            &exec_env.typed_params,
             cloud_io_rt,
         )
         .await?;
@@ -378,14 +408,17 @@ pub async fn execute_task(
                 Ok(())
             }
             LdrsDestination::Delta(delta_dest) => {
-                let dest_value = get_dest_url(ldrs_env, &delta_dest.name, "delta")?;
+                let (name, columns) = match &delta_dest {
+                    DeltaDestination::Overwrite(c) => (c.name.clone(), c.columns.clone()),
+                    DeltaDestination::Merge(m) => (m.common.name.clone(), m.common.columns.clone()),
+                };
+
+                let dest_value = get_dest_url(ldrs_env, &name, "delta")?;
                 let storage_url = dest_value.1.strip_prefix("delta+").unwrap_or(&dest_value.1);
                 let storage_url = ensure_trailing_slash(storage_url);
-                let table_path =
-                    ensure_trailing_slash(&format!("{}{}", storage_url, delta_dest.name));
+                let table_path = ensure_trailing_slash(&format!("{}{}", storage_url, name));
                 debug!("delta path: {:?}", table_path);
-                let (target_cols, strategies) =
-                    column_helper(src.source_cols, delta_dest.columns, &schema)?;
+                let (target_cols, strategies) = column_helper(src.source_cols, columns, &schema)?;
 
                 debug!("Target columns: {:?}", target_cols);
                 debug!("Arrow Transforms: {:?}", strategies);
@@ -399,29 +432,49 @@ pub async fn execute_task(
                     schema
                 };
 
-                match delta_dest.mode {
-                    DeltaMode::Overwrite => {
+                match delta_dest {
+                    DeltaDestination::Overwrite(o) => {
                         overwrite_delta(
                             &table_path,
                             schema,
                             strategies,
                             src.stream_type,
-                            delta_dest.max_rows,
-                            delta_dest.max_bytes,
+                            o.max_rows,
+                            o.max_bytes,
                         )
                         .await?;
                     }
-                    DeltaMode::Merge {
-                        merge_keys,
-                        allow_null_keys,
-                        txn,
-                    } => {
+                    DeltaDestination::Merge(m) => {
+                        let DeltaMerge {
+                            merge_keys,
+                            allow_null_keys,
+                            txn_mode,
+                            watermark_column,
+                            batch_version,
+                            app_id,
+                            ..
+                        } = m;
+                        let txn = match txn_mode {
+                            None => None,
+                            Some(TxnMode::SourceWatermark) => {
+                                Some(MergeTxnConfig::SourceWatermark {
+                                    app_id,
+                                    watermark_column: watermark_column.expect(
+                                        "validate ensures watermark_column for source_watermark",
+                                    ),
+                                })
+                            }
+                            Some(TxnMode::ProcessingTime) => Some(MergeTxnConfig::ProcessingTime {
+                                app_id,
+                                batch_version,
+                            }),
+                        };
                         let txn_config = resolve_txn_config(txn, &context)?;
                         let merge_config = MergeConfig {
                             merge_keys,
                             allow_null_keys,
-                            max_rows: delta_dest.max_rows,
-                            max_bytes: delta_dest.max_bytes,
+                            max_rows: m.common.max_rows,
+                            max_bytes: m.common.max_bytes,
                             txn_config,
                         };
                         merge_delta(
@@ -434,6 +487,38 @@ pub async fn execute_task(
                         .await?;
                     }
                 }
+                Ok(())
+            }
+            LdrsDestination::Arrow(arrow_dest) => {
+                let (target_cols, strategies) =
+                    column_helper(src.source_cols, arrow_dest.columns, &schema)?;
+                debug!("Target columns: {:?}", target_cols);
+                debug!("Arrow Transforms: {:?}", strategies);
+                if io::stdout().is_terminal() {
+                    return Err(anyhow::Error::msg("Outputting Arrow IPC Stream to stdout is not supported in a terminal. Please redirect the output to a file or pipe it to another command."));
+                }
+                let stdout = io::stdout().lock();
+                let schema = if strategies.iter().any(|s| s.is_some()) {
+                    let fields = target_cols
+                        .iter()
+                        .map(|c| c.to_arrow_field())
+                        .collect::<Vec<_>>();
+                    Arc::new(Schema::new(fields))
+                } else {
+                    schema
+                };
+                let mut writer = StreamWriter::try_new_buffered(stdout, &schema)?;
+                let mut pinned = pin!(src.stream_type);
+                while let Some(batch) = pinned.next().await {
+                    let batch = batch?;
+                    let transformed_batch = if strategies.iter().any(|s| s.is_some()) {
+                        transform_batch(&batch, &strategies, schema.clone())?
+                    } else {
+                        batch
+                    };
+                    writer.write(&transformed_batch)?;
+                }
+                writer.finish()?;
                 Ok(())
             }
         },

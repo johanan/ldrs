@@ -1,6 +1,6 @@
-use ldrs::ldrs_config::create_ldrs_exec;
+use ldrs::ldrs_config::{execute_configs, parse_yaml_config};
 use ldrs_postgres::create_connection;
-use ldrs_test_fixtures::{data_dir, data_url};
+use ldrs_test_fixtures::data_url;
 
 const TEST_CASES: &[&str] = &[
     "
@@ -87,7 +87,13 @@ async fn test_postgres_file_drop() {
     for config in TEST_CASES {
         let client = create_connection(pg_url).await.unwrap();
         let _ = client.batch_execute("DROP SCHEMA IF EXISTS public_test CASCADE");
-        let ex = create_ldrs_exec(config, &ldrs_env, None, &rt.handle()).await;
+        let ex = execute_configs(
+            parse_yaml_config(&config, &ldrs_env).unwrap(),
+            None,
+            &ldrs_env,
+            &rt.handle(),
+        )
+        .await;
         assert_eq!(ex.is_ok(), true);
 
         let users = client
@@ -111,6 +117,13 @@ async fn test_postgres_file_drop() {
 
 #[tokio::test]
 async fn test_postgres_env_role() {
+    let config = "
+src: file
+dest: pg.drop_replace
+tables:
+  - name: public_test.users
+    filename: public.users/public.users.snappy.parquet
+      ";
     let file_url = data_url();
     let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
     let ldrs_env = vec![
@@ -127,8 +140,21 @@ async fn test_postgres_env_role() {
         .enable_all()
         .build()
         .unwrap();
-    let ex = create_ldrs_exec("", &ldrs_env, None, &rt.handle()).await;
+    let ex = execute_configs(
+        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+        &rt.handle(),
+    )
+    .await;
     assert!(ex.is_err());
+    let ex_err = ex.unwrap_err();
+    let msg = format!("{:?}", ex_err); // Debug walks the whole anyhow chain, not just top-level
+    assert!(
+        msg.contains("non_existent_role"),
+        "expected role error, got: {}",
+        msg,
+    );
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
@@ -167,7 +193,13 @@ tables:
         .await;
     let _ = client.batch_execute("CREATE SCHEMA public_test_all").await;
 
-    let ex = create_ldrs_exec(config, &ldrs_env, None, &rt.handle()).await;
+    let ex = execute_configs(
+        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+        &rt.handle(),
+    )
+    .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
 
     for table in ["users", "strings", "numbers"] {
@@ -265,7 +297,13 @@ tables:
         .await;
     let _ = client.batch_execute("CREATE SCHEMA public_test_edge").await;
 
-    let ex = create_ldrs_exec(config, &ldrs_env, None, &rt.handle()).await;
+    let ex = execute_configs(
+        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+        &rt.handle(),
+    )
+    .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
 
     // Edge cases covering PgFixedNumeric branches not exercised by the main fixture:

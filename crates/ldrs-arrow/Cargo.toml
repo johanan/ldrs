@@ -12,6 +12,7 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 anyhow.workspace = true
 chrono = "0.4.44"
+schemars.workspace = true
 serde.workspace = true
 tracing.workspace = true
 uuid.workspace = true
