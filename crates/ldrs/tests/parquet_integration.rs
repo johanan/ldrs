@@ -77,7 +77,11 @@ pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
     let test_value: Value = serde_yaml::from_str(test_yaml).unwrap();
     let src = parse_src(test_value.clone(), &Some("file".into())).unwrap();
     let dest = parse_dest(test_value, &Some("pq".into())).unwrap();
-    let config = LdrsParsedConfig { src, dest };
+    let config = LdrsParsedConfig {
+        src,
+        dest,
+        unknown_keys: Vec::new(),
+    };
     let expected_config = LdrsParsedConfig {
         src: LdrsSource::File(FileSource {
             name: "public.users".into(),
@@ -89,6 +93,7 @@ pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
             columns: Vec::new(),
             bloom_filters: Vec::new(),
         }),
+        unknown_keys: Vec::new(),
     };
     assert_eq!(config, expected_config);
 
@@ -102,7 +107,11 @@ filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
     let test_value: Value = serde_yaml::from_str(sf_yaml).unwrap();
     let src = parse_src(test_value.clone(), &Some("sf".into())).unwrap();
     let dest = parse_dest(test_value, &Some("pq".into())).unwrap();
-    let config = LdrsParsedConfig { src, dest };
+    let config = LdrsParsedConfig {
+        src,
+        dest,
+        unknown_keys: Vec::new(),
+    };
     let expected_config = LdrsParsedConfig {
         src: LdrsSource::SF(SFSource::Query(SFQuery {
             name: "public.users".into(),
@@ -115,6 +124,7 @@ filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
             columns: Vec::new(),
             bloom_filters: Vec::new(),
         }),
+        unknown_keys: Vec::new(),
     };
     assert_eq!(config, expected_config);
 }

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use ldrs_arrow::{ColumnSpec, ColumnType};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,9 @@ pub struct PgDeleteInsert {
     pub role: Option<String>,
     pub columns: Vec<ColumnSpec>,
     pub delete_keys: Vec<String>,
+    #[schemars(
+        description = "Positional column types for the prepared DELETE WHERE clause. Values come from `LDRS_PARAM_*` env vars (positional, lex-sorted by env-var name); the count of types here must match the count of bound values. When present, this overrides per-position type hints from the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix."
+    )]
     pub param_keys: Option<Vec<ColumnType>>,
 }
 
@@ -226,7 +230,9 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
         get_either(yaml, "pg.post_sql", "post_sql").and_then(|v| String::deserialize(v).ok());
     let role = get_either(yaml, "pg.role", "role").and_then(|v| String::deserialize(v).ok());
     let columns = get_either(yaml, "pg.columns", "columns")
-        .and_then(|v| Vec::<ColumnSpec>::deserialize(v).ok())
+        .map(|v| Vec::<ColumnSpec>::deserialize(v))
+        .transpose()
+        .context("failed to parse columns for kind pg")?
         .unwrap_or_default();
     // get discriminators
     let merge_keys = get_either(yaml, "pg.merge_keys", "merge_keys")

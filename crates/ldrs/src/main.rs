@@ -4,7 +4,9 @@ use anyhow::Context;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use dotenvy::dotenv;
 use ldrs::cli_schema;
-use ldrs::ldrs_config::config::{parse_dest, parse_src, LdrsParsedConfig};
+use ldrs::ldrs_config::config::{
+    find_unknown_block_keys, parse_dest, parse_src, LdrsParsedConfig,
+};
 use ldrs::ldrs_config::{execute_configs, infer_env_type, parse_yaml_config};
 use ldrs::ldrs_env::get_all_ldrs_env_vars;
 use ldrs::lua_logic::lua_args::{modules_from_args, LuaArgs, SnowflakeResult, SnowflakeStrategy};
@@ -216,9 +218,15 @@ fn main() -> Result<(), anyhow::Error> {
                 let src_default = infer_env_type("LDRS_SRC", &ldrs_env);
                 let dest_default = infer_env_type("LDRS_DEST", &ldrs_env);
                 let src = parse_src(config.clone(), &src_default)?;
-                let dest = parse_dest(config, &dest_default)?;
+                let dest = parse_dest(config.clone(), &dest_default)?;
+                let unknown_keys = find_unknown_block_keys(&config, &src, &dest);
+
                 execute_configs(
-                    vec![LdrsParsedConfig { src, dest }],
+                    vec![LdrsParsedConfig {
+                        src,
+                        dest,
+                        unknown_keys,
+                    }],
                     None,
                     &ldrs_env,
                     &rt.handle(),

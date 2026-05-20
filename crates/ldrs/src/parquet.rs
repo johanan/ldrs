@@ -1,3 +1,4 @@
+use anyhow::Context;
 use ldrs_arrow::ColumnSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -35,7 +36,9 @@ impl TryFrom<&Value> for ParquetDestination {
             })?;
         let columns = value
             .get("columns")
-            .and_then(|c| Vec::<ColumnSpec>::deserialize(c).ok())
+            .map(|c| Vec::<ColumnSpec>::deserialize(c))
+            .transpose()
+            .context("failed to parse columns for kind pq")?
             .unwrap_or_default();
         let bloom_filters = value
             .get("bloom_filters")
@@ -47,5 +50,33 @@ impl TryFrom<&Value> for ParquetDestination {
             columns,
             bloom_filters,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_from_propagates_unknown_column_field_error() {
+        let yaml = r#"
+name: foo
+filename: foo.parquet
+columns:
+  - type: varchar
+    name: id
+    lenght: 32
+"#;
+        let value: Value = serde_yaml::from_str(yaml).unwrap();
+        let err = ParquetDestination::try_from(&value).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("lenght"),
+            "expected error to mention the bad field, got: {msg}"
+        );
+        assert!(
+            msg.contains("columns"),
+            "expected error to mention the columns context, got: {msg}"
+        );
     }
 }

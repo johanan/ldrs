@@ -1,4 +1,5 @@
 pub mod config;
+pub mod field_validation;
 
 use std::{
     io::{self, IsTerminal},
@@ -25,7 +26,7 @@ use ldrs_storage::{base_or_relative_path, ensure_trailing_slash};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
 use tokio::task::JoinHandle;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{
@@ -222,12 +223,19 @@ pub fn parse_yaml_config(
         .tables
         .into_iter()
         .map(|t| {
+            let raw_block = t.clone();
             let src = parse_src(
                 merge_with_defaults(&config.src_defaults, t.clone()),
                 &src_default,
             )?;
             let dest = parse_dest(merge_with_defaults(&config.dest_defaults, t), &dest_default)?;
-            Ok(LdrsParsedConfig { src, dest })
+            let unknown_keys =
+                crate::ldrs_config::config::find_unknown_block_keys(&raw_block, &src, &dest);
+            Ok(LdrsParsedConfig {
+                src,
+                dest,
+                unknown_keys,
+            })
         })
         .collect::<Result<Vec<_>, anyhow::Error>>()
 }
@@ -256,6 +264,30 @@ pub async fn execute_configs(
     for (i, task) in filtered_tasks.into_iter().enumerate() {
         let task_start = std::time::Instant::now();
         debug!("Task: {:?}", task);
+        let task_name = task.src.name();
+        for u in &task.unknown_keys {
+            match u.suggestions.as_slice() {
+                [] => warn!(
+                    "table '{}': '{}' is not a known field (see `ldrs schema`)",
+                    task_name, u.key
+                ),
+                [one] => warn!(
+                    "table '{}': '{}' is not a known field (did you mean '{}'? see `ldrs schema`)",
+                    task_name, u.key, one
+                ),
+                many => {
+                    let joined = many
+                        .iter()
+                        .map(|s| format!("'{}'", s))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    warn!(
+                        "table '{}': '{}' is not a known field (did you mean one of {}? see `ldrs schema`)",
+                        task_name, u.key, joined
+                    );
+                }
+            }
+        }
         info!("Running task: {}/{}", i + 1, total_tasks);
         execute_task(
             task,

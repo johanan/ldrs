@@ -1,10 +1,17 @@
 use crate::{
-    delta::{self, DeltaDestination},
+    delta::{self, DeltaCommon, DeltaDestination, DeltaMerge},
     file_source::FileSource,
-    ldrs_snowflake::snowflake_source::{from_serde_yaml as from_sf_serde_yaml, SFSource},
+    ldrs_config::field_validation::{extract_props, find_unknown_keys, UnknownKey},
+    ldrs_snowflake::snowflake_source::{
+        from_serde_yaml as from_sf_serde_yaml, SFQuery, SFSource, SFTable,
+    },
     parquet::ParquetDestination,
-    postgres::postgres_destination::{from_serde_yaml, PgDestination},
+    postgres::postgres_destination::{
+        from_serde_yaml, PgCommon, PgDeleteInsert, PgDestination, PgMerge,
+    },
 };
+
+use std::collections::HashSet;
 
 use anyhow::Context;
 use ldrs_arrow::ColumnSpec;
@@ -63,6 +70,54 @@ pub enum LdrsDestination {
 pub struct LdrsParsedConfig {
     pub src: LdrsSource,
     pub dest: LdrsDestination,
+    pub unknown_keys: Vec<UnknownKey>,
+}
+
+/// Block-level keys that the parser injects or expects but that are not declared
+/// on any kind's struct (the `src` and `dest` tags are pulled out before parsing
+/// the inner variant).
+pub const STRUCTURAL_KEYS: &[&str] = &["src", "dest"];
+
+/// Field names allowed by the parsed source variant.
+pub fn source_known_fields(src: &LdrsSource) -> Vec<String> {
+    match src {
+        LdrsSource::File(_) => extract_props::<FileSource>(),
+        LdrsSource::SF(SFSource::Query(_)) => extract_props::<SFQuery>(),
+        LdrsSource::SF(SFSource::Table(_)) => extract_props::<SFTable>(),
+    }
+}
+
+/// Field names allowed by the parsed destination variant.
+pub fn destination_known_fields(dest: &LdrsDestination) -> Vec<String> {
+    match dest {
+        LdrsDestination::Pq(_) => extract_props::<ParquetDestination>(),
+        LdrsDestination::Pg(PgDestination::DropReplace(_)) => extract_props::<PgCommon>(),
+        LdrsDestination::Pg(PgDestination::TruncateInsert(_)) => extract_props::<PgCommon>(),
+        LdrsDestination::Pg(PgDestination::Merge(_)) => extract_props::<PgMerge>(),
+        LdrsDestination::Pg(PgDestination::DeleteInsert(_)) => extract_props::<PgDeleteInsert>(),
+        LdrsDestination::Delta(DeltaDestination::Overwrite(_)) => extract_props::<DeltaCommon>(),
+        LdrsDestination::Delta(DeltaDestination::Merge(_)) => extract_props::<DeltaMerge>(),
+        LdrsDestination::Arrow(_) => extract_props::<ArrowDestination>(),
+    }
+}
+
+/// Walks a raw block against the union of fields declared by the parsed src and
+/// dest variants, plus the block-level structural keys. Returns findings; does
+/// not emit. Caller decides when/how to surface them.
+pub fn find_unknown_block_keys(
+    value: &Value,
+    src: &LdrsSource,
+    dest: &LdrsDestination,
+) -> Vec<UnknownKey> {
+    let src_fields = source_known_fields(src);
+    let dest_fields = destination_known_fields(dest);
+    let allowed: HashSet<&str> = src_fields
+        .iter()
+        .map(String::as_str)
+        .chain(dest_fields.iter().map(String::as_str))
+        .chain(STRUCTURAL_KEYS.iter().copied())
+        .collect();
+    find_unknown_keys(value, &allowed)
 }
 
 pub fn merge_with_defaults(defaults: &Option<Value>, specific: Value) -> Value {
@@ -157,5 +212,68 @@ pub fn parse_dest(
         _ => Err(anyhow::Error::msg(
             "unsupported dest type (see `ldrs schema` for valid kinds)",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_known_fields_sf_query() {
+        let src = LdrsSource::SF(SFSource::Query(SFQuery {
+            sql: String::new(),
+            name: String::new(),
+            param_keys: None,
+        }));
+        let mut got = source_known_fields(&src);
+        got.sort();
+        assert_eq!(got, vec!["name", "param_keys", "sql"]);
+    }
+
+    #[test]
+    fn source_known_fields_file() {
+        let src = LdrsSource::File(FileSource {
+            name: String::new(),
+            filename: None,
+        });
+        let mut got = source_known_fields(&src);
+        got.sort();
+        assert_eq!(got, vec!["filename", "name"]);
+    }
+
+    #[test]
+    fn destination_known_fields_delta_merge_includes_flattened() {
+        let dest = LdrsDestination::Delta(DeltaDestination::Merge(DeltaMerge {
+            common: DeltaCommon {
+                name: String::new(),
+                columns: Vec::new(),
+                max_rows: None,
+                max_bytes: None,
+            },
+            merge_keys: Vec::new(),
+            allow_null_keys: false,
+            txn_mode: None,
+            watermark_column: None,
+            batch_version: None,
+            app_id: String::new(),
+        }));
+        let mut got = destination_known_fields(&dest);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "allow_null_keys",
+                "app_id",
+                "batch_version",
+                "columns",
+                "max_bytes",
+                "max_rows",
+                "merge_keys",
+                "name",
+                "txn_mode",
+                "watermark_column",
+            ]
+        );
     }
 }

@@ -217,7 +217,7 @@ pub struct FileLoadData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum ColumnSpec {
     #[serde(rename = "varchar", alias = "VARCHAR")]
     Varchar { name: String, length: i32 },
