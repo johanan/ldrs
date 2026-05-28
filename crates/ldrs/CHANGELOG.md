@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.18.1] - 2026-05-28
+
+### Bug Fixes
+
+- *(cli)* Usage cleanup and tracing filters
+
 ## [0.18.0] - 2026-05-20
 
 ### Features

@@ -11,7 +11,7 @@ pub struct SFQuery {
     pub name: String,
     #[serde(default)]
     #[schemars(
-        description = "Names of the `LDRS_PARAM_<NAME>` env vars to bind into `sql`. Each entry names a distinct env var. Binding is positional in lexicographic order of the env-var names — array order in this field is ignored. Snowflake's driver uses `?` as the placeholder; this is part of the binding contract, not ldrs's surface. Optional per-position type coercion via the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix."
+        description = "Names of the `LDRS_PARAM_<NAME>` env vars to bind into `sql`. Each entry names a distinct env var. Binding is positional in lexicographic order of the env-var names, array order in this field is ignored. Snowflake's driver uses `?` as the placeholder; this is part of the binding contract, not ldrs's surface. Optional per-position type coercion via the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix."
     )]
     pub param_keys: Option<Vec<String>>,
 }
@@ -24,7 +24,7 @@ pub struct SFTable {
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "src")]
 #[schemars(
-    description = "Snowflake source. Reads via the LDRS_SRC connection URL; sf.query executes a SQL statement, sf.table reads a named table."
+    description = "Snowflake source. Reads via the LDRS_SRC connection URL; sf.query executes a SQL statement, sf.table reads a named table. Requires the separate `ldrs-sf` binary on PATH (part of the ldrs project, github.com/johanan/ldrs). Without it the run fails with 'Failed to find ldrs-sf binary in PATH'."
 )]
 pub enum SFSource {
     #[serde(rename = "sf.query")]

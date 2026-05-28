@@ -1,6 +1,6 @@
 [package]
 name = "ldrs"
-version = "0.18.0"
+version = "0.18.1"
 edition.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -41,7 +41,7 @@ tokio.workspace = true
 tokio-postgres.workspace = true
 tokio-stream = "0.1.18"
 tracing.workspace = true
-tracing-subscriber = "0.3.23"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url.workspace = true
 uuid.workspace = true
 nom = { version = "8.0.0" }

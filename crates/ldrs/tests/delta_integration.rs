@@ -575,7 +575,7 @@ tables:
         "first run should dispatch to merge_delta"
     );
 
-    // First merge into an empty table should have no remove actions — pure insert
+    // First merge into an empty table should have no remove actions pure insert
     let v1_removes = v1_content
         .lines()
         .filter(|line| {

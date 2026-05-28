@@ -555,7 +555,7 @@ pub async fn execute_task(
             }
         },
         None => {
-            info!("No schema found, most likely the load failed or no Arrow Record Batches were produced.");
+            warn!("No schema found, most likely the load failed or no Arrow Record Batches were produced.");
             Ok(())
         }
     }?;

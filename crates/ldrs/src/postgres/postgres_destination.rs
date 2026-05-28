@@ -10,6 +10,7 @@ pub struct PgCommon {
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
     pub role: Option<String>,
+    #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
 }
 
@@ -19,11 +20,10 @@ pub struct PgDeleteInsert {
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
     pub role: Option<String>,
+    #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
     pub delete_keys: Vec<String>,
-    #[schemars(
-        description = "Positional column types for the prepared DELETE WHERE clause. Values come from `LDRS_PARAM_*` env vars (positional, lex-sorted by env-var name); the count of types here must match the count of bound values. When present, this overrides per-position type hints from the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix."
-    )]
+    #[schemars(schema_with = "crate::cli_schema::param_keys_schema")]
     pub param_keys: Option<Vec<ColumnType>>,
 }
 
@@ -33,6 +33,7 @@ pub struct PgMerge {
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
     pub role: Option<String>,
+    #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
     pub merge_keys: Vec<String>,
 }
