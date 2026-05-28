@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
 use url::Url;
 
 #[derive(Clone)]
@@ -51,7 +51,7 @@ impl SnowflakeConnection {
         let mut cmd = Command::new(&self.binary_path);
         let args = vec!["exec", "--sql", sql];
 
-        info!("Running command: {:?} {:?}", &self.binary_path, args);
+        debug!("Running command: {:?} {:?}", &self.binary_path, args);
 
         let output = cmd
             .args(args)
@@ -114,7 +114,7 @@ pub async fn sf_arrow_stream(
         let mut cmd = std::process::Command::new(&binary_path);
         let args = vec!["query", "--sql", &sql];
         let cmd = cmd.args(args);
-        info!("Running command: {:?}", cmd);
+        debug!("Running command: {:?}", cmd);
         let cmd = cmd.env("LDRS_SF_SOURCE", conn_url);
         // bind the parameters in order for ldrs-sf
         let sf_named_params = bind_params.into_iter().enumerate().map(|(i, (value, _))| {

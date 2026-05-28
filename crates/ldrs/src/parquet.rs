@@ -11,7 +11,9 @@ use serde_yaml::Value;
 pub struct ParquetDestination {
     pub name: String,
     pub filename: String,
+    #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
+    #[serde(default)]
     pub bloom_filters: Vec<Vec<String>>,
 }
 

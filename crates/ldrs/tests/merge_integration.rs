@@ -183,7 +183,7 @@ async fn test_merge_basic_int_key() {
     let commit_info = find_action(&actions, "commitInfo").expect("should have commitInfo");
     assert_eq!(commit_info["operation"], "MERGE");
 
-    // Protocol upgrade — first merge should add deletionVectors
+    // Protocol upgrade first merge should add deletionVectors
     let protocol = find_action(&actions, "protocol").expect("first merge should upgrade protocol");
     let reader_features = protocol["readerFeatures"].as_array().unwrap();
     assert!(
@@ -198,14 +198,14 @@ async fn test_merge_basic_int_key() {
         "metadata should enable deletion vectors"
     );
 
-    // Remove actions — matched target files get removed
+    // Remove actions matched target files get removed
     let remove_count = count_actions(&actions, "remove");
     assert!(
         remove_count > 0,
         "should have remove actions for matched files"
     );
 
-    // Add actions — should have both DV re-adds and new source file adds
+    // Add actions should have both DV re-adds and new source file adds
     let add_actions: Vec<&serde_json::Value> =
         actions.iter().filter_map(|a| a.get("add")).collect();
     assert!(add_actions.len() > 0, "should have add actions");
@@ -251,7 +251,7 @@ async fn test_merge_empty_table() {
     let schema = test_schema();
     let table_url = format!("file://{}/", table_path);
 
-    // No overwrite — merge_delta's ensure_table creates v0, merge commits v1
+    // No overwrite merge_delta's ensure_table creates v0, merge commits v1
     let source = make_source_batch(1..501);
     let source_stream = stream::iter(vec![Ok(source)]);
     let config = MergeConfig {
@@ -330,7 +330,7 @@ async fn test_merge_all_matches() {
     .await
     .unwrap();
 
-    // Source: same ids 1..=1000 — all updates, no inserts
+    // Source: same ids 1..=1000 all updates, no inserts
     let source = make_source_batch(1..1001);
     let source_stream = stream::iter(vec![Ok(source)]);
     let config = MergeConfig {
@@ -475,7 +475,7 @@ async fn test_merge_with_existing_dvs() {
         "second merge should not include metadata action"
     );
 
-    // Interop: both merges were pure updates — logical table is still ids 1..=1000
+    // Interop: both merges were pure updates logical table is still ids 1..=1000
     verify_duckdb_count(&table_path, 1000);
 }
 
@@ -932,14 +932,14 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
 
     assert!(result.is_err(), "merge with null keys must fail");
 
-    // No v2 commit — the failed merge must not write a log entry
+    // No v2 commit the failed merge must not write a log entry
     let v2_path = format!("{}/_delta_log/00000000000000000002.json", table_path);
     assert!(
         !std::path::Path::new(&v2_path).exists(),
         "failed merge must not commit"
     );
 
-    // No orphaned source parquets — the failed validation path must clean up
+    // No orphaned source parquets the failed validation path must clean up
     let parquets_after = list_parquets(&table_path);
     assert_eq!(
         parquets_before, parquets_after,
@@ -969,7 +969,7 @@ async fn test_merge_small_change_uses_inline_dv() {
     .await
     .unwrap();
 
-    // Source: 10 updates — DV bitmap serializes well under the 1024-byte inline threshold
+    // Source: 10 updates DV bitmap serializes well under the 1024-byte inline threshold
     let source = make_source_batch(100..110);
     let config = MergeConfig {
         merge_keys: vec!["id".to_string()],
@@ -1019,7 +1019,7 @@ async fn test_merge_small_change_uses_inline_dv() {
         "inline DV should carry encoded bitmap data"
     );
 
-    // No DV file on disk — inline path must not produce a deletion_vector_*.bin file
+    // No DV file on disk inline path must not produce a deletion_vector_*.bin file
     let dv_files: Vec<_> = std::fs::read_dir(&table_path)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -1037,7 +1037,7 @@ async fn test_merge_small_change_uses_inline_dv() {
 
     // A follow-up merge must be able to read the inline DV via delta-kernel.
     // Changing different keys (200..210) should produce a new DV that unions
-    // with the existing inline one — proving delta-kernel decoded our inline bytes.
+    // with the existing inline one proving delta-kernel decoded our inline bytes.
     let second_source = make_source_batch(200..210);
     let second_config = MergeConfig {
         merge_keys: vec!["id".to_string()],
@@ -1072,7 +1072,7 @@ async fn test_merge_small_change_uses_inline_dv() {
         "second merge's DV should union with the inline DV from v2 (10 + 10 = 20)"
     );
 
-    // Interop: both merges were pure updates — logical table is still ids 1..=1000.
+    // Interop: both merges were pure updates logical table is still ids 1..=1000.
     // This also proves DuckDB can decode our inline DV bytes (storageType "i").
     verify_duckdb_count(&table_path, 1000);
 }

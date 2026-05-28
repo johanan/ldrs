@@ -241,7 +241,7 @@ tables:
         .get(0);
     assert_eq!(nested_value, "value", "jsonb key extraction round-trip");
 
-    // Numeric round-trip value checks. Cast to text so assertions are type-neutral —
+    // Numeric round-trip value checks. Cast to text so assertions are type-neutral
     for (smallint, expected_decimal) in [
         (3i32, "3.000000000000000"),
         (0, "468797.177024568000000"),

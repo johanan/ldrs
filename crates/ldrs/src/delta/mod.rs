@@ -12,6 +12,7 @@ fn default_app_id() -> String {
 pub struct DeltaCommon {
     pub name: String,
     #[serde(default, alias = "delta.columns")]
+    #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
     #[serde(alias = "delta.max_rows")]
     pub max_rows: Option<usize>,

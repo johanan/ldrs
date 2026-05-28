@@ -55,6 +55,7 @@ impl LdrsSource {
 pub struct ArrowDestination {
     pub name: String,
     #[serde(default)]
+    #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
 }
 

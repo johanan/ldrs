@@ -15,8 +15,8 @@ use ldrs::path_pattern;
 use ldrs_storage::build_store;
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
-use tracing::info;
-use tracing_subscriber::fmt;
+use tracing::{debug, info};
+use tracing_subscriber::{fmt, EnvFilter};
 
 // maintaining this so clients do not break
 #[derive(Args, Deserialize, Debug)]
@@ -39,6 +39,7 @@ pub enum DeltaCommands {
 struct ConfigArgs {
     #[arg(short, long)]
     config: String,
+    /// Run only these tables, by `name`, comma-separated (e.g. --select public.users,public.orders). Omit to run every table in the config.
     #[arg(long, value_delimiter = ',')]
     select: Option<Vec<String>>,
 }
@@ -61,7 +62,7 @@ pub enum SnowflakeCommands {
 
 #[derive(Args)]
 #[command(
-    after_help = "Tip: run `ldrs schema` to discover valid --src/--dest kinds, their required fields, and supported --opt keys. Use `ldrs schema <kind>` (e.g. `ldrs schema pq`) for a single kind."
+    after_help = "Tip: run `ldrs schema` to list the available kinds. `ldrs schema <kind>` (e.g. `ldrs schema pq`) dumps one kind's fields; `ldrs schema columns` the column-transform vocabulary; `ldrs schema usage` env vars, templating, and examples."
 )]
 struct RunArgs {
     /// Base config blob (YAML or JSON). A single table block.
@@ -90,12 +91,6 @@ struct RunArgs {
     opt: Vec<(String, String)>,
 }
 
-#[derive(Args)]
-struct SchemaArgs {
-    /// Optional kind name (file, sf, pg, pq, delta, arrow). If omitted, the full dump is emitted.
-    kind: Option<String>,
-}
-
 #[derive(Subcommand)]
 enum Destination {
     /// Load from a config file. All sources and destinations
@@ -113,7 +108,10 @@ enum Destination {
     /// Singular load from inline config and/or cli args
     Run(RunArgs),
     /// Discover available sources, destinations, and config options. Start here for one-off runs.
-    Schema(SchemaArgs),
+    Schema {
+        #[command(subcommand)]
+        command: Option<cli_schema::SchemaCommands>,
+    },
 }
 
 fn parse_kv(s: &str) -> Result<(String, String), String> {
@@ -170,9 +168,12 @@ struct Cli {
 }
 
 fn main() -> Result<(), anyhow::Error> {
-    fmt::Subscriber::builder().with_writer(io::stderr).init();
-    let cli = Cli::parse();
     let _ = dotenv();
+    fmt::Subscriber::builder()
+        .with_writer(io::stderr)
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .init();
+    let cli = Cli::parse();
 
     let Some(destination) = cli.destination else {
         Cli::command().print_help()?;
@@ -180,7 +181,7 @@ fn main() -> Result<(), anyhow::Error> {
         return Ok(());
     };
 
-    let is_data_command = !matches!(destination, Destination::Schema(_));
+    let is_data_command = !matches!(destination, Destination::Schema { .. });
     let start = std::time::Instant::now();
 
     let main_rt = tokio::runtime::Builder::new_multi_thread()
@@ -208,7 +209,7 @@ fn main() -> Result<(), anyhow::Error> {
             }
             Destination::Delta { command } => match command {
                 DeltaCommands::Load(args) => {
-                    info!("delta load with {:?}", args);
+                    debug!("delta load with {:?}", args);
                     Ok(())
                 }
             },
@@ -233,14 +234,22 @@ fn main() -> Result<(), anyhow::Error> {
                 )
                 .await
             }
-            Destination::Schema(args) => {
-                let output = match args.kind.as_deref() {
-                    None => cli_schema::build_full(),
-                    Some(kind) => cli_schema::build_one(kind)?,
-                };
-                println!("{}", serde_json::to_string_pretty(&output)?);
-                Ok(())
-            }
+            Destination::Schema { command } => match command {
+                None => {
+                    // bare `ldrs schema` → list the subcommands
+                    let mut cmd = Cli::command();
+                    if let Some(sub) = cmd.find_subcommand_mut("schema") {
+                        sub.print_help()?;
+                        println!();
+                    }
+                    Ok(())
+                }
+                Some(cmd) => {
+                    let output = cli_schema::build(&cmd);
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                    Ok(())
+                }
+            },
             Destination::Sf { command } => match command {
                 SnowflakeCommands::Exec { sql } => {
                     match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
@@ -292,11 +301,11 @@ fn main() -> Result<(), anyhow::Error> {
                         }
 
                         let pre_sql = conn.exec_transaction(&process_result.pre_sql)?;
-                        info!("Pre SQL {:?} executed successfully", pre_sql);
+                        debug!("Pre SQL {:?} executed successfully", pre_sql);
                         let _sql = match process_result.strategy {
                             SnowflakeStrategy::Sql(sql) => {
                                 let sql_result = conn.exec_transaction(&sql)?;
-                                info!("SQL {:?} executed successfully", sql_result);
+                                debug!("SQL {:?} executed successfully", sql_result);
                                 Ok(())
                             }
                             SnowflakeStrategy::Ingest => {
@@ -304,7 +313,7 @@ fn main() -> Result<(), anyhow::Error> {
                             }
                         }?;
                         let post_sql = conn.exec_transaction(&process_result.post_sql)?;
-                        info!("Post SQL {:?} executed successfully", post_sql);
+                        debug!("Post SQL {:?} executed successfully", post_sql);
                         Ok(())
                     }
                     Err(e) => Err(e),
