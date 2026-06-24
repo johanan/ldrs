@@ -9,3 +9,4 @@ pub mod lua_logic;
 pub mod parquet;
 pub mod path_pattern;
 pub mod postgres;
+pub mod sink;

@@ -335,3 +335,57 @@ tables:
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
+
+#[tokio::test]
+#[test_log::test]
+async fn test_postgres_rollback_on_post_sql_failure() {
+    let file_url = data_url();
+    let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), file_url),
+        ("LDRS_DEST".to_string(), pg_url.to_string()),
+    ];
+
+    let config = "
+dest: pg.drop_replace
+src: file
+
+tables:
+  - name: public_test_fail.users
+    filename: public.users/public.users.snappy.parquet
+    post_sql: this is not valid sql;
+";
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let client = create_connection(pg_url).await.unwrap();
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_fail CASCADE")
+        .await;
+
+    let ex = execute_configs(
+        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+        &rt.handle(),
+    )
+    .await;
+    assert!(ex.is_err(), "load should fail on the invalid post_sql");
+
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = 'public_test_fail' AND table_name = 'users')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!exists, "table must not exist after rollback");
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}

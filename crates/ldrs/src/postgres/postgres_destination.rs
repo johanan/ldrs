@@ -82,6 +82,32 @@ pub fn validate_execution_plan(commands: &[PgDestCommand]) -> Result<(), anyhow:
     }
 }
 
+pub struct PgPlan {
+    pub before: Vec<PgDestCommand>,
+    pub load_table: String,
+    pub after: Vec<PgDestCommand>,
+}
+
+/// Split a command list around its single `Load`. Validates first, so the `Load` is
+/// guaranteed present.
+pub fn split_pg_plan(mut commands: Vec<PgDestCommand>) -> Result<PgPlan, anyhow::Error> {
+    validate_execution_plan(&commands)?;
+    let load_pos = commands
+        .iter()
+        .position(|c| matches!(c, PgDestCommand::Load(_)))
+        .expect("validate_execution_plan ensures exactly one Load");
+    let after = commands.split_off(load_pos + 1);
+    let load_table = match commands.pop() {
+        Some(PgDestCommand::Load(table)) => table,
+        _ => unreachable!("position matched a Load command"),
+    };
+    Ok(PgPlan {
+        before: commands,
+        load_table,
+        after,
+    })
+}
+
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "dest")]
 #[schemars(

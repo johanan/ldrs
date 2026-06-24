@@ -5,9 +5,11 @@ mod client;
 mod extracted_values;
 mod pg_numeric;
 mod postgres_execution;
+mod sink;
 
 pub use client::*;
 pub use postgres_execution::*;
+pub use sink::*;
 
 pub fn map_colspec_to_pg_type(pq: &ColumnSpec) -> postgres_types::Type {
     match pq {

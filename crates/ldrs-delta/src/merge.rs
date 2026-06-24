@@ -8,19 +8,20 @@ use futures::{Stream, StreamExt};
 use ldrs_arrow::ArrowColumnTransformStrategy;
 use ldrs_parquet::{
     default_writer_props, read_parquet_metadata, stream_projected_parquet, with_bloom_filters,
-    write_parquet_split, ROW_NUMBER_COLUMN,
+    FileNamer, ParquetSink, ROW_NUMBER_COLUMN,
 };
-use ldrs_storage::{base_or_relative_path, build_store};
+use ldrs_storage::base_or_relative_path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::file::metadata::ParquetMetaData;
+use url::Url;
 use uuid::Uuid;
 
 use std::collections::HashMap;
 
 use crate::{
-    build_add, build_commit_jsonl, build_engine, build_metadata, ensure_table, merge_protocol,
-    version_to_log_filename, DeltaAction, DeltaCommitInfo, DeltaRemove, DeltaTxn,
-    DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, MERGE_MAX_RETRIES,
+    build_add, build_commit_jsonl, build_engine, build_metadata, cleanup_source_files,
+    ensure_table, merge_protocol, version_to_log_filename, DeltaAction, DeltaCommitInfo,
+    DeltaRemove, DeltaTxn, MERGE_MAX_RETRIES,
 };
 
 use super::dv::{build_dv_file, build_dv_inline, serialize_dv};
@@ -182,46 +183,124 @@ where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
     ensure_table(table_path, &schema).await?;
+    let mut sink = DeltaMergeSink::new(table_path, schema, transforms, merge_config)?;
+    let mut stream = std::pin::pin!(stream);
+    while let Some(batch) = stream.next().await {
+        sink.write_batch(&batch?).await?;
+    }
+    sink.finish().await
+}
 
-    let url = base_or_relative_path(table_path)?;
-    let (store, base_path, _) = build_store(&url)?;
+/// Streaming Delta merge. Writes data files through an embedded [`ParquetSink`]
+/// (with bloom filters on the merge keys) and commits an upsert on `finish`.
+/// The table must already exist.
+pub struct DeltaMergeSink {
+    inner: ParquetSink,
+    // shared with `inner`: one object-store client for both the data writes and the commit
+    store: Arc<dyn ObjectStore>,
+    base_path: object_store::path::Path,
+    url: Url,
+    schema: SchemaRef,
+    merge_config: MergeConfig,
+}
 
-    let bloom_columns: Vec<Vec<String>> = merge_config
-        .merge_keys
-        .iter()
-        .map(|k| vec![k.clone()])
-        .collect();
-    let props = with_bloom_filters(default_writer_props(), bloom_columns);
-
-    let source_files = write_parquet_split(
-        table_path,
-        schema.clone(),
-        transforms,
-        stream,
-        Some(merge_config.max_rows.unwrap_or(DEFAULT_MAX_ROWS)),
-        Some(merge_config.max_bytes.unwrap_or(DEFAULT_MAX_BYTES)),
-        |_| format!("{}.parquet", Uuid::new_v4()),
-        Some(props),
-    )
-    .await?;
-
-    if source_files.is_empty() {
-        return Ok(MergeStats::empty());
+impl DeltaMergeSink {
+    pub fn new(
+        table_path: &str,
+        schema: SchemaRef,
+        transforms: Vec<Option<ArrowColumnTransformStrategy>>,
+        merge_config: MergeConfig,
+    ) -> Result<Self, anyhow::Error> {
+        let url = base_or_relative_path(table_path)?;
+        let bloom_columns: Vec<Vec<String>> = merge_config
+            .merge_keys
+            .iter()
+            .map(|k| vec![k.clone()])
+            .collect();
+        let props = with_bloom_filters(default_writer_props(), bloom_columns);
+        let namer: FileNamer = Box::new(|_| Ok(format!("{}.parquet", Uuid::new_v4())));
+        let inner = ParquetSink::new(
+            table_path,
+            schema.clone(),
+            transforms,
+            merge_config.max_rows,
+            merge_config.max_bytes,
+            namer,
+            Some(props),
+        )?;
+        let store = inner.store();
+        let base_path = inner.base_path().clone();
+        Ok(Self {
+            inner,
+            store,
+            base_path,
+            url,
+            schema,
+            merge_config,
+        })
     }
 
-    if !merge_config.allow_null_keys {
-        if let Err(e) = validate_no_null_keys(&source_files, &merge_config.merge_keys, &schema) {
-            cleanup_source_files(&store, &base_path, &source_files).await;
-            return Err(e);
+    pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), anyhow::Error> {
+        self.inner.write_batch(batch).await
+    }
+
+    /// Flush the data files and commit the merge. The files are kept only if the
+    /// commit succeeds; on a watermark skip or any failure they are deleted.
+    pub async fn finish(self) -> Result<MergeStats, anyhow::Error> {
+        let source_files = self.inner.finish().await?;
+        if source_files.is_empty() {
+            return Ok(MergeStats::empty());
         }
+        match commit_merge(
+            &self.store,
+            &self.base_path,
+            &self.url,
+            &self.schema,
+            &self.merge_config,
+            &source_files,
+        )
+        .await
+        {
+            Ok(stats) if stats.skipped => {
+                cleanup_source_files(&self.store, &self.base_path, &source_files).await;
+                Ok(stats)
+            }
+            Ok(stats) => Ok(stats),
+            Err(e) => {
+                cleanup_source_files(&self.store, &self.base_path, &source_files).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Delete the data files written so far. No commit was made, so there is no
+    /// log entry to undo.
+    pub async fn abort(self) {
+        self.inner.abort().await;
+    }
+}
+
+/// Commit the written data files as a Delta merge. Ok means committed or skipped
+/// (the `skipped` flag distinguishes them); on any failure the caller decides
+/// what to clean up.
+async fn commit_merge(
+    store: &Arc<dyn ObjectStore>,
+    base_path: &object_store::path::Path,
+    url: &Url,
+    schema: &SchemaRef,
+    merge_config: &MergeConfig,
+    source_files: &[(String, ParquetMetaData)],
+) -> Result<MergeStats, anyhow::Error> {
+    if !merge_config.allow_null_keys {
+        validate_no_null_keys(source_files, &merge_config.merge_keys, schema)?;
     }
 
     let (key_set, converter) = build_key_set(
         store.clone(),
-        &base_path,
-        &source_files,
+        base_path,
+        source_files,
         &merge_config.merge_keys,
-        &schema,
+        schema,
     )
     .await?;
 
@@ -232,7 +311,7 @@ where
     // or an abitrary value that defaults to now
     // or None
     let (app_id, batch_version) =
-        compute_batch_version(&merge_config.txn_config, &source_files, &schema)?;
+        compute_batch_version(&merge_config.txn_config, source_files, schema)?;
 
     // Retry loop
     for _attempt in 0..MERGE_MAX_RETRIES {
@@ -249,9 +328,8 @@ where
 
         if let (Some(app_id), Some(batch_version)) = (app_id.as_ref(), batch_version) {
             if let Ok(Some(last_version)) = snapshot.get_app_id_version(app_id, engine.as_ref()) {
-                // if there is a newer version committed, nothing to do so we clean up and exit
+                // if there is a newer version committed, nothing to do so we skip
                 if last_version >= batch_version {
-                    cleanup_source_files(&store, &base_path, &source_files).await;
                     return Ok(MergeStats::skipped(last_version));
                 }
             }
@@ -261,27 +339,27 @@ where
         let candidate_files = find_candidate_target_files(
             &snapshot,
             engine.as_ref(),
-            &schema,
-            &source_files,
+            schema,
+            source_files,
             &merge_config.merge_keys[0],
         )?;
 
         let file_probes = narrow_to_eligible_row_groups(
             &candidate_files,
-            &store,
-            &base_path,
-            &schema,
-            &source_files,
+            store,
+            base_path,
+            schema,
+            source_files,
             &merge_config.merge_keys,
         )
         .await?;
 
         let (file_matches, matched_rows) = probe_targets_for_matches(
             &file_probes,
-            &store,
-            &base_path,
+            store,
+            base_path,
             engine.as_ref(),
-            &url,
+            url,
             &merge_config.merge_keys,
             &key_set,
             &converter,
@@ -307,7 +385,7 @@ where
         };
         let metadata_action = if needs_dv_upgrade {
             Some(build_metadata(
-                &schema,
+                schema,
                 Some(&table_id),
                 created_time,
                 HashMap::from([("delta.enableDeletionVectors".into(), "true".into())]),
@@ -330,7 +408,7 @@ where
             .iter()
             .map(|fm| fm.scan_file.path.as_str())
             .collect();
-        let existing_dvs = load_existing_dvs(&store, &base_path, &paths_of_interest).await?;
+        let existing_dvs = load_existing_dvs(store, base_path, &paths_of_interest).await?;
 
         let removes: Vec<DeltaRemove> = file_matches
             .iter()
@@ -352,11 +430,11 @@ where
             let descriptor = if dv_bytes.len() <= DV_INLINE_THRESHOLD {
                 build_dv_inline(&dv_bytes, cardinality)
             } else {
-                build_dv_file(store.as_ref(), &base_path, &dv_bytes, cardinality).await?
+                build_dv_file(store.as_ref(), base_path, &dv_bytes, cardinality).await?
             };
 
-            let file_stats = parquet_metadata_to_delta_stats(&fm.metadata, &schema);
-            let stats_json = delta_stats_to_json(&file_stats, &schema)?;
+            let file_stats = parquet_metadata_to_delta_stats(&fm.metadata, schema);
+            let stats_json = delta_stats_to_json(&file_stats, schema)?;
 
             adds_with_dvs.push(super::DeltaAdd {
                 path: fm.scan_file.path.clone(),
@@ -381,9 +459,7 @@ where
         let new_adds = source_files
             .iter()
             .zip(obj_metas.iter())
-            .map(|((filename, metadata), obj_meta)| {
-                build_add(filename, metadata, obj_meta, &schema)
-            })
+            .map(|((filename, metadata), obj_meta)| build_add(filename, metadata, obj_meta, schema))
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut actions: Vec<DeltaAction> = vec![DeltaAction::CommitInfo(&commit_info)];
@@ -405,7 +481,6 @@ where
         let log_path = base_path
             .clone()
             .join("_delta_log")
-            .clone()
             .join(version_to_log_filename(next_version));
 
         match store
@@ -440,8 +515,6 @@ where
         }
     }
 
-    // Retry exhaustion: clean up orphaned source files
-    cleanup_source_files(&store, &base_path, &source_files).await;
     anyhow::bail!(
         "failed to commit delta merge after {} attempts",
         MERGE_MAX_RETRIES
@@ -654,16 +727,6 @@ fn find_candidate_target_files(
     Ok(candidate_files)
 }
 
-async fn cleanup_source_files(
-    store: &Arc<dyn ObjectStore>,
-    base_path: &object_store::path::Path,
-    source_files: &[(String, ParquetMetaData)],
-) {
-    for (filename, _) in source_files {
-        let path = base_path.clone().join(filename.as_str());
-        let _ = store.delete(&path).await;
-    }
-}
 
 /// Walk the delta log in reverse, finding the latest `add` action for each path of interest.
 /// Returns a map from path to its current DV descriptor (only entries for paths that have a DV).

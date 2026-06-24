@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.19.0] - 2026-06-24
+
+### Features
+
+- *(sinks)* Turn all destinations into sinks
+
 ## [0.18.1] - 2026-05-28
 
 ### Bug Fixes

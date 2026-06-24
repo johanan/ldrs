@@ -25,5 +25,6 @@ target/
 
 **/test_data/parquet_writes/
 **/test_data/delta_writes/
+**/test_data/sink_writes/
 
 .env

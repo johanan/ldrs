@@ -1,19 +1,9 @@
-use std::{iter::zip, pin::pin, sync::Arc};
+use std::iter::zip;
 
 use anyhow::Context;
-use arrow_array::RecordBatch;
-use arrow_schema::Schema;
-use ldrs_arrow::{
-    transform_batch, ArrowColumnTransformStrategy, ColumnSpec, ColumnType, TypedColumnAccessor,
-};
+use ldrs_arrow::{ColumnSpec, ColumnType};
 use postgres_types::ToSql;
-use tokio_postgres::{binary_copy::BinaryCopyInWriter, Transaction};
-
-use crate::{
-    extracted_values::{ColumnConverter, ExtractedValue},
-    map_colspec_to_pg_type,
-};
-use futures::{StreamExt, TryStreamExt};
+use tokio_postgres::Client;
 
 pub fn map_colspec_to_pg_ddl(pq: &ColumnSpec) -> String {
     match pq {
@@ -41,13 +31,13 @@ pub fn map_colspec_to_pg_ddl(pq: &ColumnSpec) -> String {
     }
 }
 
-pub async fn execute_sql<'a>(tx: &Transaction<'a>, sql: &str) -> Result<(), anyhow::Error> {
-    tx.batch_execute(sql).await?;
+pub async fn execute_sql(client: &Client, sql: &str) -> Result<(), anyhow::Error> {
+    client.batch_execute(sql).await?;
     Ok(())
 }
 
-pub async fn execute_prepared_stmt<'a>(
-    tx: &Transaction<'a>,
+pub async fn execute_prepared_stmt(
+    client: &Client,
     sql: &str,
     params: &[(String, Option<ColumnType>)],
     stmt_types: Option<&[ColumnType]>,
@@ -72,14 +62,15 @@ pub async fn execute_prepared_stmt<'a>(
         .map(param_tosql)
         .collect::<Result<Vec<_>, anyhow::Error>>()?;
     let param_refs = param_values.iter().map(|v| v.as_ref()).collect::<Vec<_>>();
-    tx.execute(sql, &param_refs)
+    client
+        .execute(sql, &param_refs)
         .await
         .with_context(|| "Failed to execute PostgreSQL prepared statement")?;
     Ok(())
 }
 
-pub async fn execute_create_table<'a>(
-    tx: &Transaction<'a>,
+pub async fn execute_create_table(
+    client: &Client,
     table: &str,
     columns: &[ColumnSpec],
 ) -> Result<(), anyhow::Error> {
@@ -91,12 +82,12 @@ pub async fn execute_create_table<'a>(
     let fields_ddl = col_ddl.join(", ");
     ddl.push_str(&fields_ddl);
     ddl.push_str(");");
-    tx.batch_execute(&ddl).await?;
+    client.batch_execute(&ddl).await?;
     Ok(())
 }
 
-pub async fn execute_create_temp_table<'a>(
-    tx: &Transaction<'a>,
+pub async fn execute_create_temp_table(
+    client: &Client,
     table: &str,
     columns: &[ColumnSpec],
 ) -> Result<(), anyhow::Error> {
@@ -108,12 +99,12 @@ pub async fn execute_create_temp_table<'a>(
     let fields_ddl = col_ddl.join(", ");
     ddl.push_str(&fields_ddl);
     ddl.push_str(");");
-    tx.batch_execute(&ddl).await?;
+    client.batch_execute(&ddl).await?;
     Ok(())
 }
 
-pub async fn execute_merge<'a>(
-    tx: &Transaction<'a>,
+pub async fn execute_merge(
+    client: &Client,
     source: &str,
     target: &str,
     keys: &[String],
@@ -149,86 +140,7 @@ pub async fn execute_merge<'a>(
     "#,
         target, source, on, update, insert, insert_values
     );
-    tx.batch_execute(&merge_sql).await?;
-    Ok(())
-}
-
-pub async fn execute_binary_copy<'a>(
-    tx: &Transaction<'a>,
-    load_table: &str,
-    final_cols: &[ColumnSpec],
-    arrow_transforms: &[Option<ArrowColumnTransformStrategy>],
-    stream: impl futures::TryStream<Ok = RecordBatch, Error = anyhow::Error> + Send,
-) -> Result<(), anyhow::Error> {
-    let stream = stream.into_stream();
-    let mut stream = pin!(stream);
-
-    let pg_types = final_cols
-        .iter()
-        .map(map_colspec_to_pg_type)
-        .collect::<Vec<_>>();
-    let binary_ddl = format!("COPY {} FROM STDIN WITH (FORMAT BINARY)", load_table);
-    let sink = tx
-        .copy_in(&binary_ddl)
-        .await
-        .with_context(|| "Could not create binary copy")?;
-    let writer = BinaryCopyInWriter::new(sink, &pg_types);
-    let mut pinned_writer = pin!(writer);
-
-    // calculate if we need to do record batch transforms
-    let transform_plan = if arrow_transforms.iter().any(|s| s.is_some()) {
-        let target_schema = Arc::new(Schema::new(
-            final_cols
-                .iter()
-                .map(|col| col.to_arrow_field())
-                .collect::<Vec<_>>(),
-        ));
-        Some((arrow_transforms, target_schema))
-    } else {
-        None
-    };
-
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result?;
-
-        let batch = match &transform_plan {
-            Some((transforms, target_schema)) => {
-                transform_batch(&batch, transforms, target_schema.clone())?
-            }
-            None => batch,
-        };
-
-        let num_rows = batch.num_rows();
-        let columns = batch.columns();
-
-        let accessors: Vec<TypedColumnAccessor> =
-            columns.iter().map(TypedColumnAccessor::new).collect();
-
-        let converters = accessors
-            .iter()
-            .zip(final_cols.iter())
-            .map(|(accessor, col_schema)| ColumnConverter::new(accessor, col_schema))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut batch_buffer = Vec::<ExtractedValue>::with_capacity(batch.columns().len());
-        for row_idx in 0..num_rows {
-            batch_buffer.clear();
-            for converter in converters.iter() {
-                batch_buffer.push(converter.extract_value(row_idx));
-            }
-
-            pinned_writer
-                .as_mut()
-                .write_raw(&batch_buffer)
-                .await
-                .with_context(|| "Failed to write row to PostgreSQL")?;
-        }
-    }
-
-    pinned_writer
-        .finish()
-        .await
-        .with_context(|| "Could not finish copy")?;
+    client.batch_execute(&merge_sql).await?;
     Ok(())
 }
 
