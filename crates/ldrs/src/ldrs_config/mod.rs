@@ -8,24 +8,23 @@ use std::{
 };
 
 use anyhow::Context;
-use arrow::ipc::writer::StreamWriter;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use futures::Stream;
 use ldrs_arrow::{
-    build_arrow_transform_strategy, build_source_and_target_schema, transform_batch,
-    ArrowColumnTransformStrategy, ColumnSpec, ColumnType,
+    build_arrow_transform_strategy, build_source_and_target_schema, ArrowColumnTransformStrategy,
+    ColumnSpec, ColumnType,
 };
-use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, TxnConfig};
+use ldrs_delta::{ensure_table, DeltaMergeSink, DeltaOverwriteSink, MergeConfig, TxnConfig};
 use ldrs_parquet::{
     builder_from_url, columnspec_from_parquet, default_writer_props, get_fields,
-    with_bloom_filters, write_parquet,
+    with_bloom_filters, FileNamer, ParquetSink,
 };
 use ldrs_postgres::check_for_role;
 use ldrs_storage::{base_or_relative_path, ensure_trailing_slash};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
 use tokio::task::JoinHandle;
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -37,7 +36,8 @@ use crate::{
     },
     ldrs_env::{collect_params, collect_vars_by_prefix, setup_handlebars, LdrsExecutionContext},
     ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource, SnowflakeConnection},
-    postgres::execute::load_to_postgres,
+    postgres::{execute::PgSink, postgres_destination::split_pg_plan},
+    sink::{drive, ArrowStdoutSink, Sink},
 };
 
 enum StreamType {
@@ -374,186 +374,25 @@ pub async fn execute_task(
         }
     };
 
-    let _ = match src.schema {
-        Some(schema) => match task.dest {
-            LdrsDestination::Pg(pg_dest) => {
-                let dest_value = get_dest_url(ldrs_env, pg_dest.get_name(), "pg")?;
-                let (pg_url, role) = check_for_role(dest_value.1.as_str())?;
-                // check the environment for a pg role
-                let role = role.or(get_env_value(
-                    ldrs_env,
-                    &[
-                        &format!("LDRS_PG_ROLE_{}", pg_dest.get_name()),
-                        "LDRS_PG_ROLE",
-                    ],
-                )
-                .map(|(_, v)| v.to_string()));
-                let pg_commands = pg_dest.to_pg_commands();
-                let (target_cols, strategies) =
-                    column_helper(src.source_cols, pg_dest.get_columns(), &schema)?;
-                debug!("Target columns: {:?}", target_cols);
-                debug!("Arrow Transforms: {:?}", strategies);
-                load_to_postgres(
-                    &pg_url,
-                    &pg_commands,
-                    &target_cols,
-                    &strategies,
-                    &env_params,
-                    role,
-                    &context,
-                    src.stream_type,
-                )
-                .await
-            }
-            LdrsDestination::Pq(parq) => {
-                let dest_value = get_dest_url(ldrs_env, &parq.name, "pq")?;
-                let dest_value = ensure_trailing_slash(dest_value.1.as_str());
-                let handled_filename = context.render_template(&parq.filename)?;
-                let full_path = format!("{}{}", dest_value, handled_filename);
-                let full_name = base_or_relative_path(&full_path)?;
-                debug!("full_name: {:?}", full_name);
-                let (target_cols, strategies) =
-                    column_helper(src.source_cols, parq.columns, &schema)?;
-
-                debug!("Target columns: {:?}", target_cols);
-                debug!("Arrow Transforms: {:?}", strategies);
-                // create the new schema if there are any type changes
-                // adding and keeping the current metadata
-                let schema = if strategies.iter().any(|s| s.is_some()) {
-                    let fields = target_cols
-                        .iter()
-                        .map(|col| col.to_arrow_field())
-                        .collect::<Vec<_>>();
-                    Arc::new(Schema::new(fields))
-                } else {
-                    schema
-                };
-                let props = with_bloom_filters(default_writer_props(), parq.bloom_filters);
-                let _ = write_parquet(
-                    &full_name.to_string(),
-                    schema,
-                    strategies,
-                    Some(props),
-                    src.stream_type,
-                )
-                .await?;
-                Ok(())
-            }
-            LdrsDestination::Delta(delta_dest) => {
-                let (name, columns) = match &delta_dest {
-                    DeltaDestination::Overwrite(c) => (c.name.clone(), c.columns.clone()),
-                    DeltaDestination::Merge(m) => (m.common.name.clone(), m.common.columns.clone()),
-                };
-
-                let dest_value = get_dest_url(ldrs_env, &name, "delta")?;
-                let storage_url = dest_value.1.strip_prefix("delta+").unwrap_or(&dest_value.1);
-                let storage_url = ensure_trailing_slash(storage_url);
-                let table_path = ensure_trailing_slash(&format!("{}{}", storage_url, name));
-                debug!("delta path: {:?}", table_path);
-                let (target_cols, strategies) = column_helper(src.source_cols, columns, &schema)?;
-
-                debug!("Target columns: {:?}", target_cols);
-                debug!("Arrow Transforms: {:?}", strategies);
-                let schema = if strategies.iter().any(|s| s.is_some()) {
-                    let fields = target_cols
-                        .iter()
-                        .map(|col| col.to_arrow_field())
-                        .collect::<Vec<_>>();
-                    Arc::new(Schema::new(fields))
-                } else {
-                    schema
-                };
-
-                match delta_dest {
-                    DeltaDestination::Overwrite(o) => {
-                        overwrite_delta(
-                            &table_path,
-                            schema,
-                            strategies,
-                            src.stream_type,
-                            o.max_rows,
-                            o.max_bytes,
-                        )
-                        .await?;
-                    }
-                    DeltaDestination::Merge(m) => {
-                        let DeltaMerge {
-                            merge_keys,
-                            allow_null_keys,
-                            txn_mode,
-                            watermark_column,
-                            batch_version,
-                            app_id,
-                            ..
-                        } = m;
-                        let txn = match txn_mode {
-                            None => None,
-                            Some(TxnMode::SourceWatermark) => {
-                                Some(MergeTxnConfig::SourceWatermark {
-                                    app_id,
-                                    watermark_column: watermark_column.expect(
-                                        "validate ensures watermark_column for source_watermark",
-                                    ),
-                                })
-                            }
-                            Some(TxnMode::ProcessingTime) => Some(MergeTxnConfig::ProcessingTime {
-                                app_id,
-                                batch_version,
-                            }),
-                        };
-                        let txn_config = resolve_txn_config(txn, &context)?;
-                        let merge_config = MergeConfig {
-                            merge_keys,
-                            allow_null_keys,
-                            max_rows: m.common.max_rows,
-                            max_bytes: m.common.max_bytes,
-                            txn_config,
-                        };
-                        merge_delta(
-                            &table_path,
-                            schema,
-                            strategies,
-                            src.stream_type,
-                            merge_config,
-                        )
-                        .await?;
-                    }
+    match src.schema {
+        Some(schema) => {
+            let mut sinks = build_sinks(
+                vec![task.dest],
+                &src.source_cols,
+                &schema,
+                &context,
+                ldrs_env,
+                env_params,
+            )
+            .await?;
+            match drive(src.stream_type, &mut sinks).await {
+                Ok(()) => finish_all(sinks, &context, env_params).await,
+                Err(e) => {
+                    abort_all(sinks).await;
+                    Err(e)
                 }
-                Ok(())
             }
-            LdrsDestination::Arrow(arrow_dest) => {
-                let (target_cols, strategies) =
-                    column_helper(src.source_cols, arrow_dest.columns, &schema)?;
-                debug!("Target columns: {:?}", target_cols);
-                debug!("Arrow Transforms: {:?}", strategies);
-                if io::stdout().is_terminal() {
-                    return Err(anyhow::Error::msg("Outputting Arrow IPC Stream to stdout is not supported in a terminal. Please redirect the output to a file or pipe it to another command."));
-                }
-                let stdout = io::stdout().lock();
-                let schema = if strategies.iter().any(|s| s.is_some()) {
-                    let fields = target_cols
-                        .iter()
-                        .map(|c| c.to_arrow_field())
-                        .collect::<Vec<_>>();
-                    Arc::new(Schema::new(fields))
-                } else {
-                    schema
-                };
-                let mut writer = StreamWriter::try_new_buffered(stdout, &schema)?;
-                let mut pinned = pin!(src.stream_type);
-                while let Some(batch) = pinned.next().await {
-                    let batch = batch?;
-                    let transformed_batch = if strategies.iter().any(|s| s.is_some()) {
-                        transform_batch(&batch, &strategies, schema.clone())?
-                    } else {
-                        batch
-                    };
-                    writer.write(&transformed_batch)?;
-                }
-                writer.finish()?;
-                Ok(())
-            }
-        },
+        }
         None => {
             warn!("No schema found, most likely the load failed or no Arrow Record Batches were produced.");
             Ok(())
@@ -568,6 +407,221 @@ pub async fn execute_task(
         }?
     }
     Ok(())
+}
+
+/// Build one sink per destination, ready to receive batches. Each arm resolves its
+/// destination config and constructs the engine sink
+pub async fn build_sinks(
+    dests: Vec<LdrsDestination>,
+    source_cols: &[ColumnSpec],
+    schema: &SchemaRef,
+    context: &LdrsExecutionContext<'_>,
+    ldrs_env: &[(String, String)],
+    env_params: &[(String, String, Option<ColumnType>)],
+) -> Result<Vec<Sink>, anyhow::Error> {
+    let mut sinks = Vec::with_capacity(dests.len());
+    for dest in dests {
+        match build_one(dest, source_cols, schema, context, ldrs_env, env_params).await {
+            Ok(sink) => sinks.push(sink),
+            Err(e) => {
+                abort_all(sinks).await;
+                return Err(e);
+            }
+        }
+    }
+    Ok(sinks)
+}
+
+async fn build_one(
+    dest: LdrsDestination,
+    source_cols: &[ColumnSpec],
+    schema: &SchemaRef,
+    context: &LdrsExecutionContext<'_>,
+    ldrs_env: &[(String, String)],
+    env_params: &[(String, String, Option<ColumnType>)],
+) -> Result<Sink, anyhow::Error> {
+    match dest {
+        LdrsDestination::Pg(pg_dest) => {
+            let dest_value = get_dest_url(ldrs_env, pg_dest.get_name(), "pg")?;
+            let (pg_url, role) = check_for_role(dest_value.1.as_str())?;
+            let role = role.or(get_env_value(
+                ldrs_env,
+                &[
+                    &format!("LDRS_PG_ROLE_{}", pg_dest.get_name()),
+                    "LDRS_PG_ROLE",
+                ],
+            )
+            .map(|(_, v)| v.to_string()));
+            let plan = split_pg_plan(pg_dest.to_pg_commands())?;
+            let (target_cols, strategies) =
+                column_helper(source_cols.to_vec(), pg_dest.get_columns(), schema)?;
+            let pg = PgSink::open(
+                &pg_url,
+                role,
+                plan,
+                target_cols,
+                strategies,
+                context,
+                env_params,
+            )
+            .await?;
+            Ok(Sink::Pg(pg))
+        }
+        LdrsDestination::Pq(parq) => {
+            let dest_value = get_dest_url(ldrs_env, &parq.name, "pq")?;
+            let dest_value = ensure_trailing_slash(dest_value.1.as_str());
+            let handled_filename = context.render_template(&parq.filename)?;
+            let (target_cols, strategies) =
+                column_helper(source_cols.to_vec(), parq.columns, schema)?;
+            let out_schema = if strategies.iter().any(|s| s.is_some()) {
+                let fields = target_cols
+                    .iter()
+                    .map(|col| col.to_arrow_field())
+                    .collect::<Vec<_>>();
+                Arc::new(Schema::new(fields))
+            } else {
+                schema.clone()
+            };
+            let props = with_bloom_filters(default_writer_props(), parq.bloom_filters);
+            let namer: FileNamer = Box::new(move |_| Ok(handled_filename.clone()));
+            let sink = ParquetSink::new(
+                &dest_value,
+                out_schema,
+                strategies,
+                None,
+                None,
+                namer,
+                Some(props),
+            )?;
+            Ok(Sink::Pq(sink))
+        }
+        LdrsDestination::Delta(delta_dest) => {
+            let (name, columns) = match &delta_dest {
+                DeltaDestination::Overwrite(c) => (c.name.clone(), c.columns.clone()),
+                DeltaDestination::Merge(m) => (m.common.name.clone(), m.common.columns.clone()),
+            };
+            let dest_value = get_dest_url(ldrs_env, &name, "delta")?;
+            let storage_url = dest_value.1.strip_prefix("delta+").unwrap_or(&dest_value.1);
+            let storage_url = ensure_trailing_slash(storage_url);
+            let table_path = ensure_trailing_slash(&format!("{}{}", storage_url, name));
+            let (target_cols, strategies) = column_helper(source_cols.to_vec(), columns, schema)?;
+            let out_schema = if strategies.iter().any(|s| s.is_some()) {
+                let fields = target_cols
+                    .iter()
+                    .map(|col| col.to_arrow_field())
+                    .collect::<Vec<_>>();
+                Arc::new(Schema::new(fields))
+            } else {
+                schema.clone()
+            };
+
+            ensure_table(&table_path, &out_schema).await?;
+            match delta_dest {
+                DeltaDestination::Overwrite(o) => {
+                    let sink = DeltaOverwriteSink::new(
+                        &table_path,
+                        out_schema,
+                        strategies,
+                        o.max_rows,
+                        o.max_bytes,
+                    )?;
+                    Ok(Sink::DeltaOverwrite(sink))
+                }
+                DeltaDestination::Merge(m) => {
+                    let DeltaMerge {
+                        merge_keys,
+                        allow_null_keys,
+                        txn_mode,
+                        watermark_column,
+                        batch_version,
+                        app_id,
+                        ..
+                    } = m;
+                    let txn = match txn_mode {
+                        None => None,
+                        Some(TxnMode::SourceWatermark) => Some(MergeTxnConfig::SourceWatermark {
+                            app_id,
+                            watermark_column: watermark_column
+                                .expect("validate ensures watermark_column for source_watermark"),
+                        }),
+                        Some(TxnMode::ProcessingTime) => Some(MergeTxnConfig::ProcessingTime {
+                            app_id,
+                            batch_version,
+                        }),
+                    };
+                    let txn_config = resolve_txn_config(txn, context)?;
+                    let merge_config = MergeConfig {
+                        merge_keys,
+                        allow_null_keys,
+                        max_rows: m.common.max_rows,
+                        max_bytes: m.common.max_bytes,
+                        txn_config,
+                    };
+                    let sink =
+                        DeltaMergeSink::new(&table_path, out_schema, strategies, merge_config)?;
+                    Ok(Sink::DeltaMerge(sink))
+                }
+            }
+        }
+        LdrsDestination::Arrow(arrow_dest) => {
+            let (target_cols, strategies) =
+                column_helper(source_cols.to_vec(), arrow_dest.columns, schema)?;
+            if io::stdout().is_terminal() {
+                return Err(anyhow::Error::msg("Outputting Arrow IPC Stream to stdout is not supported in a terminal. Please redirect the output to a file or pipe it to another command."));
+            }
+            let out_schema = if strategies.iter().any(|s| s.is_some()) {
+                let fields = target_cols
+                    .iter()
+                    .map(|col| col.to_arrow_field())
+                    .collect::<Vec<_>>();
+                Arc::new(Schema::new(fields))
+            } else {
+                schema.clone()
+            };
+            let sink = ArrowStdoutSink::new(io::stdout(), out_schema, strategies)?;
+            Ok(Sink::Arrow(sink))
+        }
+    }
+}
+
+/// Finish every sink after a successful stream.
+pub async fn finish_all(
+    sinks: Vec<Sink>,
+    context: &LdrsExecutionContext<'_>,
+    env_params: &[(String, String, Option<ColumnType>)],
+) -> Result<(), anyhow::Error> {
+    for sink in sinks {
+        match sink {
+            Sink::Pg(pg) => pg.commit(context, env_params).await?,
+            Sink::Pq(s) => {
+                s.finish().await?;
+            }
+            Sink::DeltaOverwrite(s) => {
+                s.finish().await?;
+            }
+            Sink::DeltaMerge(s) => {
+                s.finish().await?;
+            }
+            Sink::Arrow(s) => {
+                s.finish()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Failure-path cleanup. Each sink undoes what it can: Postgres rolls back, the file
+/// sinks delete their incomplete output, Arrow is a no-op. Best-effort.
+pub async fn abort_all(sinks: Vec<Sink>) {
+    for sink in sinks {
+        match sink {
+            Sink::Pg(pg) => pg.rollback().await,
+            Sink::Pq(s) => s.abort().await,
+            Sink::DeltaOverwrite(s) => s.abort().await,
+            Sink::DeltaMerge(s) => s.abort().await,
+            Sink::Arrow(s) => s.abort(),
+        }
+    }
 }
 
 #[cfg(test)]

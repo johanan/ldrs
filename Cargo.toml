@@ -22,6 +22,7 @@ arrow-schema = { version = "58", features = ["serde", "canonical_extension_types
 anyhow = "1.0.102"
 bytes = "1"
 chrono = "0.4.44"
+deadpool-postgres = "0.14.1"
 delta_kernel = "0.21.0"
 futures = "0.3.32"
 object_store = { version = "0.13.1", features = ["azure"] }

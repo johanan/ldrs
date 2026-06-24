@@ -14,6 +14,7 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+deadpool-postgres.workspace = true
 futures.workspace = true
 native-tls = { version = "0.2.18", features = ["vendored"] }
 postgres-native-tls.workspace = true

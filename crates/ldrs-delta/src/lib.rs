@@ -7,9 +7,8 @@ use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{DataType as DeltaDataType, StructField, StructType};
 use delta_kernel::{Engine, Snapshot, Version};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use ldrs_arrow::ArrowColumnTransformStrategy;
-use ldrs_parquet::{default_writer_props, write_parquet_split};
 use ldrs_storage::{base_or_relative_path, build_store};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::Serialize;
@@ -17,9 +16,11 @@ use uuid::Uuid;
 
 mod dv;
 mod merge;
+mod overwrite;
 mod stats;
 
 pub use merge::*;
+pub use overwrite::*;
 pub use stats::*;
 
 #[derive(Serialize)]
@@ -334,8 +335,17 @@ fn version_to_log_filename(version: Version) -> String {
     format!("{:020}.json", version)
 }
 
-const DEFAULT_MAX_ROWS: usize = 1_000_000;
-const DEFAULT_MAX_BYTES: usize = 128 * 1024 * 1024; // 128MB
+async fn cleanup_source_files(
+    store: &Arc<dyn ObjectStore>,
+    base_path: &object_store::path::Path,
+    source_files: &[(String, parquet::file::metadata::ParquetMetaData)],
+) {
+    for (filename, _) in source_files {
+        let path = base_path.clone().join(filename.as_str());
+        let _ = store.delete(&path).await;
+    }
+}
+
 const MAX_COMMIT_RETRIES: usize = 10;
 const MERGE_MAX_RETRIES: usize = 3;
 
@@ -393,62 +403,10 @@ where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
     ensure_table(table_path, &schema).await?;
-
-    let url = base_or_relative_path(table_path)?;
-    let (store, base_path, _) = build_store(&url)?;
-
-    let engine = build_engine(store.clone());
-
-    let files = write_parquet_split(
-        table_path,
-        schema.clone(),
-        transforms,
-        stream,
-        Some(max_rows.unwrap_or(DEFAULT_MAX_ROWS)),
-        Some(max_bytes.unwrap_or(DEFAULT_MAX_BYTES)),
-        |_| format!("{}.parquet", Uuid::new_v4()),
-        Some(default_writer_props()),
-    )
-    .await?;
-
-    let file_paths: Vec<_> = files
-        .iter()
-        .map(|(filename, _)| base_path.clone().join(filename.as_str()))
-        .collect();
-
-    let obj_metas =
-        futures::future::try_join_all(file_paths.iter().map(|path| store.head(path))).await?;
-
-    let adds = files
-        .iter()
-        .zip(obj_metas.iter())
-        .map(|((filename, metadata), obj_meta)| build_add(filename, metadata, obj_meta, &schema))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    for _attempt in 0..MAX_COMMIT_RETRIES {
-        let table_state = snapshot_table_state(engine.as_ref(), &url)?;
-        let (commit_body, next_version) = build_overwrite_commit(&table_state, &schema, &adds)?;
-        let log_path = base_path
-            .clone()
-            .join("_delta_log")
-            .clone()
-            .join(version_to_log_filename(next_version));
-
-        match store
-            .put_opts(
-                &log_path,
-                PutPayload::from(commit_body),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(object_store::Error::AlreadyExists { .. }) => continue,
-            Err(e) => return Err(e.into()),
-        }
+    let mut sink = DeltaOverwriteSink::new(table_path, schema, transforms, max_rows, max_bytes)?;
+    let mut stream = std::pin::pin!(stream);
+    while let Some(batch) = stream.next().await {
+        sink.write_batch(&batch?).await?;
     }
-    anyhow::bail!("failed to commit delta overwrite after {MAX_COMMIT_RETRIES} attempts")
+    sink.finish().await
 }
