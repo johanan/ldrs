@@ -33,8 +33,8 @@ pub fn param_keys_schema(_: &mut SchemaGenerator) -> Schema {
 fn usage_block() -> Value {
     json!({
         "yaml_config": "The schemas under `sources` and `destinations` describe the per-table block shape used inside `tables:` in YAML config files. The full YAML envelope is documented under `yaml_config`. Defaults are merged into each table block; later table-level values override.",
-        "run_command": "`ldrs run` accepts a single block. Three layers, top wins: first-class flags (--src/--dest/--name/--sql) > --opt key=value pairs > --config-inline YAML. --opt is flat string=string only; complex (nested/list) fields require --config-inline.",
-        "ld_command": "`ldrs ld --config <file>` loads a multi-table YAML config: each block under `tables:` runs in order, with `src_defaults`/`dest_defaults` merged into every block. `--select t1,t2` (comma-separated) runs only the named tables. A single `LDRS_SRC`/`LDRS_DEST` serves as the location for all tables; set `LDRS_SRC_<NAME>`/`LDRS_DEST_<NAME>` to point individual tables elsewhere (see env_vars for the full resolution chain).",
+        "run_command": "`ldrs run` accepts a single block (one source -> one destination, Arrow-pipeable). Three layers, top wins: first-class flags (--src/--dest/--name/--sql) > --opt key=value pairs > --config-inline YAML. --opt is flat string=string only; complex (nested/list) fields require --config-inline. A block is version-free: `version:`/`destinations:` apply only to multi-table config files (`ldrs ld`). Run `ldrs schema <kind>` to see a block's fields.",
+        "ld_command": "`ldrs ld --config <file>` runs a multi-table YAML config: each entry under `tables:` runs in order. Use `version: 2` for the nested `destinations:` form: one source fans out to many destinations. A top-level `destinations:` list is the shared default for tables that don't declare their own; `src_defaults` merges into each table's source block, and each table's `name`/`columns` are inherited into its destination blocks. `--select t1,t2` (comma-separated) runs only the named tables. A single `LDRS_SRC`/`LDRS_DEST` locates all tables; set `LDRS_SRC_<NAME>`/`LDRS_DEST_<NAME>` to point individual tables elsewhere (see env_vars). The flat single-`dest:` form (version 1) is deprecated.",
         "namespacing": "If a kind has a `namespace` field, that string is an optional prefix on any of its type-specific fields (e.g., `pg.merge_keys` and `merge_keys` are equivalent for pg). Universal block fields (`name`, `src`, `dest`) are never namespaced. Used to disambiguate when source and destination contribute overlapping field names to the same block.",
         "columns": "The `columns` field, when present on a destination kind, declares column transforms (rename/cast/projection). It is always a destination-side field, sources never accept `columns`. Run `ldrs schema columns` for the variant schema.",
         "param_keys": "Positional column types for a destination's prepared statement (currently pg.delete_insert's DELETE WHERE clause). Values come from `LDRS_PARAM_*` env vars, bound positionally in lexicographic order of the env-var name; the count of types here must match the count of bound values. When present, this overrides the per-position type hint from the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix. Run `ldrs schema columns` for the type variants.",
@@ -54,7 +54,7 @@ fn usage_block() -> Value {
             "snowflake_to_local_parquet": "LDRS_DEST=file:///tmp/probe ldrs run --src sf.query --dest pq --name probe --sql 'SELECT 1 AS x' --opt filename=probe.snappy.parquet",
             "pipe_arrow_to_duckdb": "ldrs run --src sf.query --dest arrow --name probe --sql 'SELECT 1 AS x' | duckdb -c \"INSTALL nanoarrow FROM community; LOAD nanoarrow; FROM read_arrow('/dev/stdin')\"",
             "pipe_arrow_to_pyarrow": "ldrs run --src sf.query --dest arrow --name probe --sql 'SELECT 1' | python3 -c 'import pyarrow.ipc, sys; print(pyarrow.ipc.open_stream(sys.stdin.buffer).read_all())'",
-            "parameterized_sf_query": "LDRS_PARAM_P1=42 LDRS_PARAM_P2=2026-01-01 ldrs run --src sf.query --dest pq --name probe --sql 'SELECT * FROM t WHERE org_id = ? AND created_at >= ?' --config-inline 'param_keys: [P1, P2]' --opt filename=probe.parquet — note: env vars bind positionally in lexicographic order of the name, so zero-pad past nine (P01..P10) since lex order sorts P10 between P1 and P2"
+            "parameterized_sf_query": "LDRS_PARAM_P1=42 LDRS_PARAM_P2=2026-01-01 ldrs run --src sf.query --dest pq --name probe --sql 'SELECT * FROM t WHERE org_id = ? AND created_at >= ?' --config-inline 'param_keys: [P1, P2]' --opt filename=probe.parquet Note: env vars bind positionally in lexicographic order of the name, so zero-pad past nine (P01..P10) since lex order sorts P10 between P1 and P2"
         }
     })
 }
@@ -151,7 +151,7 @@ pub fn build_yaml() -> Value {
     json!({
         "$defs": g.take_definitions(true),
         "yaml_config": yaml_config,
-        "note": "Per-table blocks under `tables:` are opaque here; their shape depends on the src/dest kind. See `ldrs schema <kind>`.",
+        "note": "Each entry under `tables:` is a source block; its destinations come from the table's or the top-level `destinations:` list (each entry a destination block). Block shapes are opaque here and depend on the src/dest kind: see `ldrs schema <kind>`.",
         "usage_ref": "ldrs schema usage",
     })
 }

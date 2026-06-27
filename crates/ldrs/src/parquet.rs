@@ -15,6 +15,10 @@ pub struct ParquetDestination {
     pub columns: Vec<ColumnSpec>,
     #[serde(default)]
     pub bloom_filters: Vec<Vec<String>>,
+    #[serde(default, alias = "pq.max_rows")]
+    pub max_rows: Option<usize>,
+    #[serde(default, alias = "pq.max_bytes")]
+    pub max_bytes: Option<usize>,
 }
 
 impl TryFrom<&Value> for ParquetDestination {
@@ -25,7 +29,9 @@ impl TryFrom<&Value> for ParquetDestination {
             .get("name")
             .and_then(|v| String::deserialize(v).ok())
             .ok_or_else(|| {
-                anyhow::anyhow!("Missing name for kind pq (see `ldrs schema pq` for required fields)")
+                anyhow::anyhow!(
+                    "Missing name for kind pq (see `ldrs schema pq` for required fields)"
+                )
             })?;
         let filename = value
             .get("pq.filename")
@@ -46,11 +52,25 @@ impl TryFrom<&Value> for ParquetDestination {
             .get("bloom_filters")
             .and_then(|b| Vec::<Vec<String>>::deserialize(b).ok())
             .unwrap_or_default();
+        let max_rows = value
+            .get("pq.max_rows")
+            .or(value.get("max_rows"))
+            .map(usize::deserialize)
+            .transpose()
+            .context("failed to parse max_rows for kind pq")?;
+        let max_bytes = value
+            .get("pq.max_bytes")
+            .or(value.get("max_bytes"))
+            .map(usize::deserialize)
+            .transpose()
+            .context("failed to parse max_bytes for kind pq")?;
         Ok(ParquetDestination {
             name,
             filename,
             columns,
             bloom_filters,
+            max_rows,
+            max_bytes,
         })
     }
 }
@@ -80,5 +100,32 @@ columns:
             msg.contains("columns"),
             "expected error to mention the columns context, got: {msg}"
         );
+    }
+
+    #[test]
+    fn try_from_parses_rotation_limits() {
+        // exercises both the `pq.`-prefixed alias and the bare key
+        let yaml = r#"
+name: foo
+pq.filename: "out/{{ name }}_{{ pad index 5 }}.parquet"
+pq.max_rows: 1000
+max_bytes: 2000
+"#;
+        let value: Value = serde_yaml::from_str(yaml).unwrap();
+        let dest = ParquetDestination::try_from(&value).unwrap();
+        assert_eq!(dest.max_rows, Some(1000));
+        assert_eq!(dest.max_bytes, Some(2000));
+    }
+
+    #[test]
+    fn try_from_rotation_limits_default_none() {
+        let yaml = r#"
+name: foo
+filename: out.parquet
+"#;
+        let value: Value = serde_yaml::from_str(yaml).unwrap();
+        let dest = ParquetDestination::try_from(&value).unwrap();
+        assert_eq!(dest.max_rows, None);
+        assert_eq!(dest.max_bytes, None);
     }
 }

@@ -5,7 +5,6 @@ use arrow::row::{RowConverter, SortField};
 use arrow_array::{cast::AsArray, types::Int64Type, ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use futures::{Stream, StreamExt};
-use ldrs_arrow::ArrowColumnTransformStrategy;
 use ldrs_parquet::{
     default_writer_props, read_parquet_metadata, stream_projected_parquet, with_bloom_filters,
     FileNamer, ParquetSink, ROW_NUMBER_COLUMN,
@@ -175,7 +174,6 @@ pub(crate) fn validate_no_null_keys(
 pub async fn merge_delta<S>(
     table_path: &str,
     schema: SchemaRef,
-    transforms: Vec<Option<ArrowColumnTransformStrategy>>,
     stream: S,
     merge_config: MergeConfig,
 ) -> Result<MergeStats, anyhow::Error>
@@ -183,7 +181,7 @@ where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
     ensure_table(table_path, &schema).await?;
-    let mut sink = DeltaMergeSink::new(table_path, schema, transforms, merge_config)?;
+    let mut sink = DeltaMergeSink::new(table_path, schema, merge_config)?;
     let mut stream = std::pin::pin!(stream);
     while let Some(batch) = stream.next().await {
         sink.write_batch(&batch?).await?;
@@ -208,7 +206,6 @@ impl DeltaMergeSink {
     pub fn new(
         table_path: &str,
         schema: SchemaRef,
-        transforms: Vec<Option<ArrowColumnTransformStrategy>>,
         merge_config: MergeConfig,
     ) -> Result<Self, anyhow::Error> {
         let url = base_or_relative_path(table_path)?;
@@ -222,7 +219,6 @@ impl DeltaMergeSink {
         let inner = ParquetSink::new(
             table_path,
             schema.clone(),
-            transforms,
             merge_config.max_rows,
             merge_config.max_bytes,
             namer,
@@ -727,7 +723,6 @@ fn find_candidate_target_files(
     Ok(candidate_files)
 }
 
-
 /// Walk the delta log in reverse, finding the latest `add` action for each path of interest.
 /// Returns a map from path to its current DV descriptor (only entries for paths that have a DV).
 /// Paths whose latest add had no DV are absent from the returned map.
@@ -851,8 +846,6 @@ mod tests {
     #[test]
     fn validate_no_null_keys_errors_on_unknown_key_name() {
         let schema = two_col_schema();
-        // An unknown merge key must return Err (not panic). No parquet metadata needed —
-        // the key-to-index resolution runs first.
         let err = validate_no_null_keys(&[], &["does_not_exist".to_string()], &schema)
             .expect_err("should error on unknown merge key");
         assert!(

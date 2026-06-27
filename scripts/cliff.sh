@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INCLUDE='crates/ldrs/**'
+INCLUDE='crates/**'
 CHANGELOG='crates/ldrs/CHANGELOG.md'
 
 NEXT=$(git-cliff --include-path "$INCLUDE" --unreleased --bumped-version)

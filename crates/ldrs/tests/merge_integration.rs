@@ -135,16 +135,9 @@ async fn test_merge_basic_int_key() {
     // Write target: ids 1..=1000 via overwrite
     let target = make_target_batch(1..1001);
     let target_stream = stream::iter(vec![Ok(target)]);
-    overwrite_delta(
-        &table_url,
-        schema.clone(),
-        vec![],
-        target_stream,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    overwrite_delta(&table_url, schema.clone(), target_stream, None, None)
+        .await
+        .unwrap();
 
     // Merge source: ids 501..=1500
     // 500 updates (501..=1000), 500 inserts (1001..=1500)
@@ -158,7 +151,7 @@ async fn test_merge_basic_int_key() {
         txn_config: TxnConfig::None,
     };
 
-    let stats = merge_delta(&table_url, schema.clone(), vec![], source_stream, config)
+    let stats = merge_delta(&table_url, schema.clone(), source_stream, config)
         .await
         .unwrap();
 
@@ -262,7 +255,7 @@ async fn test_merge_empty_table() {
         txn_config: TxnConfig::None,
     };
 
-    let stats = merge_delta(&table_url, schema.clone(), vec![], source_stream, config)
+    let stats = merge_delta(&table_url, schema.clone(), source_stream, config)
         .await
         .unwrap();
 
@@ -319,16 +312,9 @@ async fn test_merge_all_matches() {
     // Target: ids 1..=1000
     let target = make_target_batch(1..1001);
     let target_stream = stream::iter(vec![Ok(target)]);
-    overwrite_delta(
-        &table_url,
-        schema.clone(),
-        vec![],
-        target_stream,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    overwrite_delta(&table_url, schema.clone(), target_stream, None, None)
+        .await
+        .unwrap();
 
     // Source: same ids 1..=1000 all updates, no inserts
     let source = make_source_batch(1..1001);
@@ -341,7 +327,7 @@ async fn test_merge_all_matches() {
         txn_config: TxnConfig::None,
     };
 
-    let stats = merge_delta(&table_url, schema.clone(), vec![], source_stream, config)
+    let stats = merge_delta(&table_url, schema.clone(), source_stream, config)
         .await
         .unwrap();
 
@@ -399,7 +385,6 @@ async fn test_merge_with_existing_dvs() {
     overwrite_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(target)]),
         None,
         None,
@@ -420,7 +405,6 @@ async fn test_merge_with_existing_dvs() {
     let stats1 = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(first_source)]),
         config.clone(),
     )
@@ -435,7 +419,6 @@ async fn test_merge_with_existing_dvs() {
     let stats2 = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(second_source)]),
         config.clone(),
     )
@@ -493,7 +476,6 @@ async fn test_merge_string_key() {
     overwrite_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(target)]),
         None,
         None,
@@ -515,7 +497,6 @@ async fn test_merge_string_key() {
     let stats = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(source)]),
         config,
     )
@@ -564,7 +545,6 @@ async fn test_merge_timestamp_key() {
     overwrite_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(target)]),
         None,
         None,
@@ -584,7 +564,6 @@ async fn test_merge_timestamp_key() {
     let stats = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(source)]),
         config,
     )
@@ -626,7 +605,6 @@ async fn test_merge_composite_key() {
     overwrite_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(target)]),
         None,
         None,
@@ -648,7 +626,6 @@ async fn test_merge_composite_key() {
     let stats = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(source)]),
         config,
     )
@@ -690,7 +667,6 @@ async fn test_merge_txn_watermark_skip() {
     overwrite_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(target)]),
         None,
         None,
@@ -714,7 +690,6 @@ async fn test_merge_txn_watermark_skip() {
     let stats1 = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(source)]),
         config.clone(),
     )
@@ -734,7 +709,6 @@ async fn test_merge_txn_watermark_skip() {
     let stats2 = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(same_source)]),
         config.clone(),
     )
@@ -772,7 +746,6 @@ async fn test_merge_txn_processing_time_skip() {
     overwrite_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(target)]),
         None,
         None,
@@ -798,7 +771,6 @@ async fn test_merge_txn_processing_time_skip() {
     let stats1 = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(source)]),
         config.clone(),
     )
@@ -821,7 +793,6 @@ async fn test_merge_txn_processing_time_skip() {
     let stats2 = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(same_source)]),
         config.clone(),
     )
@@ -842,7 +813,6 @@ async fn test_merge_txn_processing_time_skip() {
     let stats3 = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(different_source)]),
         newer_config,
     )
@@ -880,7 +850,6 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
     overwrite_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(target)]),
         None,
         None,
@@ -924,7 +893,6 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
     let result = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(source)]),
         config,
     )
@@ -961,7 +929,6 @@ async fn test_merge_small_change_uses_inline_dv() {
     overwrite_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(target)]),
         None,
         None,
@@ -982,7 +949,6 @@ async fn test_merge_small_change_uses_inline_dv() {
     let stats = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(source)]),
         config,
     )
@@ -1049,7 +1015,6 @@ async fn test_merge_small_change_uses_inline_dv() {
     let stats2 = merge_delta(
         &table_url,
         schema.clone(),
-        vec![],
         stream::iter(vec![Ok(second_source)]),
         second_config,
     )

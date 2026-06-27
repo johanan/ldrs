@@ -1,8 +1,9 @@
 use arrow_array::RecordBatch;
-use ldrs_arrow::{ArrowColumnTransformStrategy, ColumnSpec, ColumnType};
+use ldrs_arrow::{ColumnSpec, ColumnType};
+use deadpool_postgres::Pool;
 use ldrs_postgres::{
-    build_pg_pool, execute_create_table, execute_create_temp_table, execute_merge,
-    execute_prepared_stmt, execute_sql, PgCopySink,
+    execute_create_table, execute_create_temp_table, execute_merge, execute_prepared_stmt,
+    execute_sql, PgCopySink,
 };
 use tokio_postgres::Client;
 
@@ -64,11 +65,10 @@ impl PgSink {
     /// Check out a connection, `BEGIN`, set the role, run the pre-load commands, and
     /// open the binary COPY.
     pub async fn open(
-        pg_url: &str,
+        pool: Pool,
         role: Option<String>,
         plan: PgPlan,
         final_cols: Vec<ColumnSpec>,
-        strategies: Vec<Option<ArrowColumnTransformStrategy>>,
         context: &LdrsExecutionContext<'_>,
         env_params: &[(String, String, Option<ColumnType>)],
     ) -> Result<Self, anyhow::Error> {
@@ -79,7 +79,6 @@ impl PgSink {
         } = plan;
         let load_table = context.render_template(&load_table)?;
 
-        let pool = build_pg_pool(pg_url)?;
         let conn = pool.get().await?;
         let prepared = async {
             conn.batch_execute("BEGIN").await?;
@@ -103,7 +102,7 @@ impl PgSink {
             return Err(e);
         }
 
-        let copy = PgCopySink::open(conn, &load_table, final_cols.clone(), strategies).await?;
+        let copy = PgCopySink::open(conn, &load_table, final_cols.clone()).await?;
         Ok(PgSink {
             copy,
             after_commands: after,

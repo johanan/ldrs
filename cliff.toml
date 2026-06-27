@@ -19,6 +19,10 @@ body = """
     {% for commit in commits %}
         - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
             {{ commit.message | upper_first }}\
+        {% if commit.body %}
+
+          {{ commit.body | trim | replace(from="\n", to="\n  ") }}
+        {% endif %}\
     {% endfor %}
 {% endfor %}\n
 """
@@ -33,10 +37,6 @@ split_commits = false
 tag_pattern = "v[0-9]*"
 sort_commits = "oldest"
 topo_order = false
-
-commit_preprocessors = [
-    { pattern = '\n[\s\S]*', replace = "" },
-]
 
 commit_parsers = [
     { message = "^Merge pull request",      skip = true },

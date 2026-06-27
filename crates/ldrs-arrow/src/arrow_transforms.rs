@@ -276,7 +276,7 @@ fn apply_custom_transform(
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| anyhow::anyhow!("Failed to downcast column to StringArray"))?;
-            Ok(string_to_uuid_array(string_arr))
+            Ok(string_to_uuid_array(string_arr)?)
         }
         ArrowCustomTransform::UuidToString => {
             let uuid_arr = col
@@ -301,19 +301,25 @@ fn apply_custom_transform(
     }
 }
 
-pub fn string_to_uuid_array(source: &StringArray) -> Arc<FixedSizeBinaryArray> {
+pub fn string_to_uuid_array(
+    source: &StringArray,
+) -> Result<Arc<FixedSizeBinaryArray>, anyhow::Error> {
     let num_rows = source.len();
     let mut values = vec![0u8; num_rows * 16];
 
     for i in 0..num_rows {
         if !source.is_null(i) {
-            let uuid = uuid::Uuid::parse_str(source.value(i)).unwrap();
+            let uuid = uuid::Uuid::parse_str(source.value(i))
+                .with_context(|| format!("invalid UUID at row {}: {:?}", i, source.value(i)))?;
             values[i * 16..(i + 1) * 16].copy_from_slice(uuid.as_bytes());
         }
     }
 
     let nulls = source.nulls().cloned();
-    Arc::new(FixedSizeBinaryArray::try_new(16, Buffer::from(values), nulls).unwrap())
+    Ok(Arc::new(
+        FixedSizeBinaryArray::try_new(16, Buffer::from(values), nulls)
+            .context("failed to build UUID FixedSizeBinaryArray")?,
+    ))
 }
 
 pub fn uuid_to_string_array(source: &FixedSizeBinaryArray) -> ArrayRef {

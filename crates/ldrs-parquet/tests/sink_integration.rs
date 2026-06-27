@@ -77,8 +77,7 @@ async fn sink_write_finish_single_file() {
     // The namer emits a stray leading slash; `join_relative` drops the empty leading
     // segment, so the file lands at the normalized path (not "%2F…" or "//…").
     let namer: FileNamer = Box::new(|i| Ok(format!("/part_{:05}.parquet", i)));
-    let mut sink =
-        ParquetSink::new(&dir, schema.clone(), Vec::new(), None, None, namer, None).unwrap();
+    let mut sink = ParquetSink::new(&dir, schema.clone(), None, None, namer, None).unwrap();
     sink.write_batch(&test_batch(&schema, 0, 3)).await.unwrap();
     sink.write_batch(&test_batch(&schema, 3, 2)).await.unwrap();
     let results = sink.finish().await.unwrap();
@@ -96,10 +95,11 @@ async fn sink_rotates_by_rows() {
     let dir = test_dir("rotate_rows");
 
     let mut sink =
-        ParquetSink::new(&dir, schema.clone(), Vec::new(), Some(2), None, indexed_namer(), None)
-            .unwrap();
+        ParquetSink::new(&dir, schema.clone(), Some(2), None, indexed_namer(), None).unwrap();
     for i in 0..3 {
-        sink.write_batch(&test_batch(&schema, i * 2, 2)).await.unwrap();
+        sink.write_batch(&test_batch(&schema, i * 2, 2))
+            .await
+            .unwrap();
     }
     let results = sink.finish().await.unwrap();
 
@@ -118,7 +118,7 @@ async fn sink_collision_check_rejects_constant_name_with_rotation() {
     let schema = test_schema();
     let dir = test_dir("collision");
 
-    let err = ParquetSink::new(&dir, schema, Vec::new(), Some(2), None, constant_namer(), None)
+    let err = ParquetSink::new(&dir, schema, Some(2), None, constant_namer(), None)
         .err()
         .expect("constant namer + rotation limit must fail at construct");
     assert!(
@@ -134,8 +134,7 @@ async fn sink_constant_name_without_rotation_is_fine() {
     let dir = test_dir("constant_ok");
 
     let mut sink =
-        ParquetSink::new(&dir, schema.clone(), Vec::new(), None, None, constant_namer(), None)
-            .unwrap();
+        ParquetSink::new(&dir, schema.clone(), None, None, constant_namer(), None).unwrap();
     sink.write_batch(&test_batch(&schema, 0, 4)).await.unwrap();
     let results = sink.finish().await.unwrap();
     assert_eq!(results.len(), 1);
@@ -149,8 +148,11 @@ async fn sink_namer_error_fails_at_construct() {
 
     let broken: FileNamer = Box::new(|_| Err(anyhow::anyhow!("render failed")));
     // even with no rotation limits, namer(0) runs at construct
-    let result = ParquetSink::new(&dir, schema, Vec::new(), None, None, broken, None);
-    assert!(result.is_err(), "broken template must fail before any data moves");
+    let result = ParquetSink::new(&dir, schema, None, None, broken, None);
+    assert!(
+        result.is_err(),
+        "broken template must fail before any data moves"
+    );
 }
 
 #[tokio::test]
@@ -159,8 +161,7 @@ async fn sink_skips_zero_row_batches() {
     let dir = test_dir("zero_rows");
 
     let mut sink =
-        ParquetSink::new(&dir, schema.clone(), Vec::new(), None, None, indexed_namer(), None)
-            .unwrap();
+        ParquetSink::new(&dir, schema.clone(), None, None, indexed_namer(), None).unwrap();
     let empty = RecordBatch::new_empty(schema.clone());
     sink.write_batch(&empty).await.unwrap();
     sink.write_batch(&test_batch(&schema, 0, 2)).await.unwrap();
@@ -178,10 +179,10 @@ async fn sink_empty_stream_writes_no_files() {
     let dir = test_dir("empty_stream");
 
     let mut sink =
-        ParquetSink::new(&dir, schema.clone(), Vec::new(), None, None, indexed_namer(), None)
-            .unwrap();
-    // a source can chunk "nothing" as one empty batch — same outcome as no batches
-    sink.write_batch(&RecordBatch::new_empty(schema)).await.unwrap();
+        ParquetSink::new(&dir, schema.clone(), None, None, indexed_namer(), None).unwrap();
+    sink.write_batch(&RecordBatch::new_empty(schema))
+        .await
+        .unwrap();
     let results = sink.finish().await.unwrap();
 
     assert!(results.is_empty());
@@ -194,9 +195,7 @@ async fn sink_finish_empty_writes_schema_only_marker() {
     let schema = test_schema();
     let dir = test_dir("marker");
 
-    let sink =
-        ParquetSink::new(&dir, schema.clone(), Vec::new(), None, None, indexed_namer(), None)
-            .unwrap();
+    let sink = ParquetSink::new(&dir, schema.clone(), None, None, indexed_namer(), None).unwrap();
     let results = sink.finish_empty().await.unwrap();
 
     assert_eq!(results.len(), 1);
@@ -212,8 +211,7 @@ async fn sink_finish_empty_rejects_written_rows() {
     let dir = test_dir("marker_misuse");
 
     let mut sink =
-        ParquetSink::new(&dir, schema.clone(), Vec::new(), None, None, indexed_namer(), None)
-            .unwrap();
+        ParquetSink::new(&dir, schema.clone(), None, None, indexed_namer(), None).unwrap();
     sink.write_batch(&test_batch(&schema, 0, 1)).await.unwrap();
     assert!(
         sink.finish_empty().await.is_err(),
@@ -227,8 +225,7 @@ async fn sink_abort_deletes_completed_files() {
     let dir = test_dir("abort");
 
     let mut sink =
-        ParquetSink::new(&dir, schema.clone(), Vec::new(), Some(2), None, indexed_namer(), None)
-            .unwrap();
+        ParquetSink::new(&dir, schema.clone(), Some(2), None, indexed_namer(), None).unwrap();
     // first batch completes a file via rotation, second leaves a writer in flight
     sink.write_batch(&test_batch(&schema, 0, 2)).await.unwrap();
     sink.write_batch(&test_batch(&schema, 2, 1)).await.unwrap();

@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.0] - 2026-06-27
+
+### Bug Fixes
+
+- *(ldrs-storage)* Regression on file://
+
+This started resolving to root instead. This is the fix and also
+pointing towards the evenutal usage which is to only use file:// for
+absolute paths and relative paths will be just strings. like rel/path or
+even just .
+
+
+### Features
+
+- *(sinks)* Multi-destination pipelines
+
+ldrs can now write the same source to multiple destinations in the same
+load. This comes with a new v2 config that is roughly the same.
+
+v1 configs will still parse and work, for now.
+
+
 ## [0.19.0] - 2026-06-24
 
 ### Features
