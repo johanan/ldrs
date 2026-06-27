@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use ldrs_arrow::ArrowColumnTransformStrategy;
 use ldrs_parquet::{default_writer_props, FileNamer, ParquetSink};
 use ldrs_storage::base_or_relative_path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
@@ -30,7 +29,6 @@ impl DeltaOverwriteSink {
     pub fn new(
         table_path: &str,
         schema: SchemaRef,
-        transforms: Vec<Option<ArrowColumnTransformStrategy>>,
         max_rows: Option<usize>,
         max_bytes: Option<usize>,
     ) -> Result<Self, anyhow::Error> {
@@ -39,7 +37,6 @@ impl DeltaOverwriteSink {
         let inner = ParquetSink::new(
             table_path,
             schema.clone(),
-            transforms,
             max_rows,
             max_bytes,
             namer,
@@ -65,7 +62,15 @@ impl DeltaOverwriteSink {
     /// removes with no adds, truncating the table.
     pub async fn finish(self) -> Result<(), anyhow::Error> {
         let files = self.inner.finish().await?;
-        match commit_overwrite(&self.store, &self.base_path, &self.url, &self.schema, &files).await {
+        match commit_overwrite(
+            &self.store,
+            &self.base_path,
+            &self.url,
+            &self.schema,
+            &files,
+        )
+        .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 cleanup_source_files(&self.store, &self.base_path, &files).await;

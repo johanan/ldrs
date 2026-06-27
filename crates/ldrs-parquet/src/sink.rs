@@ -1,6 +1,5 @@
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use ldrs_arrow::{transform_batch, ArrowColumnTransformStrategy};
 use ldrs_storage::{base_or_relative_path, build_store};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -22,7 +21,6 @@ pub struct ParquetSink {
     base_path: object_store::path::Path,
     props: WriterProperties,
     schema: SchemaRef,
-    transform_plan: Option<Vec<Option<ArrowColumnTransformStrategy>>>,
     max_rows: Option<usize>,
     max_bytes: Option<usize>,
     namer: FileNamer,
@@ -35,11 +33,9 @@ pub struct ParquetSink {
 }
 
 impl ParquetSink {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dir_path: &str,
         schema: SchemaRef,
-        transforms: Vec<Option<ArrowColumnTransformStrategy>>,
         max_rows: Option<usize>,
         max_bytes: Option<usize>,
         namer: FileNamer,
@@ -57,23 +53,16 @@ impl ParquetSink {
             anyhow::ensure!(
                 first != second,
                 "file name template produces the same name for consecutive files ({}); \
-                 rotation would overwrite it — add {{{{ index }}}} to the template",
+                 rotation would overwrite it. Add {{{{ index }}}} to the template",
                 first
             );
         }
-
-        let transform_plan = if transforms.iter().any(|s| s.is_some()) {
-            Some(transforms)
-        } else {
-            None
-        };
 
         Ok(ParquetSink {
             store,
             base_path,
             props: writer_props.unwrap_or_else(default_writer_props),
             schema,
-            transform_plan,
             max_rows,
             max_bytes,
             namer,
@@ -98,22 +87,11 @@ impl ParquetSink {
         &self.base_path
     }
 
-    /// One iteration of the split-writer loop: transform, write, rotate.
-    /// Zero-row batches are skipped so that "no rows" produces "no files"
-    /// regardless of how the source chunks an empty result.
+    /// Write a batch and rotate. Zero-row batches are skipped (no rows → no files).
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), anyhow::Error> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-
-        let transformed;
-        let batch = match &self.transform_plan {
-            Some(plan) => {
-                transformed = transform_batch(batch, plan, self.schema.clone())?;
-                &transformed
-            }
-            None => batch,
-        };
 
         if self.writer.is_none() {
             self.current_filename = (self.namer)(self.file_index)?;

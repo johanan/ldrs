@@ -298,8 +298,7 @@ async fn test_overwrite_delta() {
         .unwrap()
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
 
-    let transforms = vec![None; schema.fields().len()];
-    overwrite_delta(&table_url, schema.clone(), transforms, stream, None, None)
+    overwrite_delta(&table_url, schema.clone(), stream, None, None)
         .await
         .unwrap();
 
@@ -363,8 +362,7 @@ async fn test_overwrite_delta() {
         .unwrap()
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
 
-    let transforms2 = vec![None; schema.fields().len()];
-    overwrite_delta(&table_url, schema, transforms2, stream2, None, None)
+    overwrite_delta(&table_url, schema, stream2, None, None)
         .await
         .unwrap();
 

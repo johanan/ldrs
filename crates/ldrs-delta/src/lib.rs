@@ -8,7 +8,6 @@ use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{DataType as DeltaDataType, StructField, StructType};
 use delta_kernel::{Engine, Snapshot, Version};
 use futures::{Stream, StreamExt};
-use ldrs_arrow::ArrowColumnTransformStrategy;
 use ldrs_storage::{base_or_relative_path, build_store};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::Serialize;
@@ -394,7 +393,6 @@ fn build_overwrite_commit(
 pub async fn overwrite_delta<S>(
     table_path: &str,
     schema: SchemaRef,
-    transforms: Vec<Option<ArrowColumnTransformStrategy>>,
     stream: S,
     max_rows: Option<usize>,
     max_bytes: Option<usize>,
@@ -403,7 +401,7 @@ where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
     ensure_table(table_path, &schema).await?;
-    let mut sink = DeltaOverwriteSink::new(table_path, schema, transforms, max_rows, max_bytes)?;
+    let mut sink = DeltaOverwriteSink::new(table_path, schema, max_rows, max_bytes)?;
     let mut stream = std::pin::pin!(stream);
     while let Some(batch) = stream.next().await {
         sink.write_batch(&batch?).await?;

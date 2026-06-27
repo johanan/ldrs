@@ -138,9 +138,12 @@ pub fn get_env_values_by_keys<'a>(
 }
 
 handlebars_helper!(now_timestamp: | | chrono::prelude::Utc::now().timestamp() );
+// Zero-pad an integer to a fixed width: `{{ pad index 5 }}` with index 3 -> "00003".
+handlebars_helper!(pad: |value: i64, width: usize| format!("{value:0width$}"));
 
 pub fn setup_handlebars(handle_bars: &mut handlebars::Handlebars) -> () {
     handle_bars.register_helper("now_timestamp", Box::new(now_timestamp));
+    handle_bars.register_helper("pad", Box::new(pad));
     handle_bars.set_strict_mode(true);
 }
 
@@ -254,6 +257,21 @@ mod tests {
         let rfc = context.render_template("{{rfc3339}}").unwrap();
         assert_eq!(rfc, now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
         info!("rfc: {}", rfc);
+    }
+
+    #[test_log::test]
+    fn test_handlebars_pad() {
+        let mut hb = handlebars::Handlebars::new();
+        setup_handlebars(&mut hb);
+        let rendered = hb
+            .render_template("{{ pad index 5 }}", &json!({ "index": 3 }))
+            .unwrap();
+        assert_eq!(rendered, "00003");
+        // a value wider than the pad width is not truncated
+        let wide = hb
+            .render_template("{{ pad index 3 }}", &json!({ "index": 123456 }))
+            .unwrap();
+        assert_eq!(wide, "123456");
     }
 
     #[test_log::test]

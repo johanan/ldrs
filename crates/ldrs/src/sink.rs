@@ -4,7 +4,7 @@ use std::pin::pin;
 use arrow::ipc::writer::StreamWriter;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use futures::{StreamExt, TryStream, TryStreamExt};
+use futures::{future::join_all, StreamExt, TryStream, TryStreamExt};
 use ldrs_arrow::{transform_batch, ArrowColumnTransformStrategy};
 use ldrs_delta::{DeltaMergeSink, DeltaOverwriteSink};
 use ldrs_parquet::ParquetSink;
@@ -14,42 +14,18 @@ use crate::postgres::execute::PgSink;
 /// Streams Arrow record batches to `writer` as an Arrow IPC stream.
 pub struct ArrowStdoutSink<W: Write = Stdout> {
     writer: StreamWriter<BufWriter<W>>,
-    schema: SchemaRef,
-    transform_plan: Option<Vec<Option<ArrowColumnTransformStrategy>>>,
 }
 
 impl<W: Write> ArrowStdoutSink<W> {
-    pub fn new(
-        writer: W,
-        schema: SchemaRef,
-        transforms: Vec<Option<ArrowColumnTransformStrategy>>,
-    ) -> Result<Self, anyhow::Error> {
-        let transform_plan = if transforms.iter().any(|s| s.is_some()) {
-            Some(transforms)
-        } else {
-            None
-        };
+    pub fn new(writer: W, schema: SchemaRef) -> Result<Self, anyhow::Error> {
         let writer = StreamWriter::try_new_buffered(writer, &schema)?;
-        Ok(ArrowStdoutSink {
-            writer,
-            schema,
-            transform_plan,
-        })
+        Ok(ArrowStdoutSink { writer })
     }
 
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), anyhow::Error> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-
-        let transformed;
-        let batch = match &self.transform_plan {
-            Some(plan) => {
-                transformed = transform_batch(batch, plan, self.schema.clone())?;
-                &transformed
-            }
-            None => batch,
-        };
 
         self.writer.write(batch)?;
         Ok(())
@@ -93,9 +69,25 @@ impl Sink {
     }
 }
 
-/// Drive one source stream into every sink, sequential per batch: each batch is
-/// written to all sinks before the next is pulled
-pub async fn drive<S>(stream: S, sinks: &mut [Sink]) -> Result<(), anyhow::Error>
+/// A destination's arrow transform: the per-column cast strategies plus the resulting schema.
+pub type BatchTransform = (Vec<Option<ArrowColumnTransformStrategy>>, SchemaRef);
+
+/// How transforms are applied across a task's sinks. `None` (in either variant) is passthrough
+pub enum Transforms {
+    /// Every destination resolved the same transform: apply once per batch, fan to all sinks.
+    Shared(Option<BatchTransform>),
+    /// Destinations differ: apply each sink's own transform (positional with `sinks`) before
+    /// its write.
+    PerDest(Vec<Option<BatchTransform>>),
+}
+
+/// Drive one source stream into every sink, sequential per batch: each batch is transformed
+/// (once if shared, else per destination) and written to all sinks before the next is pulled.
+pub async fn drive<S>(
+    stream: S,
+    sinks: &mut [Sink],
+    transforms: &Transforms,
+) -> Result<(), anyhow::Error>
 where
     S: TryStream<Ok = RecordBatch, Error = anyhow::Error>,
 {
@@ -103,8 +95,43 @@ where
     let mut stream = pin!(stream);
     while let Some(batch) = stream.next().await {
         let batch = batch?;
-        for sink in sinks.iter_mut() {
-            sink.write_batch(&batch).await?;
+        match transforms {
+            Transforms::Shared(transform) => {
+                let transformed;
+                let out = match transform {
+                    Some((strategies, schema)) => {
+                        transformed = transform_batch(&batch, strategies, schema.clone())?;
+                        &transformed
+                    }
+                    None => &batch,
+                };
+                // Write the batch to every sink concurrently; `join_all` runs all to completion
+                join_all(sinks.iter_mut().map(|sink| sink.write_batch(out)))
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            Transforms::PerDest(per_dest) => {
+                // Materialize each sink's output up front so the concurrent writes can borrow it
+                let outs = per_dest
+                    .iter()
+                    .map(|transform| match transform {
+                        Some((strategies, schema)) => {
+                            transform_batch(&batch, strategies, schema.clone())
+                        }
+                        None => Ok(batch.clone()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                join_all(
+                    sinks
+                        .iter_mut()
+                        .zip(outs.iter())
+                        .map(|(sink, out)| sink.write_batch(out)),
+                )
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            }
         }
     }
     Ok(())
@@ -117,7 +144,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use arrow::ipc::reader::StreamReader;
-    use arrow_array::{Array, Int32Array, Int64Array};
+    use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field, Schema};
 
     #[test]
@@ -170,7 +197,7 @@ mod tests {
     fn writes_single_batch() {
         let schema = int_schema();
         let buf = SharedBuf::new();
-        let mut sink = ArrowStdoutSink::new(buf.clone(), schema.clone(), vec![None]).unwrap();
+        let mut sink = ArrowStdoutSink::new(buf.clone(), schema.clone()).unwrap();
         sink.write_batch(&int_batch(&schema, vec![1, 2, 3]))
             .unwrap();
         sink.finish().unwrap();
@@ -185,7 +212,7 @@ mod tests {
     fn preserves_multiple_batches_in_order() {
         let schema = int_schema();
         let buf = SharedBuf::new();
-        let mut sink = ArrowStdoutSink::new(buf.clone(), schema.clone(), vec![None]).unwrap();
+        let mut sink = ArrowStdoutSink::new(buf.clone(), schema.clone()).unwrap();
         sink.write_batch(&int_batch(&schema, vec![1, 2])).unwrap();
         sink.write_batch(&int_batch(&schema, vec![3])).unwrap();
         sink.finish().unwrap();
@@ -200,7 +227,7 @@ mod tests {
     fn empty_stream_is_schema_only() {
         let schema = int_schema();
         let buf = SharedBuf::new();
-        let sink = ArrowStdoutSink::new(buf.clone(), schema.clone(), vec![None]).unwrap();
+        let sink = ArrowStdoutSink::new(buf.clone(), schema.clone()).unwrap();
         sink.finish().unwrap();
 
         let (out_schema, batches) = read_back(buf.bytes());
@@ -212,7 +239,7 @@ mod tests {
     fn skips_zero_row_batches() {
         let schema = int_schema();
         let buf = SharedBuf::new();
-        let mut sink = ArrowStdoutSink::new(buf.clone(), schema.clone(), vec![None]).unwrap();
+        let mut sink = ArrowStdoutSink::new(buf.clone(), schema.clone()).unwrap();
         sink.write_batch(&RecordBatch::new_empty(schema.clone()))
             .unwrap();
         sink.finish().unwrap();
@@ -222,34 +249,10 @@ mod tests {
     }
 
     #[test]
-    fn applies_transform_to_output_schema() {
-        let source = int_schema();
-        let target: SchemaRef = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
-        let buf = SharedBuf::new();
-        let strategies = vec![Some(ArrowColumnTransformStrategy::ArrowCast {
-            target_type: DataType::Int64,
-        })];
-        let mut sink = ArrowStdoutSink::new(buf.clone(), target.clone(), strategies).unwrap();
-        sink.write_batch(&int_batch(&source, vec![7, 8])).unwrap();
-        sink.finish().unwrap();
-
-        let (out_schema, batches) = read_back(buf.bytes());
-        assert_eq!(out_schema.field(0).data_type(), &DataType::Int64);
-        assert_eq!(batches.len(), 1);
-        let col = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(col.value(0), 7);
-        assert_eq!(col.value(1), 8);
-    }
-
-    #[test]
     fn abort_is_a_noop() {
         let schema = int_schema();
         let buf = SharedBuf::new();
-        let mut sink = ArrowStdoutSink::new(buf.clone(), schema.clone(), vec![None]).unwrap();
+        let mut sink = ArrowStdoutSink::new(buf.clone(), schema.clone()).unwrap();
         sink.write_batch(&int_batch(&schema, vec![1])).unwrap();
         sink.abort();
         // No panic, nothing to assert beyond a clean return.

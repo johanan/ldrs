@@ -36,7 +36,7 @@ const wordmarks: Record<Font, string> = {
 const text = wordmarks[font];
 const lines = text.split("\n");
 
-// SVG sizing — monospace approximation. Real char width depends on the font
+// SVG sizing monospace approximation. Real char width depends on the font
 // the browser picks; this gets the viewBox close enough that the SVG scales
 // proportionally with the content.
 const lineHeight = 14;

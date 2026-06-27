@@ -2,6 +2,7 @@ pub mod config;
 pub mod field_validation;
 
 use std::{
+    collections::HashMap,
     io::{self, IsTerminal},
     pin::pin,
     sync::Arc,
@@ -10,6 +11,7 @@ use std::{
 use anyhow::Context;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
+use deadpool_postgres::Pool;
 use futures::Stream;
 use ldrs_arrow::{
     build_arrow_transform_strategy, build_source_and_target_schema, ArrowColumnTransformStrategy,
@@ -20,8 +22,8 @@ use ldrs_parquet::{
     builder_from_url, columnspec_from_parquet, default_writer_props, get_fields,
     with_bloom_filters, FileNamer, ParquetSink,
 };
-use ldrs_postgres::check_for_role;
-use ldrs_storage::{base_or_relative_path, ensure_trailing_slash};
+use ldrs_postgres::{build_pg_pool, check_for_role};
+use ldrs_storage::join_into_url;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -31,13 +33,12 @@ use url::Url;
 use crate::{
     delta::{DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
     ldrs_config::config::{
-        merge_with_defaults, parse_dest, parse_src, LdrsConfig, LdrsDestination, LdrsParsedConfig,
-        LdrsSource,
+        parse_table, validate_configs, LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource,
     },
     ldrs_env::{collect_params, collect_vars_by_prefix, setup_handlebars, LdrsExecutionContext},
     ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource, SnowflakeConnection},
     postgres::{execute::PgSink, postgres_destination::split_pg_plan},
-    sink::{drive, ArrowStdoutSink, Sink},
+    sink::{drive, ArrowStdoutSink, BatchTransform, Sink, Transforms},
 };
 
 enum StreamType {
@@ -216,27 +217,16 @@ pub fn parse_yaml_config(
     let config: LdrsConfig =
         serde_yaml::from_str(config_string).with_context(|| "Could not parse the config")?;
 
-    let src_default = config.src.or(infer_env_type("LDRS_SRC", ldrs_env));
-    let dest_default = config.dest.or(infer_env_type("LDRS_DEST", ldrs_env));
+    let src_default = config.src.clone().or(infer_env_type("LDRS_SRC", ldrs_env));
+    let dest_default = config
+        .dest
+        .clone()
+        .or(infer_env_type("LDRS_DEST", ldrs_env));
 
     config
         .tables
-        .into_iter()
-        .map(|t| {
-            let raw_block = t.clone();
-            let src = parse_src(
-                merge_with_defaults(&config.src_defaults, t.clone()),
-                &src_default,
-            )?;
-            let dest = parse_dest(merge_with_defaults(&config.dest_defaults, t), &dest_default)?;
-            let unknown_keys =
-                crate::ldrs_config::config::find_unknown_block_keys(&raw_block, &src, &dest);
-            Ok(LdrsParsedConfig {
-                src,
-                dest,
-                unknown_keys,
-            })
-        })
+        .iter()
+        .map(|t| parse_table(t.clone(), &config, &src_default, &dest_default))
         .collect::<Result<Vec<_>, anyhow::Error>>()
 }
 
@@ -259,7 +249,11 @@ pub async fn execute_configs(
     };
     debug!("Tasks to be run {:?}", filtered_tasks);
 
+    validate_configs(&filtered_tasks)?;
+
     let exec_env = ExecutionEnv::create(ldrs_env);
+    // One connection pool per database URL, shared across every task for the whole run.
+    let mut pg_pools: HashMap<String, Pool> = HashMap::new();
     let total_tasks = filtered_tasks.len();
     for (i, task) in filtered_tasks.into_iter().enumerate() {
         let task_start = std::time::Instant::now();
@@ -296,6 +290,7 @@ pub async fn execute_configs(
             &exec_env.handlebars_vars,
             &exec_env.typed_params,
             cloud_io_rt,
+            &mut pg_pools,
         )
         .await?;
         let task_end = std::time::Instant::now();
@@ -312,6 +307,7 @@ pub async fn execute_task(
     handlebars_vars: &[(String, String)],
     env_params: &[(String, String, Option<ColumnType>)],
     cloud_io_rt: &tokio::runtime::Handle,
+    pg_pools: &mut HashMap<String, Pool>,
 ) -> Result<(), anyhow::Error> {
     let (src, context) = match task.src {
         LdrsSource::File(file) => {
@@ -320,10 +316,9 @@ pub async fn execute_task(
             // if the filename is not provided, use the name as the filename
             let file_name = file.filename.as_deref().unwrap_or(file.name.as_str());
             let src_value = get_src_url(ldrs_env, &file.name, "file")?;
-            // render the filename if it has tokens in the path
-            let joined =
-                ldrs_context.render_template(&format!("{}{}", src_value.1.as_str(), file_name))?;
-            let src_url = base_or_relative_path(&joined)?;
+            // render the filename template, then join it onto the source base
+            let file_name = ldrs_context.render_template(file_name)?;
+            let src_url = join_into_url(src_value.1.as_str(), &file_name)?;
             let builder = builder_from_url(src_url.clone(), cloud_io_rt.clone()).await?;
 
             let schema = builder.schema().clone();
@@ -376,16 +371,26 @@ pub async fn execute_task(
 
     match src.schema {
         Some(schema) => {
-            let mut sinks = build_sinks(
-                vec![task.dest],
+            // Matching destinations share one transform; otherwise each casts its own.
+            let shared = all_columns_match(&task.dests);
+            let built = build_sinks(
+                task.dests,
                 &src.source_cols,
                 &schema,
                 &context,
                 ldrs_env,
                 env_params,
+                pg_pools,
             )
             .await?;
-            match drive(src.stream_type, &mut sinks).await {
+            let (mut sinks, per_dest): (Vec<Sink>, Vec<Option<BatchTransform>>) =
+                built.into_iter().unzip();
+            let transforms = if shared {
+                Transforms::Shared(per_dest.into_iter().next().flatten())
+            } else {
+                Transforms::PerDest(per_dest)
+            };
+            match drive(src.stream_type, &mut sinks, &transforms).await {
                 Ok(()) => finish_all(sinks, &context, env_params).await,
                 Err(e) => {
                     abort_all(sinks).await;
@@ -409,8 +414,26 @@ pub async fn execute_task(
     Ok(())
 }
 
-/// Build one sink per destination, ready to receive batches. Each arm resolves its
-/// destination config and constructs the engine sink
+/// Whether every destination resolved to the same column specs.
+/// If they all match it is the same transforms as the source columns are the same as well.
+fn all_columns_match(dests: &[LdrsDestination]) -> bool {
+    dests.len() > 1 && dests.windows(2).all(|w| w[0].columns() == w[1].columns())
+}
+
+/// Get the pool for `url` from the registry, building and caching it on first use. Returns a
+/// clone of the cached pool.
+fn pool_for(pools: &mut HashMap<String, Pool>, url: &str) -> Result<Pool, anyhow::Error> {
+    if let Some(pool) = pools.get(url) {
+        return Ok(pool.clone());
+    }
+    let pool = build_pg_pool(url)?;
+    pools.insert(url.to_string(), pool.clone());
+    Ok(pool)
+}
+
+/// Build one sink per destination, paired with the transform it needs (the executor owns
+/// the cast; sinks are passthrough writers). Aborts already-built sinks if a later one
+/// fails to construct.
 pub async fn build_sinks(
     dests: Vec<LdrsDestination>,
     source_cols: &[ColumnSpec],
@@ -418,18 +441,44 @@ pub async fn build_sinks(
     context: &LdrsExecutionContext<'_>,
     ldrs_env: &[(String, String)],
     env_params: &[(String, String, Option<ColumnType>)],
-) -> Result<Vec<Sink>, anyhow::Error> {
-    let mut sinks = Vec::with_capacity(dests.len());
+    pg_pools: &mut HashMap<String, Pool>,
+) -> Result<Vec<(Sink, Option<BatchTransform>)>, anyhow::Error> {
+    let mut built = Vec::with_capacity(dests.len());
     for dest in dests {
-        match build_one(dest, source_cols, schema, context, ldrs_env, env_params).await {
-            Ok(sink) => sinks.push(sink),
+        match build_one(dest, source_cols, schema, context, ldrs_env, env_params, pg_pools).await {
+            Ok(pair) => built.push(pair),
             Err(e) => {
-                abort_all(sinks).await;
+                abort_all(built.into_iter().map(|(sink, _)| sink).collect()).await;
                 return Err(e);
             }
         }
     }
-    Ok(sinks)
+    Ok(built)
+}
+
+/// Resolve a destination's column specs into its target columns, output schema, and the
+/// transform the executor will run (`None` when no cast is needed).
+fn resolve_transform(
+    source_cols: &[ColumnSpec],
+    columns: Vec<ColumnSpec>,
+    schema: &SchemaRef,
+) -> Result<(Vec<ColumnSpec>, SchemaRef, Option<BatchTransform>), anyhow::Error> {
+    let (target_cols, strategies) = column_helper(source_cols.to_vec(), columns, schema)?;
+    if strategies.iter().any(|s| s.is_some()) {
+        let out_schema = Arc::new(Schema::new(
+            target_cols
+                .iter()
+                .map(|col| col.to_arrow_field())
+                .collect::<Vec<_>>(),
+        ));
+        Ok((
+            target_cols,
+            out_schema.clone(),
+            Some((strategies, out_schema)),
+        ))
+    } else {
+        Ok((target_cols, schema.clone(), None))
+    }
 }
 
 async fn build_one(
@@ -439,7 +488,8 @@ async fn build_one(
     context: &LdrsExecutionContext<'_>,
     ldrs_env: &[(String, String)],
     env_params: &[(String, String, Option<ColumnType>)],
-) -> Result<Sink, anyhow::Error> {
+    pg_pools: &mut HashMap<String, Pool>,
+) -> Result<(Sink, Option<BatchTransform>), anyhow::Error> {
     match dest {
         LdrsDestination::Pg(pg_dest) => {
             let dest_value = get_dest_url(ldrs_env, pg_dest.get_name(), "pg")?;
@@ -453,47 +503,30 @@ async fn build_one(
             )
             .map(|(_, v)| v.to_string()));
             let plan = split_pg_plan(pg_dest.to_pg_commands())?;
-            let (target_cols, strategies) =
-                column_helper(source_cols.to_vec(), pg_dest.get_columns(), schema)?;
-            let pg = PgSink::open(
-                &pg_url,
-                role,
-                plan,
-                target_cols,
-                strategies,
-                context,
-                env_params,
-            )
-            .await?;
-            Ok(Sink::Pg(pg))
+            // PG keeps `target_cols` for COPY encoding; the cast runs in the executor.
+            let (target_cols, _out_schema, transform) =
+                resolve_transform(source_cols, pg_dest.get_columns(), schema)?;
+            let pool = pool_for(pg_pools, &pg_url)?;
+            let pg = PgSink::open(pool, role, plan, target_cols, context, env_params).await?;
+            Ok((Sink::Pg(pg), transform))
         }
         LdrsDestination::Pq(parq) => {
             let dest_value = get_dest_url(ldrs_env, &parq.name, "pq")?;
-            let dest_value = ensure_trailing_slash(dest_value.1.as_str());
-            let handled_filename = context.render_template(&parq.filename)?;
-            let (target_cols, strategies) =
-                column_helper(source_cols.to_vec(), parq.columns, schema)?;
-            let out_schema = if strategies.iter().any(|s| s.is_some()) {
-                let fields = target_cols
-                    .iter()
-                    .map(|col| col.to_arrow_field())
-                    .collect::<Vec<_>>();
-                Arc::new(Schema::new(fields))
-            } else {
-                schema.clone()
-            };
+            let (_target_cols, out_schema, transform) =
+                resolve_transform(source_cols, parq.columns, schema)?;
             let props = with_bloom_filters(default_writer_props(), parq.bloom_filters);
-            let namer: FileNamer = Box::new(move |_| Ok(handled_filename.clone()));
+            let mut namer_hb = handlebars::Handlebars::new();
+            setup_handlebars(&mut namer_hb);
+            let namer = build_index_namer(namer_hb, &context.context, &parq.filename);
             let sink = ParquetSink::new(
-                &dest_value,
+                &dest_value.1,
                 out_schema,
-                strategies,
-                None,
-                None,
+                parq.max_rows,
+                parq.max_bytes,
                 namer,
                 Some(props),
             )?;
-            Ok(Sink::Pq(sink))
+            Ok((Sink::Pq(sink), transform))
         }
         LdrsDestination::Delta(delta_dest) => {
             let (name, columns) = match &delta_dest {
@@ -502,30 +535,16 @@ async fn build_one(
             };
             let dest_value = get_dest_url(ldrs_env, &name, "delta")?;
             let storage_url = dest_value.1.strip_prefix("delta+").unwrap_or(&dest_value.1);
-            let storage_url = ensure_trailing_slash(storage_url);
-            let table_path = ensure_trailing_slash(&format!("{}{}", storage_url, name));
-            let (target_cols, strategies) = column_helper(source_cols.to_vec(), columns, schema)?;
-            let out_schema = if strategies.iter().any(|s| s.is_some()) {
-                let fields = target_cols
-                    .iter()
-                    .map(|col| col.to_arrow_field())
-                    .collect::<Vec<_>>();
-                Arc::new(Schema::new(fields))
-            } else {
-                schema.clone()
-            };
+            let table_path = join_into_url(storage_url, &name)?.to_string();
+            let (_target_cols, out_schema, transform) =
+                resolve_transform(source_cols, columns, schema)?;
 
             ensure_table(&table_path, &out_schema).await?;
             match delta_dest {
                 DeltaDestination::Overwrite(o) => {
-                    let sink = DeltaOverwriteSink::new(
-                        &table_path,
-                        out_schema,
-                        strategies,
-                        o.max_rows,
-                        o.max_bytes,
-                    )?;
-                    Ok(Sink::DeltaOverwrite(sink))
+                    let sink =
+                        DeltaOverwriteSink::new(&table_path, out_schema, o.max_rows, o.max_bytes)?;
+                    Ok((Sink::DeltaOverwrite(sink), transform))
                 }
                 DeltaDestination::Merge(m) => {
                     let DeltaMerge {
@@ -557,29 +576,19 @@ async fn build_one(
                         max_bytes: m.common.max_bytes,
                         txn_config,
                     };
-                    let sink =
-                        DeltaMergeSink::new(&table_path, out_schema, strategies, merge_config)?;
-                    Ok(Sink::DeltaMerge(sink))
+                    let sink = DeltaMergeSink::new(&table_path, out_schema, merge_config)?;
+                    Ok((Sink::DeltaMerge(sink), transform))
                 }
             }
         }
         LdrsDestination::Arrow(arrow_dest) => {
-            let (target_cols, strategies) =
-                column_helper(source_cols.to_vec(), arrow_dest.columns, schema)?;
             if io::stdout().is_terminal() {
                 return Err(anyhow::Error::msg("Outputting Arrow IPC Stream to stdout is not supported in a terminal. Please redirect the output to a file or pipe it to another command."));
             }
-            let out_schema = if strategies.iter().any(|s| s.is_some()) {
-                let fields = target_cols
-                    .iter()
-                    .map(|col| col.to_arrow_field())
-                    .collect::<Vec<_>>();
-                Arc::new(Schema::new(fields))
-            } else {
-                schema.clone()
-            };
-            let sink = ArrowStdoutSink::new(io::stdout(), out_schema, strategies)?;
-            Ok(Sink::Arrow(sink))
+            let (_target_cols, out_schema, transform) =
+                resolve_transform(source_cols, arrow_dest.columns, schema)?;
+            let sink = ArrowStdoutSink::new(io::stdout(), out_schema)?;
+            Ok((Sink::Arrow(sink), transform))
         }
     }
 }
@@ -624,12 +633,50 @@ pub async fn abort_all(sinks: Vec<Sink>) {
     }
 }
 
+/// Build a Parquet file namer that renders `template` for each rotation with the rotation
+/// `index` bound into the context. Owns the handlebars and a copy of the context.
+fn build_index_namer(
+    handlebars: handlebars::Handlebars<'static>,
+    context: &serde_json::Value,
+    template: &str,
+) -> FileNamer {
+    let context = context.clone();
+    let template = template.to_string();
+    Box::new(move |index| {
+        let mut ctx = context.clone();
+        ctx["index"] = serde_json::json!(index);
+        handlebars.render_template(&template, &ctx).map_err(Into::into)
+    })
+}
+
 #[cfg(test)]
 mod tests {
 
     use ldrs_arrow::{ColumnType, TimeUnit};
 
     use super::*;
+
+    #[test]
+    fn pool_for_caches_pools_by_url() {
+        // build_pg_pool is lazy (no connection), so this exercises the registry offline.
+        let mut pools = HashMap::new();
+        let _ = pool_for(&mut pools, "postgresql://localhost/db1").unwrap();
+        let _ = pool_for(&mut pools, "postgresql://localhost/db1").unwrap();
+        assert_eq!(pools.len(), 1, "same URL reuses one pool");
+        let _ = pool_for(&mut pools, "postgresql://localhost/db2").unwrap();
+        assert_eq!(pools.len(), 2, "a different URL gets its own pool");
+    }
+
+    #[test]
+    fn index_namer_renders_padded_distinct_names() {
+        let mut hb = handlebars::Handlebars::new();
+        setup_handlebars(&mut hb);
+        let context = serde_json::json!({ "name": "public.users" });
+        let namer = build_index_namer(hb, &context, "out/{{ name }}_{{ pad index 5 }}.parquet");
+        assert_eq!(namer(0).unwrap(), "out/public.users_00000.parquet");
+        assert_eq!(namer(1).unwrap(), "out/public.users_00001.parquet");
+        assert_eq!(namer(42).unwrap(), "out/public.users_00042.parquet");
+    }
 
     #[test]
     fn test_get_src_url() {

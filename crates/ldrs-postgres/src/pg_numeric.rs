@@ -125,13 +125,7 @@ fn write_numeric(value: i128, scale: i16, out: &mut BytesMut) {
 mod tests {
     use super::*;
 
-    fn expected_bytes(
-        ndigits: u16,
-        weight: i16,
-        sign: u16,
-        scale: u16,
-        digits: &[i16],
-    ) -> Vec<u8> {
+    fn expected_bytes(ndigits: u16, weight: i16, sign: u16, scale: u16, digits: &[i16]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&ndigits.to_be_bytes());
         buf.extend_from_slice(&weight.to_be_bytes());
@@ -186,13 +180,7 @@ mod tests {
             .to_sql(&Type::NUMERIC, &mut buf)
             .unwrap();
             let expected = expected_bytes(*ndigits, *weight, *sign, *dscale, digits);
-            assert_eq!(
-                &buf[..],
-                &expected[..],
-                "value={}, scale={}",
-                value,
-                scale
-            );
+            assert_eq!(&buf[..], &expected[..], "value={}, scale={}", value, scale);
         }
     }
 }

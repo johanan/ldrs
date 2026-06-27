@@ -1,11 +1,9 @@
 use std::pin::Pin;
-use std::sync::Arc;
 
 use anyhow::Context;
 use arrow_array::RecordBatch;
-use arrow_schema::{Schema, SchemaRef};
 use deadpool_postgres::Object;
-use ldrs_arrow::{transform_batch, ArrowColumnTransformStrategy, ColumnSpec, TypedColumnAccessor};
+use ldrs_arrow::{ColumnSpec, TypedColumnAccessor};
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 
 use crate::extracted_values::{ColumnConverter, ExtractedValue};
@@ -17,7 +15,6 @@ pub struct PgCopySink {
     conn: Object,
     writer: Pin<Box<BinaryCopyInWriter>>,
     final_cols: Vec<ColumnSpec>,
-    transform: Option<(Vec<Option<ArrowColumnTransformStrategy>>, SchemaRef)>,
 }
 
 impl PgCopySink {
@@ -26,20 +23,7 @@ impl PgCopySink {
         conn: Object,
         load_table: &str,
         final_cols: Vec<ColumnSpec>,
-        arrow_transforms: Vec<Option<ArrowColumnTransformStrategy>>,
     ) -> Result<Self, anyhow::Error> {
-        let transform = if arrow_transforms.iter().any(|s| s.is_some()) {
-            let target_schema = Arc::new(Schema::new(
-                final_cols
-                    .iter()
-                    .map(|col| col.to_arrow_field())
-                    .collect::<Vec<_>>(),
-            ));
-            Some((arrow_transforms, target_schema))
-        } else {
-            None
-        };
-
         let pg_types = final_cols
             .iter()
             .map(map_colspec_to_pg_type)
@@ -55,7 +39,6 @@ impl PgCopySink {
             conn,
             writer,
             final_cols,
-            transform,
         })
     }
 
@@ -63,15 +46,6 @@ impl PgCopySink {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-
-        let transformed;
-        let batch = match &self.transform {
-            Some((transforms, target_schema)) => {
-                transformed = transform_batch(batch, transforms, target_schema.clone())?;
-                &transformed
-            }
-            None => batch,
-        };
 
         let accessors: Vec<TypedColumnAccessor> = batch
             .columns()
