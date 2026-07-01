@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.1] - 2026-07-01
+
+### Bug Fixes
+
+- *(config)* Target and url lookups
+
+URL will correct check for shouty snake_case for env vars for
+destination url.
+
+target was added so that the landing place can be different from the
+source name.
+
+Types and structs added for finalize which will allow Lua to run over
+the results of what was completed.
+
+
 ## [0.20.0] - 2026-06-27
 
 ### Bug Fixes
