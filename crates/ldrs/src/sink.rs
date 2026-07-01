@@ -83,18 +83,21 @@ pub enum Transforms {
 
 /// Drive one source stream into every sink, sequential per batch: each batch is transformed
 /// (once if shared, else per destination) and written to all sinks before the next is pulled.
+/// Returns the total rows streamed.
 pub async fn drive<S>(
     stream: S,
     sinks: &mut [Sink],
     transforms: &Transforms,
-) -> Result<(), anyhow::Error>
+) -> Result<u64, anyhow::Error>
 where
     S: TryStream<Ok = RecordBatch, Error = anyhow::Error>,
 {
     let stream = stream.into_stream();
     let mut stream = pin!(stream);
+    let mut total_rows: u64 = 0;
     while let Some(batch) = stream.next().await {
         let batch = batch?;
+        total_rows += batch.num_rows() as u64;
         match transforms {
             Transforms::Shared(transform) => {
                 let transformed;
@@ -134,7 +137,7 @@ where
             }
         }
     }
-    Ok(())
+    Ok(total_rows)
 }
 
 #[cfg(test)]

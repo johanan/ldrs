@@ -8,5 +8,6 @@ pub mod ldrs_snowflake;
 pub mod lua_logic;
 pub mod parquet;
 pub mod path_pattern;
+pub mod phase;
 pub mod postgres;
 pub mod sink;

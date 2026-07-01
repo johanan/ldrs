@@ -432,6 +432,7 @@ mod tests {
         let dest = LdrsDestination::Delta(DeltaDestination::Merge(DeltaMerge {
             common: DeltaCommon {
                 name: String::new(),
+                target: None,
                 columns: Vec::new(),
                 max_rows: None,
                 max_bytes: None,
@@ -456,6 +457,7 @@ mod tests {
                 "max_rows",
                 "merge_keys",
                 "name",
+                "target",
                 "txn_mode",
                 "watermark_column",
             ]

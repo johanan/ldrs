@@ -53,6 +53,11 @@ impl DeltaOverwriteSink {
         })
     }
 
+    /// The Delta table root (data files and `_delta_log`).
+    pub fn base_path(&self) -> &object_store::path::Path {
+        &self.base_path
+    }
+
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), anyhow::Error> {
         self.inner.write_batch(batch).await
     }

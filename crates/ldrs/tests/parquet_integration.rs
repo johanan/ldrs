@@ -89,6 +89,7 @@ pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
         }),
         dests: vec![LdrsDestination::Pq(ParquetDestination {
             name: "public.users".into(),
+            target: None,
             filename: "tests/test_data/parquet_writes/public.users.written.snappy.parquet".into(),
             columns: Vec::new(),
             bloom_filters: Vec::new(),
@@ -122,6 +123,7 @@ filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
         })),
         dests: vec![LdrsDestination::Pq(ParquetDestination {
             name: "public.users".into(),
+            target: None,
             filename: "tests/test_data/parquet_writes/public.users.written.snappy.parquet".into(),
             columns: Vec::new(),
             bloom_filters: Vec::new(),
@@ -142,10 +144,11 @@ dest: pq
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
 dest_defaults:
-  pq.filename: parquet_writes/{{ name }}_roundtrip.snappy.parquet
+  pq.filename: parquet_writes/{{ target }}_roundtrip.snappy.parquet
 
 tables:
   - name: public.users
+    target: public.users_renamed
     bloom_filters: [[unique_id]]
     columns: [ { name: created, type: timestamptz, time_unit: Micros }]
   - name: public.numbers
@@ -163,7 +166,8 @@ tables:
         .build()
         .unwrap();
     let expected_files = vec![
-        fixture_str("parquet_writes/public.users_roundtrip.snappy.parquet"),
+        // `users` set an explicit `target`; `numbers` defaults to `name`
+        fixture_str("parquet_writes/public.users_renamed_roundtrip.snappy.parquet"),
         fixture_str("parquet_writes/public.numbers_roundtrip.snappy.parquet"),
     ];
     // delete before the test

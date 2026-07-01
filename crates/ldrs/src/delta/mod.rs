@@ -11,6 +11,8 @@ fn default_app_id() -> String {
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DeltaCommon {
     pub name: String,
+    #[serde(default)]
+    pub target: Option<String>,
     #[serde(default, alias = "delta.columns")]
     #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,

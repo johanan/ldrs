@@ -12,7 +12,7 @@ use anyhow::Context;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use deadpool_postgres::Pool;
-use futures::Stream;
+use futures::{future::join_all, Stream};
 use ldrs_arrow::{
     build_arrow_transform_strategy, build_source_and_target_schema, ArrowColumnTransformStrategy,
     ColumnSpec, ColumnType,
@@ -35,8 +35,11 @@ use crate::{
     ldrs_config::config::{
         parse_table, validate_configs, LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource,
     },
-    ldrs_env::{collect_params, collect_vars_by_prefix, setup_handlebars, LdrsExecutionContext},
+    ldrs_env::{
+        collect_params, collect_vars_by_prefix, setup_handlebars, shouty, LdrsExecutionContext,
+    },
     ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource, SnowflakeConnection},
+    phase::{DeltaStrategy, DestinationOutcome, FileWritten, PhaseOutput},
     postgres::{execute::PgSink, postgres_destination::split_pg_plan},
     sink::{drive, ArrowStdoutSink, BatchTransform, Sink, Transforms},
 };
@@ -67,6 +70,7 @@ struct LdrsSrcStream {
     stream_type: StreamType,
     source_cols: Vec<ColumnSpec>,
     cleanup_handle: Option<JoinHandle<Result<(), anyhow::Error>>>,
+    source_files: Option<Vec<String>>,
 }
 
 struct ExecutionEnv<'a> {
@@ -103,27 +107,37 @@ pub fn get_env_value<'a>(
 
 pub fn get_src_url<'a>(
     vars: &'a [(String, String)],
-    name: &str,
+    ident: &str,
     prefix: &str,
 ) -> Result<&'a (String, String), anyhow::Error> {
-    let fqn = format!("LDRS_SRC_{}", name);
+    // identity (raw, then screaming-snake for OS env), then kind, then the bare fallback
+    let raw = format!("LDRS_SRC_{}", ident);
+    let snake = format!("LDRS_SRC_{}", shouty(ident));
     let prefix_key = format!("LDRS_SRC_{}", prefix);
-    get_env_value(vars, &[&fqn, &prefix_key, "LDRS_SRC"]).ok_or_else(|| {
-        anyhow::anyhow!("No env var found for {} or {} or LDRS_SRC", fqn, prefix_key)
+    get_env_value(vars, &[&raw, &snake, &prefix_key, "LDRS_SRC"]).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No env var found for {}, {}, {}, or LDRS_SRC",
+            raw,
+            snake,
+            prefix_key
+        )
     })
 }
 
 pub fn get_dest_url<'a>(
     vars: &'a [(String, String)],
-    name: &str,
+    ident: &str,
     prefix: &str,
 ) -> Result<&'a (String, String), anyhow::Error> {
-    let fqn = format!("LDRS_DEST_{}", name);
+    // identity (raw, then screaming-snake for OS env), then kind, then the bare fallback
+    let raw = format!("LDRS_DEST_{}", ident);
+    let snake = format!("LDRS_DEST_{}", shouty(ident));
     let prefix_key = format!("LDRS_DEST_{}", prefix);
-    get_env_value(vars, &[&fqn, &prefix_key, "LDRS_DEST"]).ok_or_else(|| {
+    get_env_value(vars, &[&raw, &snake, &prefix_key, "LDRS_DEST"]).ok_or_else(|| {
         anyhow::anyhow!(
-            "No env var found for {} or {} or LDRS_DEST",
-            fqn,
+            "No env var found for {}, {}, {}, or LDRS_DEST",
+            raw,
+            snake,
             prefix_key
         )
     })
@@ -283,7 +297,7 @@ pub async fn execute_configs(
             }
         }
         info!("Running task: {}/{}", i + 1, total_tasks);
-        execute_task(
+        let rows = execute_task(
             task,
             exec_env.ldrs_env,
             &exec_env.handlebars,
@@ -294,7 +308,11 @@ pub async fn execute_configs(
         )
         .await?;
         let task_end = std::time::Instant::now();
-        info!("Task time: {:?}", task_end - task_start);
+        info!(
+            rows,
+            elapsed_ms = (task_end - task_start).as_millis(),
+            "Task completed"
+        );
     }
 
     Ok(())
@@ -308,7 +326,8 @@ pub async fn execute_task(
     env_params: &[(String, String, Option<ColumnType>)],
     cloud_io_rt: &tokio::runtime::Handle,
     pg_pools: &mut HashMap<String, Pool>,
-) -> Result<(), anyhow::Error> {
+) -> Result<Option<u64>, anyhow::Error> {
+    let name = task.src.name().to_string();
     let (src, context) = match task.src {
         LdrsSource::File(file) => {
             let ldrs_context =
@@ -338,6 +357,7 @@ pub async fn execute_task(
                     stream_type: StreamType::Parquet(stream),
                     source_cols,
                     cleanup_handle: None,
+                    source_files: Some(vec![src_url.to_string()]),
                 },
                 ldrs_context,
             )
@@ -363,13 +383,14 @@ pub async fn execute_task(
                     stream_type: StreamType::Receiver(arrow_stream.batch_stream),
                     source_cols: vec![],
                     cleanup_handle: Some(arrow_stream.command_handle),
+                    source_files: None,
                 },
                 ldrs_context,
             )
         }
     };
 
-    match src.schema {
+    let rows = match src.schema {
         Some(schema) => {
             // Matching destinations share one transform; otherwise each casts its own.
             let shared = all_columns_match(&task.dests);
@@ -391,7 +412,29 @@ pub async fn execute_task(
                 Transforms::PerDest(per_dest)
             };
             match drive(src.stream_type, &mut sinks, &transforms).await {
-                Ok(()) => finish_all(sinks, &context, env_params).await,
+                Ok(rows) => {
+                    let destinations = finish_all(sinks, env_params).await?;
+                    let phase = PhaseOutput {
+                        name,
+                        source_files: src.source_files,
+                        success: destinations.iter().all(|d| d.succeeded()),
+                        rows,
+                        destinations,
+                    };
+                    debug!("finalize phase output: {:?}", phase);
+                    match phase.success {
+                        true => Ok(Some(rows)),
+                        false => {
+                            let failures = phase
+                                .destinations
+                                .iter()
+                                .filter_map(|d| d.status().err().map(|e| format!("{e:#}")))
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            Err(anyhow::anyhow!("load failed: {failures}"))
+                        }
+                    }
+                }
                 Err(e) => {
                     abort_all(sinks).await;
                     Err(e)
@@ -400,7 +443,7 @@ pub async fn execute_task(
         }
         None => {
             warn!("No schema found, most likely the load failed or no Arrow Record Batches were produced.");
-            Ok(())
+            Ok(None)
         }
     }?;
 
@@ -411,7 +454,7 @@ pub async fn execute_task(
             Err(e) => Err(anyhow::anyhow!("ldrs-sf task panicked: {}", e)),
         }?
     }
-    Ok(())
+    Ok(rows)
 }
 
 /// Whether every destination resolved to the same column specs.
@@ -445,7 +488,17 @@ pub async fn build_sinks(
 ) -> Result<Vec<(Sink, Option<BatchTransform>)>, anyhow::Error> {
     let mut built = Vec::with_capacity(dests.len());
     for dest in dests {
-        match build_one(dest, source_cols, schema, context, ldrs_env, env_params, pg_pools).await {
+        match build_one(
+            dest,
+            source_cols,
+            schema,
+            context,
+            ldrs_env,
+            env_params,
+            pg_pools,
+        )
+        .await
+        {
             Ok(pair) => built.push(pair),
             Err(e) => {
                 abort_all(built.into_iter().map(|(sink, _)| sink).collect()).await;
@@ -492,12 +545,29 @@ async fn build_one(
 ) -> Result<(Sink, Option<BatchTransform>), anyhow::Error> {
     match dest {
         LdrsDestination::Pg(pg_dest) => {
-            let dest_value = get_dest_url(ldrs_env, pg_dest.get_name(), "pg")?;
+            let resolved_target =
+                context.render_template(pg_dest.get_target().unwrap_or(pg_dest.get_name()))?;
+            // PG needs a schema-qualified identity for its staging/rename flow.
+            let (pg_schema, pg_table) = resolved_target.split_once('.').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pg destination requires a schema-qualified target, got '{resolved_target}'"
+                )
+            })?;
+            let load_table_name = format!("{}_{}", pg_table, uuid::Uuid::new_v4().simple());
+            let load_table = format!("{pg_schema}.{load_table_name}");
+            let pg_ctx = context.with_vars(&[
+                ("target", &resolved_target),
+                ("schema", pg_schema),
+                ("table", pg_table),
+                ("load_table", &load_table),
+                ("load_table_name", &load_table_name),
+            ]);
+            let dest_value = get_dest_url(ldrs_env, &resolved_target, "pg")?;
             let (pg_url, role) = check_for_role(dest_value.1.as_str())?;
             let role = role.or(get_env_value(
                 ldrs_env,
                 &[
-                    &format!("LDRS_PG_ROLE_{}", pg_dest.get_name()),
+                    &format!("LDRS_PG_ROLE_{}", shouty(&resolved_target)),
                     "LDRS_PG_ROLE",
                 ],
             )
@@ -507,17 +577,29 @@ async fn build_one(
             let (target_cols, _out_schema, transform) =
                 resolve_transform(source_cols, pg_dest.get_columns(), schema)?;
             let pool = pool_for(pg_pools, &pg_url)?;
-            let pg = PgSink::open(pool, role, plan, target_cols, context, env_params).await?;
+            let pg = PgSink::open(
+                pool,
+                role,
+                plan,
+                target_cols,
+                resolved_target,
+                &pg_ctx,
+                env_params,
+            )
+            .await?;
             Ok((Sink::Pg(pg), transform))
         }
         LdrsDestination::Pq(parq) => {
-            let dest_value = get_dest_url(ldrs_env, &parq.name, "pq")?;
+            let resolved_target =
+                context.render_template(parq.target.as_deref().unwrap_or(&parq.name))?;
+            let dest_ctx = context.with_vars(&[("target", &resolved_target)]);
+            let dest_value = get_dest_url(ldrs_env, &resolved_target, "pq")?;
             let (_target_cols, out_schema, transform) =
                 resolve_transform(source_cols, parq.columns, schema)?;
             let props = with_bloom_filters(default_writer_props(), parq.bloom_filters);
             let mut namer_hb = handlebars::Handlebars::new();
             setup_handlebars(&mut namer_hb);
-            let namer = build_index_namer(namer_hb, &context.context, &parq.filename);
+            let namer = build_index_namer(namer_hb, &dest_ctx.context, &parq.filename);
             let sink = ParquetSink::new(
                 &dest_value.1,
                 out_schema,
@@ -529,13 +611,20 @@ async fn build_one(
             Ok((Sink::Pq(sink), transform))
         }
         LdrsDestination::Delta(delta_dest) => {
-            let (name, columns) = match &delta_dest {
-                DeltaDestination::Overwrite(c) => (c.name.clone(), c.columns.clone()),
-                DeltaDestination::Merge(m) => (m.common.name.clone(), m.common.columns.clone()),
+            let (resolved_target, columns) = match &delta_dest {
+                DeltaDestination::Overwrite(c) => (
+                    context.render_template(c.target.as_deref().unwrap_or(&c.name))?,
+                    c.columns.clone(),
+                ),
+                DeltaDestination::Merge(m) => (
+                    context
+                        .render_template(m.common.target.as_deref().unwrap_or(&m.common.name))?,
+                    m.common.columns.clone(),
+                ),
             };
-            let dest_value = get_dest_url(ldrs_env, &name, "delta")?;
+            let dest_value = get_dest_url(ldrs_env, &resolved_target, "delta")?;
             let storage_url = dest_value.1.strip_prefix("delta+").unwrap_or(&dest_value.1);
-            let table_path = join_into_url(storage_url, &name)?.to_string();
+            let table_path = join_into_url(storage_url, &resolved_target)?.to_string();
             let (_target_cols, out_schema, transform) =
                 resolve_transform(source_cols, columns, schema)?;
 
@@ -568,7 +657,8 @@ async fn build_one(
                             batch_version,
                         }),
                     };
-                    let txn_config = resolve_txn_config(txn, context)?;
+                    let dest_ctx = context.with_vars(&[("target", &resolved_target)]);
+                    let txn_config = resolve_txn_config(txn, &dest_ctx)?;
                     let merge_config = MergeConfig {
                         merge_keys,
                         allow_null_keys,
@@ -593,30 +683,80 @@ async fn build_one(
     }
 }
 
-/// Finish every sink after a successful stream.
+/// Finish every sink after a successful stream, recording each one's outcome. Sinks finish
+/// concurrently; each commit is independent, so one failure does not stop the others.
 pub async fn finish_all(
     sinks: Vec<Sink>,
-    context: &LdrsExecutionContext<'_>,
     env_params: &[(String, String, Option<ColumnType>)],
-) -> Result<(), anyhow::Error> {
-    for sink in sinks {
-        match sink {
-            Sink::Pg(pg) => pg.commit(context, env_params).await?,
-            Sink::Pq(s) => {
-                s.finish().await?;
-            }
-            Sink::DeltaOverwrite(s) => {
-                s.finish().await?;
-            }
-            Sink::DeltaMerge(s) => {
-                s.finish().await?;
-            }
-            Sink::Arrow(s) => {
-                s.finish()?;
+) -> Result<Vec<DestinationOutcome>, anyhow::Error> {
+    let destinations: Vec<DestinationOutcome> = join_all(sinks.into_iter().map(|sink| {
+        async move {
+            match sink {
+                Sink::Pg(pg) => {
+                    let table = pg.target().to_string();
+                    let result = pg
+                        .commit(env_params)
+                        .await
+                        .with_context(|| format!("postgres load to {table} failed"));
+                    Some(DestinationOutcome::Pg { table, result })
+                }
+                Sink::Pq(s) => {
+                    let location = s.base_path().to_string();
+                    Some(DestinationOutcome::Parquet {
+                        location: location.clone(),
+                        result: s
+                            .finish()
+                            .await
+                            .map(|metas| {
+                                metas
+                                    .into_iter()
+                                    .map(|(path, md)| FileWritten {
+                                        path,
+                                        rows: md.file_metadata().num_rows().max(0) as u64,
+                                    })
+                                    .collect()
+                            })
+                            .with_context(|| format!("parquet write to {location} failed")),
+                    })
+                }
+                Sink::DeltaOverwrite(s) => {
+                    let location = s.base_path().to_string();
+                    Some(DestinationOutcome::Delta {
+                        location: location.clone(),
+                        strategy: DeltaStrategy::Overwrite,
+                        result: s
+                            .finish()
+                            .await
+                            .with_context(|| format!("delta overwrite at {location} failed")),
+                    })
+                }
+                Sink::DeltaMerge(s) => {
+                    let location = s.base_path().to_string();
+                    Some(DestinationOutcome::Delta {
+                        location: location.clone(),
+                        strategy: DeltaStrategy::Merge,
+                        result: s
+                            .finish()
+                            .await
+                            .map(|_| ())
+                            .with_context(|| format!("delta merge at {location} failed")),
+                    })
+                }
+                // arrow: terminal, no outcome entry; a finish error (e.g. closed pipe) is logged, not fatal
+                Sink::Arrow(s) => {
+                    if let Err(e) = s.finish() {
+                        warn!("arrow sink finish failed: {e}");
+                    }
+                    None
+                }
             }
         }
-    }
-    Ok(())
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    Ok(destinations)
 }
 
 /// Failure-path cleanup. Each sink undoes what it can: Postgres rolls back, the file
@@ -645,7 +785,9 @@ fn build_index_namer(
     Box::new(move |index| {
         let mut ctx = context.clone();
         ctx["index"] = serde_json::json!(index);
-        handlebars.render_template(&template, &ctx).map_err(Into::into)
+        handlebars
+            .render_template(&template, &ctx)
+            .map_err(Into::into)
     })
 }
 
@@ -703,6 +845,39 @@ mod tests {
         assert_eq!(
             get_src_url(&vars, "NO_MATCH", "NO_MATCH").unwrap(),
             &("LDRS_SRC".to_string(), "https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_dest_url_shouty_form() {
+        // a dotted identity ("public.users") can't be set as an OS env var; the screaming-snake
+        // form resolves it. raw still wins when present (e.g. a programmatically-injected key).
+        let snake_only = vec![(
+            "LDRS_DEST_PUBLIC_USERS".to_string(),
+            "delta+az://lake".to_string(),
+        )];
+        assert_eq!(
+            get_dest_url(&snake_only, "public.users", "delta")
+                .unwrap()
+                .1,
+            "delta+az://lake"
+        );
+
+        let raw_present = vec![
+            (
+                "LDRS_DEST_public.users".to_string(),
+                "raw://wins".to_string(),
+            ),
+            (
+                "LDRS_DEST_PUBLIC_USERS".to_string(),
+                "delta+az://lake".to_string(),
+            ),
+        ];
+        assert_eq!(
+            get_dest_url(&raw_present, "public.users", "delta")
+                .unwrap()
+                .1,
+            "raw://wins"
         );
     }
 
