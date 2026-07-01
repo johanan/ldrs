@@ -10,6 +10,8 @@ use serde_yaml::Value;
 )]
 pub struct ParquetDestination {
     pub name: String,
+    #[serde(default)]
+    pub target: Option<String>,
     pub filename: String,
     #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
@@ -33,6 +35,7 @@ impl TryFrom<&Value> for ParquetDestination {
                     "Missing name for kind pq (see `ldrs schema pq` for required fields)"
                 )
             })?;
+        let target = value.get("target").and_then(|v| String::deserialize(v).ok());
         let filename = value
             .get("pq.filename")
             .or(value.get("filename"))
@@ -66,6 +69,7 @@ impl TryFrom<&Value> for ParquetDestination {
             .context("failed to parse max_bytes for kind pq")?;
         Ok(ParquetDestination {
             name,
+            target,
             filename,
             columns,
             bloom_filters,

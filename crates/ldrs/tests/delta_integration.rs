@@ -414,6 +414,7 @@ src_defaults:
 
 tables:
   - name: public.users
+    target: public.users_curated
   - name: public.numbers
   - name: public.string_values
     filename: public.string_values/public.strings.snappy.parquet
@@ -425,7 +426,8 @@ tables:
         .display()
         .to_string();
 
-    let table_names = ["public.users", "public.numbers", "public.string_values"];
+    // `public.users` has an explicit `target`, so it lands at `public.users_curated`, not its name.
+    let table_names = ["public.users_curated", "public.numbers", "public.string_values"];
 
     // cleanup before test
     for name in &table_names {

@@ -17,7 +17,7 @@ tables:
 dest: pg.drop_replace
 src: file
 src_defaults:
-  filename: public.users/public.{{ table }}.snappy.parquet
+  filename: public.users/public.{{ table_of name }}.snappy.parquet
 
 tables:
 - name: public_test.users
@@ -174,6 +174,7 @@ src: file
 
 tables:
   - name: public_test_all.users
+    target: public_test_all.renamed
     filename: public.users/public.users.snappy.parquet
   - name: public_test_all.strings
     filename: public.string_values/public.strings.snappy.parquet
@@ -202,7 +203,7 @@ tables:
     .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
 
-    for table in ["users", "strings", "numbers"] {
+    for table in ["strings", "numbers"] {
         let rows = client
             .query(&format!("SELECT * FROM public_test_all.{}", table), &[])
             .await
@@ -213,6 +214,29 @@ tables:
             table
         );
     }
+
+    // `users` was given an explicit `target`, so it lands at `renamed`, not at its `name`.
+    let renamed = client
+        .query("SELECT * FROM public_test_all.renamed", &[])
+        .await
+        .unwrap();
+    assert!(
+        !renamed.is_empty(),
+        "users data should land at its target table `renamed`"
+    );
+    let untargeted: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = 'public_test_all' AND table_name = 'users')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        !untargeted,
+        "no table should be created at the un-targeted name `users`"
+    );
 
     // JSONB round-trip value checks. PG operators (->>, jsonb_typeof) reject
     // malformed JSONB, so these double as wire-format validation.
@@ -386,6 +410,62 @@ tables:
         .unwrap()
         .get(0);
     assert!(!exists, "table must not exist after rollback");
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+#[tokio::test]
+#[test_log::test]
+async fn test_postgres_templated_target() {
+    // The per-tenant path: one config, a runtime `LDRS_TEMPL_TENANT`, and a `target` that weaves
+    // it into the landing table via helpers. Renders to `public_test_tenant.acme_users`.
+    let file_url = data_url();
+    let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), file_url),
+        ("LDRS_DEST".to_string(), pg_url.to_string()),
+        ("LDRS_TEMPL_TENANT".to_string(), "acme".to_string()),
+    ];
+
+    let config = "
+dest: pg.drop_replace
+src: file
+
+tables:
+  - name: public_test_tenant.users
+    target: \"public_test_tenant.{{ tenant }}_{{ table_of name }}\"
+    filename: public.users/public.users.snappy.parquet
+";
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let client = create_connection(pg_url).await.unwrap();
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_tenant CASCADE")
+        .await;
+
+    let ex = execute_configs(
+        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+        &rt.handle(),
+    )
+    .await;
+    assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
+
+    let rows = client
+        .query("SELECT * FROM public_test_tenant.acme_users", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "data should land at the templated target table"
+    );
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }

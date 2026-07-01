@@ -7,6 +7,8 @@ use serde_yaml::Value;
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct PgCommon {
     pub name: String,
+    #[serde(default)]
+    pub target: Option<String>,
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
     pub role: Option<String>,
@@ -17,6 +19,8 @@ pub struct PgCommon {
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct PgDeleteInsert {
     pub name: String,
+    #[serde(default)]
+    pub target: Option<String>,
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
     pub role: Option<String>,
@@ -30,6 +34,8 @@ pub struct PgDeleteInsert {
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct PgMerge {
     pub name: String,
+    #[serde(default)]
+    pub target: Option<String>,
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
     pub role: Option<String>,
@@ -131,6 +137,16 @@ impl PgDestination {
             PgDestination::TruncateInsert(common) => &common.name,
             PgDestination::Merge(merge) => &merge.name,
             PgDestination::DeleteInsert(delete_insert) => &delete_insert.name,
+        }
+    }
+
+    /// The optional `target` template; falls back to `name` at render time when absent.
+    pub fn get_target(&self) -> Option<&str> {
+        match self {
+            PgDestination::DropReplace(common) => common.target.as_deref(),
+            PgDestination::TruncateInsert(common) => common.target.as_deref(),
+            PgDestination::Merge(merge) => merge.target.as_deref(),
+            PgDestination::DeleteInsert(delete_insert) => delete_insert.target.as_deref(),
         }
     }
 
@@ -250,6 +266,7 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
         .ok_or_else(|| {
             anyhow::anyhow!("Missing name for kind pg (see `ldrs schema pg` for required fields)")
         })?;
+    let target = yaml.get("target").and_then(|v| String::deserialize(v).ok());
     // get common values
     let pre_sql =
         get_either(yaml, "pg.pre_sql", "pre_sql").and_then(|v| String::deserialize(v).ok());
@@ -275,6 +292,7 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
         (Some(merge_keys), None) => match tag {
             Some("pg.merge") | Some("pg") | None => Ok(PgDestination::Merge(PgMerge {
                 name,
+                target,
                 pre_sql,
                 post_sql,
                 role,
@@ -287,6 +305,7 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
             Some("pg.delete_insert") | Some("pg") | None => {
                 Ok(PgDestination::DeleteInsert(PgDeleteInsert {
                     name,
+                    target,
                     pre_sql,
                     post_sql,
                     role,
@@ -300,6 +319,7 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
         (None, None) => match tag {
             Some("pg.drop_replace") => Ok(PgDestination::DropReplace(PgCommon {
                 name,
+                target,
                 pre_sql,
                 post_sql,
                 role,
@@ -307,6 +327,7 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
             })),
             Some("pg.truncate_insert") => Ok(PgDestination::TruncateInsert(PgCommon {
                 name,
+                target,
                 pre_sql,
                 post_sql,
                 role,
@@ -343,6 +364,7 @@ columns: []
 
         let expected = PgDestination::DropReplace(PgCommon {
             name: "my_table".to_string(),
+            target: None,
             pre_sql: Some(
                 "CREATE TABLE IF NOT EXISTS my_table (id SERIAL PRIMARY KEY);".to_string(),
             ),
@@ -374,6 +396,7 @@ columns: []
 
         let expected = PgDestination::TruncateInsert(PgCommon {
             name: "my_table".to_string(),
+            target: None,
             pre_sql: Some(
                 "CREATE TABLE IF NOT EXISTS my_table (id SERIAL PRIMARY KEY);".to_string(),
             ),
@@ -411,6 +434,7 @@ param_keys: [Integer]
 
         let expected = PgDestination::DeleteInsert(PgDeleteInsert {
             name: "my_table".to_string(),
+            target: None,
             pre_sql: Some(
                 "CREATE TABLE IF NOT EXISTS my_table (id SERIAL PRIMARY KEY);".to_string(),
             ),
@@ -445,6 +469,7 @@ merge_keys: [id]
 
         let expected = PgDestination::Merge(PgMerge {
             name: "my_table".to_string(),
+            target: None,
             pre_sql: None,
             post_sql: None,
             role: Some("my_role".to_string()),

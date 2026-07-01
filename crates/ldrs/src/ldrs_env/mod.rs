@@ -1,7 +1,13 @@
 use handlebars::handlebars_helper;
+use heck::ToShoutySnakeCase;
 use ldrs_arrow::ColumnType;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
+
+/// Screaming-snake-case an identity for env-var lookups and template scoping (the one shared rule).
+pub fn shouty(s: &str) -> String {
+    s.to_shouty_snake_case()
+}
 
 pub fn get_all_ldrs_env_vars() -> Vec<(String, String)> {
     std::env::vars()
@@ -140,10 +146,18 @@ pub fn get_env_values_by_keys<'a>(
 handlebars_helper!(now_timestamp: | | chrono::prelude::Utc::now().timestamp() );
 // Zero-pad an integer to a fixed width: `{{ pad index 5 }}` with index 3 -> "00003".
 handlebars_helper!(pad: |value: i64, width: usize| format!("{value:0width$}"));
+// `{{ shoutySnakeCase name }}` -> SCREAMING_SNAKE_CASE (owned here, not the handlebars feature).
+handlebars_helper!(shouty_snake_case: |s: str| s.to_shouty_snake_case());
+// Decompose a `schema.table` identity on the first dot; permissive (empty/whole, never error).
+handlebars_helper!(schema_of: |s: str| s.split_once('.').map(|(a, _)| a).unwrap_or(""));
+handlebars_helper!(table_of: |s: str| s.split_once('.').map(|(_, b)| b).unwrap_or(s));
 
 pub fn setup_handlebars(handle_bars: &mut handlebars::Handlebars) -> () {
     handle_bars.register_helper("now_timestamp", Box::new(now_timestamp));
     handle_bars.register_helper("pad", Box::new(pad));
+    handle_bars.register_helper("shoutySnakeCase", Box::new(shouty_snake_case));
+    handle_bars.register_helper("schema_of", Box::new(schema_of));
+    handle_bars.register_helper("table_of", Box::new(table_of));
     handle_bars.set_strict_mode(true);
 }
 
@@ -159,44 +173,23 @@ impl<'a> LdrsExecutionContext<'a> {
         handlebars: &'a handlebars::Handlebars<'a>,
         template_vars: &[(String, String)],
     ) -> Result<Self, anyhow::Error> {
-        let (schema, table) = match name.split_once('.') {
-            Some((schema, table)) => (Some(schema), table),
-            None => (None, name),
-        };
-
-        let shouty_name = name.to_uppercase().replace('.', "_");
-        let name_prefix = format!("{}_", shouty_name);
+        let name_prefix = format!("{}_", shouty(name));
 
         let mut map = serde_json::Map::new();
 
-        // named is LDRS_TEMPL_SHOUTY_NAME_
-        // default is LDRS_TEMPL_
+        // named is LDRS_TEMPL_<SHOUTY_NAME>_, default is LDRS_TEMPL_
         let (named, default): (Vec<_>, Vec<_>) = template_vars
             .iter()
             .partition(|(k, _)| k.starts_with(&name_prefix));
         for (key, value) in &default {
             map.insert(key.to_lowercase(), Value::String(value.clone()));
         }
-
         for (key, value) in &named {
             let scoped_key = key.strip_prefix(&name_prefix).unwrap().to_lowercase();
             map.insert(scoped_key, Value::String(value.clone()));
         }
-        // create random load_table name
-        let load_table_name = format!(
-            "{}_{}",
-            table,
-            uuid::Uuid::new_v4().to_string().replace('-', "")
-        );
         let now = chrono::prelude::Utc::now();
         map.insert("name".into(), name.into());
-        if let Some(s) = schema {
-            let load_table = format!("{}.{}", s, load_table_name);
-            map.insert("schema".into(), s.into());
-            map.insert("load_table".into(), load_table.into());
-        }
-        map.insert("table".into(), table.into());
-        map.insert("load_table_name".into(), load_table_name.into());
         map.insert(
             "rfc3339".into(),
             json!(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
@@ -221,6 +214,21 @@ impl<'a> LdrsExecutionContext<'a> {
         self.handlebars
             .render_template(template, &self.context)
             .map_err(|e| e.into())
+    }
+
+    /// Derive a per-destination context: clone the base, insert (overwriting) the given vars,
+    /// share the same handlebars registry.
+    pub fn with_vars(&self, vars: &[(&str, &str)]) -> Self {
+        let mut context = self.context.clone();
+        if let Value::Object(map) = &mut context {
+            for (k, v) in vars {
+                map.insert(k.to_string(), Value::String(v.to_string()));
+            }
+        }
+        Self {
+            context,
+            handlebars: self.handlebars,
+        }
     }
 }
 
@@ -305,22 +313,41 @@ mod tests {
     }
 
     #[test_log::test]
-    fn test_handlebars_schema() {
+    fn test_shouty() {
+        // the shared Rust rule
+        assert_eq!(shouty("public.users"), "PUBLIC_USERS");
+        assert_eq!(shouty("acme.users"), "ACME_USERS");
+        assert_eq!(shouty("users"), "USERS");
+        assert_eq!(shouty("myTable"), "MY_TABLE");
+
+        // the self-registered helper (no longer the handlebars `string_helpers` feature)
+        let mut hb = handlebars::Handlebars::new();
+        setup_handlebars(&mut hb);
+        let rendered = hb
+            .render_template("{{ shoutySnakeCase name }}", &json!({ "name": "public.users" }))
+            .unwrap();
+        assert_eq!(rendered, "PUBLIC_USERS");
+    }
+
+    #[test_log::test]
+    fn test_schema_table_helpers() {
+        // schema/table are no longer decomposed into the context; they come from the
+        // `schema_of`/`table_of` helpers applied to `name` (or `target`), on demand.
         let mut hb = handlebars::Handlebars::new();
         setup_handlebars(&mut hb);
         let context = LdrsExecutionContext::try_new("test.table", &hb, &[]).unwrap();
+        assert_eq!(context.render_template("{{ schema_of name }}").unwrap(), "test");
+        assert_eq!(context.render_template("{{ table_of name }}").unwrap(), "table");
         assert_eq!(
-            context.render_template("{{ schema }}.{{ table }}").unwrap(),
-            "test.table".to_string()
+            context
+                .render_template("{{ schema_of name }}.{{ table_of name }}")
+                .unwrap(),
+            "test.table"
         );
 
-        let mut hb = handlebars::Handlebars::new();
-        setup_handlebars(&mut hb);
+        // no dot: schema_of is empty (permissive, never an error), table_of is the whole name
         let context = LdrsExecutionContext::try_new("table", &hb, &[]).unwrap();
-        assert_eq!(
-            context.render_template("{{ table }}").unwrap(),
-            "table".to_string()
-        );
-        assert_eq!(context.render_template("{{ schema }}").is_err(), true);
+        assert_eq!(context.render_template("{{ schema_of name }}").unwrap(), "");
+        assert_eq!(context.render_template("{{ table_of name }}").unwrap(), "table");
     }
 }

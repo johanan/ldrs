@@ -46,7 +46,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url.workspace = true
 uuid.workspace = true
 nom = { version = "8.0.0" }
-handlebars = { version = "6.4.0", features = ["string_helpers"] }
+handlebars = { version = "6.4.0" }
+heck = "0.5"
 which = "8.0.2"
 
 [dev-dependencies]
