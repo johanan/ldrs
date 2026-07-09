@@ -27,11 +27,12 @@ use ldrs_storage::join_into_url;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::{
     delta::{DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
+    finalize::{call_finalize, run_sf, FinalizeItem, SfCommand},
     ldrs_config::config::{
         parse_table, validate_configs, LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource,
     },
@@ -318,6 +319,44 @@ pub async fn execute_configs(
     Ok(())
 }
 
+/// Run every finalize item against its resolved target. Items are independent so they run concurrently and their failures are collected, never short-circuited.
+async fn run_finalize(
+    items: &[FinalizeItem],
+    phase: &PhaseOutput,
+    ldrs_env: &[(String, String)],
+    context: &LdrsExecutionContext<'_>,
+) -> Vec<String> {
+    let runs = items.iter().map(|item| async move {
+        match item {
+            FinalizeItem::Sf(sf) => {
+                // `target` defaults to the source name; it is both the rendered identity the Lua
+                // builds on and the connection-lookup key.
+                let target = sf.target.as_deref().unwrap_or(&phase.name);
+                let resolved = context
+                    .render_template(target)
+                    .map_err(|e| format!("finalize target render failed: {e:#}"))?;
+                let url = get_dest_url(ldrs_env, &resolved, "sf")
+                    .map_err(|e| format!("{e:#}"))?
+                    .1
+                    .clone();
+                let conn =
+                    SnowflakeConnection::create_connection(&url).map_err(|e| format!("{e:#}"))?;
+                let commands = call_finalize::<SfCommand>(&sf.lua, phase, context)
+                    .map_err(|e| format!("{e:#}"))?;
+                tokio::task::spawn_blocking(move || run_sf(&conn, commands))
+                    .await
+                    .map_err(|e| format!("finalize task panicked: {e}"))?
+            }
+        }
+    });
+    // Keep the failures (`Err`); a success is `Ok(())` with nothing to report.
+    join_all(runs)
+        .await
+        .into_iter()
+        .filter_map(Result::err)
+        .collect()
+}
+
 pub async fn execute_task(
     task: LdrsParsedConfig,
     ldrs_env: &[(String, String)],
@@ -328,6 +367,7 @@ pub async fn execute_task(
     pg_pools: &mut HashMap<String, Pool>,
 ) -> Result<Option<u64>, anyhow::Error> {
     let name = task.src.name().to_string();
+    let finalize_items = task.finalize;
     let (src, context) = match task.src {
         LdrsSource::File(file) => {
             let ldrs_context =
@@ -422,17 +462,37 @@ pub async fn execute_task(
                         destinations,
                     };
                     debug!("finalize phase output: {:?}", phase);
-                    match phase.success {
-                        true => Ok(Some(rows)),
-                        false => {
-                            let failures = phase
-                                .destinations
-                                .iter()
-                                .filter_map(|d| d.status().err().map(|e| format!("{e:#}")))
-                                .collect::<Vec<_>>()
-                                .join("; ");
-                            Err(anyhow::anyhow!("load failed: {failures}"))
-                        }
+                    let finalize_failures =
+                        run_finalize(&finalize_items, &phase, ldrs_env, &context).await;
+                    let load_failures: Vec<String> = phase
+                        .destinations
+                        .iter()
+                        .filter_map(|d| d.status().err().cloned())
+                        .collect();
+                    // Load and finalize are distinct phases (data didn't land vs. post-load work
+                    // didn't run). Each failure is its own structured log line; the returned error
+                    // is a summary, since the detail lives in the logs.
+                    for f in &load_failures {
+                        error!(phase = "load", "{f}");
+                    }
+                    for f in &finalize_failures {
+                        error!(phase = "finalize", "{f}");
+                    }
+                    let mut summary = Vec::new();
+                    if !load_failures.is_empty() {
+                        summary.push(format!("{} load", load_failures.len()));
+                    }
+                    if !finalize_failures.is_empty() {
+                        summary.push(format!("{} finalize", finalize_failures.len()));
+                    }
+                    if summary.is_empty() {
+                        Ok(Some(rows))
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "task '{}' failed (see logs): {} error(s)",
+                            phase.name,
+                            summary.join(", ")
+                        ))
                     }
                 }
                 Err(e) => {
@@ -697,7 +757,8 @@ pub async fn finish_all(
                     let result = pg
                         .commit(env_params)
                         .await
-                        .with_context(|| format!("postgres load to {table} failed"));
+                        .with_context(|| format!("postgres load to {table} failed"))
+                        .map_err(|e| format!("{e:#}"));
                     Some(DestinationOutcome::Pg { table, result })
                 }
                 Sink::Pq(s) => {
@@ -716,7 +777,8 @@ pub async fn finish_all(
                                     })
                                     .collect()
                             })
-                            .with_context(|| format!("parquet write to {location} failed")),
+                            .with_context(|| format!("parquet write to {location} failed"))
+                            .map_err(|e| format!("{e:#}")),
                     })
                 }
                 Sink::DeltaOverwrite(s) => {
@@ -727,7 +789,8 @@ pub async fn finish_all(
                         result: s
                             .finish()
                             .await
-                            .with_context(|| format!("delta overwrite at {location} failed")),
+                            .with_context(|| format!("delta overwrite at {location} failed"))
+                            .map_err(|e| format!("{e:#}")),
                     })
                 }
                 Sink::DeltaMerge(s) => {
@@ -739,7 +802,8 @@ pub async fn finish_all(
                             .finish()
                             .await
                             .map(|_| ())
-                            .with_context(|| format!("delta merge at {location} failed")),
+                            .with_context(|| format!("delta merge at {location} failed"))
+                            .map_err(|e| format!("{e:#}")),
                     })
                 }
                 // arrow: terminal, no outcome entry; a finish error (e.g. closed pipe) is logged, not fatal

@@ -226,6 +226,7 @@ fn main() -> Result<(), anyhow::Error> {
                     vec![LdrsParsedConfig {
                         src,
                         dests: vec![dest],
+                        finalize: Vec::new(),
                         unknown_keys,
                     }],
                     None,
@@ -258,7 +259,7 @@ fn main() -> Result<(), anyhow::Error> {
                                 ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
                                     &sf_url,
                                 )?;
-                            let message = conn.exec(&sql)?;
+                            let message = conn.exec(&[sql])?;
                             info!("Snowflake exec result: {}", message);
                             Ok(())
                         }
@@ -300,11 +301,11 @@ fn main() -> Result<(), anyhow::Error> {
                             Err(anyhow::anyhow!("Ingest is not implemented"))?
                         }
 
-                        let pre_sql = conn.exec_transaction(&process_result.pre_sql)?;
+                        let pre_sql = conn.exec(&process_result.pre_sql)?;
                         debug!("Pre SQL {:?} executed successfully", pre_sql);
                         let _sql = match process_result.strategy {
                             SnowflakeStrategy::Sql(sql) => {
-                                let sql_result = conn.exec_transaction(&sql)?;
+                                let sql_result = conn.exec(&sql)?;
                                 debug!("SQL {:?} executed successfully", sql_result);
                                 Ok(())
                             }
@@ -312,7 +313,7 @@ fn main() -> Result<(), anyhow::Error> {
                                 Err(anyhow::anyhow!("Ingest is not implemented"))
                             }
                         }?;
-                        let post_sql = conn.exec_transaction(&process_result.post_sql)?;
+                        let post_sql = conn.exec(&process_result.post_sql)?;
                         debug!("Post SQL {:?} executed successfully", post_sql);
                         Ok(())
                     }

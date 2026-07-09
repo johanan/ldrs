@@ -46,15 +46,26 @@ impl SnowflakeConnection {
         });
     }
 
-    /// Execute a SQL statement (typically DDL) and return success/failure
-    pub fn exec(&self, sql: &str) -> Result<String, anyhow::Error> {
-        let mut cmd = Command::new(&self.binary_path);
-        let args = vec!["exec", "--sql", sql];
+    /// Execute an ordered list of SQL statements via `ldrs-sf exec` in a single spawn, returning the
+    /// captured stdout JSON (one result set per statement). Statements are passed pre-separated as
+    /// repeated `--sql` flags; ldrs-sf runs them in order and stops at the first driver error.
+    pub fn exec(&self, statements: &[String]) -> Result<String, anyhow::Error> {
+        if statements.is_empty() {
+            return Ok(String::new());
+        }
 
-        debug!("Running command: {:?} {:?}", &self.binary_path, args);
+        let mut cmd = Command::new(&self.binary_path);
+        cmd.arg("exec");
+        for sql in statements {
+            cmd.arg("--sql").arg(sql);
+        }
+
+        debug!(
+            "Running ldrs-sf exec: {} statement(s)",
+            statements.len()
+        );
 
         let output = cmd
-            .args(args)
             .env("LDRS_SF_SOURCE", &self.raw_conn_url)
             .output()
             .with_context(|| "Failed to execute ldrs-sf command")?;
@@ -66,30 +77,6 @@ impl SnowflakeConnection {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(anyhow::anyhow!("Command failed: {}", stderr))
         }
-    }
-
-    /// Execute multiple SQL statements in a transaction
-    pub fn exec_transaction(&self, sql_statements: &[String]) -> Result<String, anyhow::Error> {
-        if sql_statements.is_empty() {
-            return Ok("No statements to execute".to_string());
-        }
-
-        // Combine all statements into a single transaction
-        let transaction_sql = format!("BEGIN;\n{};\nCOMMIT;", sql_statements.join(";\n"));
-
-        self.exec(&transaction_sql)
-    }
-
-    pub fn exec_each_statement(
-        &self,
-        sql_statements: &[String],
-    ) -> Result<Vec<String>, anyhow::Error> {
-        let mut results = Vec::new();
-        for sql in sql_statements {
-            let result = self.exec(sql)?;
-            results.push(result);
-        }
-        Ok(results)
     }
 }
 

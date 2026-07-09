@@ -70,23 +70,60 @@ func (sf *SnowflakeConn) Close() error {
 	return sf.Snowflake.Close()
 }
 
-func (sf *SnowflakeConn) ExecuteCommands(ctx context.Context, sql_commands []string) ([]string, error) {
-	var results []string
+const maxCapturedRows = 5
+
+// StatementResult is one statement's captured result set, shaped like a Snowflake result
+type StatementResult struct {
+	Columns   []string `json:"columns"`
+	Rows      [][]any  `json:"rows"`
+	Truncated bool     `json:"truncated"`
+}
+
+// ExecuteCommands runs an ordered list of statements, capturing each one's result set.
+func (sf *SnowflakeConn) ExecuteCommands(ctx context.Context, sqlCommands []string) ([]StatementResult, error) {
 	db := sf.Snowflake
-	for _, command := range sql_commands {
-		stmt, err := db.PrepareContext(gosnowflake.WithHigherPrecision(ctx), command)
+	results := make([]StatementResult, 0, len(sqlCommands))
+	for _, command := range sqlCommands {
+		// Plain scanning yields the number's string form, which is readable and greppable.
+		rows, err := db.QueryContext(ctx, command)
 		if err != nil {
 			return nil, err
 		}
-		defer stmt.Close()
-		var status string
-		err = stmt.QueryRowContext(ctx, nil).Scan(&status)
+		result, err := captureRows(rows)
+		rows.Close()
 		if err != nil {
 			return nil, err
 		}
-		results = append(results, status)
+		results = append(results, result)
 	}
 	return results, nil
+}
+
+// captureRows reads up to maxCapturedRows rows generically, preserving column order.
+func captureRows(rows *sql.Rows) (StatementResult, error) {
+	cols, err := rows.Columns()
+	if err != nil {
+		return StatementResult{}, err
+	}
+	result := StatementResult{Columns: cols, Rows: [][]any{}}
+	scan := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range scan {
+		ptrs[i] = &scan[i]
+	}
+	for rows.Next() {
+		if len(result.Rows) >= maxCapturedRows {
+			result.Truncated = true
+			break
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return StatementResult{}, err
+		}
+		row := make([]any, len(cols))
+		copy(row, scan)
+		result.Rows = append(result.Rows, row)
+	}
+	return result, rows.Err()
 }
 
 func (sf *SnowflakeConn) ExecuteQuery(ctx context.Context, query string, args []any, numReaders int) error {
