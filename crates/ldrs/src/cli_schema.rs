@@ -6,9 +6,11 @@ use serde_json::{json, Value};
 use crate::{
     delta::DeltaDestination,
     file_source::FileSource,
+    finalize::FinalizeItem,
     ldrs_config::config::{ArrowDestination, LdrsConfig},
     ldrs_snowflake::snowflake_source::SFSource,
     parquet::ParquetDestination,
+    phase::PhaseOutput,
     postgres::postgres_destination::PgDestination,
 };
 
@@ -34,7 +36,7 @@ fn usage_block() -> Value {
     json!({
         "yaml_config": "The schemas under `sources` and `destinations` describe the per-table block shape used inside `tables:` in YAML config files. The full YAML envelope is documented under `yaml_config`. Defaults are merged into each table block; later table-level values override.",
         "run_command": "`ldrs run` accepts a single block (one source -> one destination, Arrow-pipeable). Three layers, top wins: first-class flags (--src/--dest/--name/--sql) > --opt key=value pairs > --config-inline YAML. --opt is flat string=string only; complex (nested/list) fields require --config-inline. A block is version-free: `version:`/`destinations:` apply only to multi-table config files (`ldrs ld`). Run `ldrs schema <kind>` to see a block's fields.",
-        "ld_command": "`ldrs ld --config <file>` runs a multi-table YAML config: each entry under `tables:` runs in order. Use `version: 2` for the nested `destinations:` form: one source fans out to many destinations. A top-level `destinations:` list is the shared default for tables that don't declare their own; `src_defaults` merges into each table's source block, and each table's `name`/`columns` are inherited into its destination blocks. `--select t1,t2` (comma-separated) runs only the named tables. A single `LDRS_SRC`/`LDRS_DEST` locates all tables; set `LDRS_SRC_<NAME>`/`LDRS_DEST_<NAME>` to point individual tables elsewhere (see env_vars). The flat single-`dest:` form (version 1) is deprecated.",
+        "ld_command": "`ldrs ld --config <file>` runs a multi-table YAML config: each entry under `tables:` runs in order. Use `version: 2` for the nested `destinations:` form: one source fans out to many destinations. A top-level `destinations:` list is the shared default for tables that don't declare their own; `src_defaults` merges into each table's source block, and each table's `name`/`columns` are inherited into its destination blocks. `--select t1,t2` (comma-separated) runs only the named tables. A single `LDRS_SRC`/`LDRS_DEST` locates all tables; set `LDRS_SRC_<NAME>`/`LDRS_DEST_<NAME>` to point individual tables elsewhere (see env_vars). A table (or the top level) may also declare a `finalize:` list: post-load Lua handlers that run against a resolved target after the load (v2/nested only; see `ldrs schema finalize`). The flat single-`dest:` form (version 1) is deprecated.",
         "namespacing": "If a kind has a `namespace` field, that string is an optional prefix on any of its type-specific fields (e.g., `pg.merge_keys` and `merge_keys` are equivalent for pg). Universal block fields (`name`, `src`, `dest`) are never namespaced. Used to disambiguate when source and destination contribute overlapping field names to the same block.",
         "columns": "The `columns` field, when present on a destination kind, declares column transforms (rename/cast/projection). It is always a destination-side field, sources never accept `columns`. Run `ldrs schema columns` for the variant schema.",
         "param_keys": "Positional column types for a destination's prepared statement (currently pg.delete_insert's DELETE WHERE clause). Values come from `LDRS_PARAM_*` env vars, bound positionally in lexicographic order of the env-var name; the count of types here must match the count of bound values. When present, this overrides the per-position type hint from the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix. Run `ldrs schema columns` for the type variants.",
@@ -76,6 +78,8 @@ pub enum SchemaCommands {
     Delta,
     /// Arrow IPC stdout destination block
     Arrow,
+    /// Post-load finalize item block (`run:` selects the kind, e.g. sf)
+    Finalize,
     /// Column transform + param type vocabulary (ColumnSpec / ColumnType)
     Columns,
     /// YAML config file envelope (LdrsConfig)
@@ -93,6 +97,7 @@ pub fn build(command: &SchemaCommands) -> Value {
         SchemaCommands::Pq => dest_doc::<ParquetDestination>("pq", Some("pq")),
         SchemaCommands::Delta => dest_doc::<DeltaDestination>("delta", Some("delta")),
         SchemaCommands::Arrow => dest_doc::<ArrowDestination>("arrow", None),
+        SchemaCommands::Finalize => finalize_doc(),
         SchemaCommands::Columns => build_columns(),
         SchemaCommands::Yaml => build_yaml(),
         SchemaCommands::Usage => build_usage(),
@@ -130,6 +135,23 @@ fn dest_doc<T: JsonSchema>(kind: &str, namespace: Option<&str>) -> Value {
     })
 }
 
+/// The post-load finalize item block (`FinalizeItem`). `run:` selects the kind;
+/// the remaining fields are that kind's config. A v2/nested-only feature.
+fn finalize_doc() -> Value {
+    let mut g = SchemaGenerator::default();
+    let block = g.subschema_for::<FinalizeItem>();
+    let phase = g.subschema_for::<PhaseOutput>();
+    json!({
+        "$defs": g.take_definitions(true),
+        "kind": "finalize",
+        "finalize": block,
+        "phase": phase,
+        "handler": "The `lua` file must define `finalize(phase)`: called once per item with the run's output (`phase`, schema below), it returns the command list run against the item's target. Config/identity is reached via the `render(template)` helper, not a second argument.",
+        "execution": "Every returned command runs in order, stopping at the first error; each statement's result set is info-logged under phase=\"finalize\".",
+        "usage_ref": "ldrs schema usage",
+    })
+}
+
 /// The column transform + param type vocabulary the target of the
 /// `columns`/`param_keys` placeholders in every per-kind dump.
 pub fn build_columns() -> Value {
@@ -151,7 +173,7 @@ pub fn build_yaml() -> Value {
     json!({
         "$defs": g.take_definitions(true),
         "yaml_config": yaml_config,
-        "note": "Each entry under `tables:` is a source block; its destinations come from the table's or the top-level `destinations:` list (each entry a destination block). Block shapes are opaque here and depend on the src/dest kind: see `ldrs schema <kind>`.",
+        "note": "Each entry under `tables:` is a source block; its destinations come from the table's or the top-level `destinations:` list (each entry a destination block). Block shapes are opaque here and depend on the src/dest kind: see `ldrs schema <kind>`. A table's or the top-level `finalize:` list holds post-load items: see `ldrs schema finalize`.",
         "usage_ref": "ldrs schema usage",
     })
 }

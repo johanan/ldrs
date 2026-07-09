@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/url"
 	"os"
-	"strings"
 
 	"github.com/johanan/ldrs/go/ldrs-sf/database"
 	"github.com/spf13/cobra"
@@ -13,11 +12,11 @@ import (
 
 var execCmd = &cobra.Command{
 	Use:   "exec",
-	Short: "Execute a SQL command against Snowflake",
+	Short: "Execute one or more SQL statements against Snowflake",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		sqlCommand, err := cmd.Flags().GetString("sql")
+		sqlCommands, err := cmd.Flags().GetStringArray("sql")
 		if err != nil {
 			return err
 		}
@@ -38,21 +37,12 @@ var execCmd = &cobra.Command{
 		}
 		defer sf.Close()
 
-		sqlCommands := strings.Split(sqlCommand, ";")
-		nonEmptyCommands := make([]string, 0, len(sqlCommands))
-
-		for _, sql := range sqlCommands {
-			if sql != "" {
-				nonEmptyCommands = append(nonEmptyCommands, sql)
-			}
-		}
-
-		output, err := sf.ExecuteCommands(ctx, nonEmptyCommands)
+		output, err := sf.ExecuteCommands(ctx, sqlCommands)
 		if err != nil {
 			return err
 		}
 
-		// json encode the string array of outcomes
+		// json encode the per-statement result sets
 		jsonOutput, err := json.Marshal(output)
 		if err != nil {
 			return err
@@ -65,5 +55,5 @@ var execCmd = &cobra.Command{
 }
 
 func init() {
-	execCmd.Flags().String("sql", "", "SQL command to execute")
+	execCmd.Flags().StringArray("sql", nil, "SQL statement to execute (repeatable)")
 }

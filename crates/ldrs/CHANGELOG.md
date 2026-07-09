@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.0] - 2026-07-09
+
+### Features
+
+- *(finalize)* Added post load Lua phase finalize
+
+Added a phase after destinations have loaded that takes a Lua script and
+can run arbitrary commands after. This is only tied to Snowflake now,
+but is perfect for COPY, CREATE, etc.
+
+
 ## [0.20.1] - 2026-07-01
 
 ### Bug Fixes

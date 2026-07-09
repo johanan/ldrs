@@ -80,6 +80,7 @@ pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
     let config = LdrsParsedConfig {
         src,
         dests: vec![dest],
+        finalize: Vec::new(),
         unknown_keys: Vec::new(),
     };
     let expected_config = LdrsParsedConfig {
@@ -96,6 +97,7 @@ pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
             max_rows: None,
             max_bytes: None,
         })],
+        finalize: Vec::new(),
         unknown_keys: Vec::new(),
     };
     assert_eq!(config, expected_config);
@@ -113,6 +115,7 @@ filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
     let config = LdrsParsedConfig {
         src,
         dests: vec![dest],
+        finalize: Vec::new(),
         unknown_keys: Vec::new(),
     };
     let expected_config = LdrsParsedConfig {
@@ -130,6 +133,7 @@ filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
             max_rows: None,
             max_bytes: None,
         })],
+        finalize: Vec::new(),
         unknown_keys: Vec::new(),
     };
     assert_eq!(config, expected_config);

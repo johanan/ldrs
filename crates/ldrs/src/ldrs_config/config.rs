@@ -1,6 +1,7 @@
 use crate::{
     delta::{self, DeltaCommon, DeltaDestination, DeltaMerge},
     file_source::FileSource,
+    finalize::{FinalizeItem, SfFinalize},
     ldrs_config::field_validation::{extract_props, find_unknown_keys, UnknownKey},
     ldrs_snowflake::snowflake_source::{
         from_serde_yaml as from_sf_serde_yaml, SFQuery, SFSource, SFTable,
@@ -44,6 +45,12 @@ pub struct LdrsConfig {
     #[serde(default)]
     #[schemars(with = "Option<Vec<serde_json::Value>>")]
     pub destinations: Option<Vec<Value>>,
+    /// Post-load finalize items: each runs a Lua handler against a resolved target after the load.
+    /// The shared default for any table that doesn't declare its own `finalize:`. Whole-array
+    /// supersede, never merged.
+    #[serde(default)]
+    #[schemars(with = "Option<Vec<serde_json::Value>>")]
+    pub finalize: Option<Vec<Value>>,
     #[schemars(with = "Vec<serde_json::Value>")]
     pub tables: Vec<serde_yaml::Value>,
 }
@@ -102,6 +109,7 @@ impl LdrsDestination {
 pub struct LdrsParsedConfig {
     pub src: LdrsSource,
     pub dests: Vec<LdrsDestination>,
+    pub finalize: Vec<FinalizeItem>,
     pub unknown_keys: Vec<UnknownKey>,
 }
 
@@ -247,8 +255,38 @@ pub fn parse_dest(
     }
 }
 
+/// Field names allowed by a parsed finalize item's kind (for unknown-key validation).
+fn finalize_known_fields(item: &FinalizeItem) -> Vec<String> {
+    match item {
+        FinalizeItem::Sf(_) => extract_props::<SfFinalize>(),
+    }
+}
+
+/// Resolve a table's finalize list
+fn parse_finalize(
+    table: &Value,
+    config: &LdrsConfig,
+) -> Result<(Vec<FinalizeItem>, Vec<UnknownKey>), anyhow::Error> {
+    let blocks = match table.get("finalize") {
+        Some(Value::Sequence(seq)) => seq.clone(),
+        Some(_) => anyhow::bail!("`finalize` must be a list"),
+        None => config.finalize.clone().unwrap_or_default(),
+    };
+    let mut items = Vec::new();
+    let mut unknown_keys = Vec::new();
+    for raw in blocks {
+        let item: FinalizeItem =
+            serde_yaml::from_value(raw.clone()).with_context(|| "failed to parse finalize item")?;
+        let fields = finalize_known_fields(&item);
+        let allowed: HashSet<&str> = fields.iter().map(String::as_str).chain(["run"]).collect();
+        unknown_keys.extend(find_unknown_keys(&raw, &allowed));
+        items.push(item);
+    }
+    Ok((items, unknown_keys))
+}
+
 /// Parse one table block into its source and destination(s): the flat (v1) form or the
-/// nested (v2) `destinations:` form (dispatched by [`is_nested`]).
+/// nested (v2) `destinations:` form (dispatched by [`is_nested`]). Finalize is a v2/nested-only feature
 pub fn parse_table(
     table: Value,
     config: &LdrsConfig,
@@ -300,6 +338,7 @@ fn parse_table_flat(
     Ok(LdrsParsedConfig {
         src,
         dests: vec![dest],
+        finalize: Vec::new(),
         unknown_keys,
     })
 }
@@ -356,18 +395,22 @@ fn parse_table_nested(
     let src_allowed: HashSet<&str> = src_fields
         .iter()
         .map(String::as_str)
-        .chain(["src", "destinations", "columns"])
+        .chain(["src", "destinations", "columns", "finalize"])
         .collect();
+
+    let (finalize, finalize_unknowns) = parse_finalize(&table, config)?;
 
     let unknown_keys = per_block_unknowns
         .into_iter()
         .flatten()
         .chain(find_unknown_keys(&table, &src_allowed))
+        .chain(finalize_unknowns)
         .collect();
 
     Ok(LdrsParsedConfig {
         src,
         dests,
+        finalize,
         unknown_keys,
     })
 }
@@ -816,5 +859,143 @@ tables:
 "#;
         let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
         assert!(validate_configs(&configs).is_ok());
+    }
+
+    #[test]
+    fn top_level_finalize_applies_to_tables() {
+        let yaml = r#"
+version: 2
+src: file
+destinations:
+  - dest: delta.overwrite
+finalize:
+  - run: sf
+    lua: sf_register.lua
+tables:
+  - name: public.users
+    columns:
+      - { type: uuid, name: id }
+"#;
+        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        assert_eq!(configs[0].finalize.len(), 1);
+        match &configs[0].finalize[0] {
+            FinalizeItem::Sf(sf) => {
+                assert_eq!(sf.lua, "sf_register.lua");
+                assert_eq!(sf.target, None);
+            }
+        }
+    }
+
+    #[test]
+    fn table_finalize_supersedes_top_level() {
+        let yaml = r#"
+version: 2
+src: file
+destinations:
+  - dest: delta.overwrite
+finalize:
+  - run: sf
+    lua: default.lua
+tables:
+  - name: public.users
+    columns:
+      - { type: uuid, name: id }
+    finalize:
+      - run: sf
+        target: "custom.{{ table_of name }}"
+        lua: custom.lua
+"#;
+        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        assert_eq!(configs[0].finalize.len(), 1);
+        match &configs[0].finalize[0] {
+            FinalizeItem::Sf(sf) => {
+                assert_eq!(sf.lua, "custom.lua");
+                assert_eq!(sf.target.as_deref(), Some("custom.{{ table_of name }}"));
+            }
+        }
+    }
+
+    #[test]
+    fn finalize_unsupported_run_kind_errors() {
+        let yaml = r#"
+version: 2
+src: file
+destinations:
+  - dest: delta.overwrite
+finalize:
+  - run: bigquery
+    lua: x.lua
+tables:
+  - name: users
+    columns:
+      - { type: uuid, name: id }
+"#;
+        let err = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap_err();
+        assert!(err.to_string().contains("finalize item"), "got: {}", err);
+    }
+
+    #[test]
+    fn finalize_missing_lua_errors() {
+        let yaml = r#"
+version: 2
+src: file
+destinations:
+  - dest: delta.overwrite
+finalize:
+  - run: sf
+tables:
+  - name: users
+    columns:
+      - { type: uuid, name: id }
+"#;
+        let err = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap_err();
+        assert!(err.to_string().contains("finalize item"), "got: {}", err);
+    }
+
+    #[test]
+    fn finalize_unknown_key_is_flagged() {
+        let yaml = r#"
+version: 2
+src: file
+destinations:
+  - dest: delta.overwrite
+finalize:
+  - run: sf
+    lua: x.lua
+    targett: oops
+tables:
+  - name: users
+    columns:
+      - { type: uuid, name: id }
+"#;
+        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let flagged: Vec<&str> = configs[0]
+            .unknown_keys
+            .iter()
+            .map(|u| u.key.as_str())
+            .collect();
+        assert!(
+            flagged.contains(&"targett"),
+            "expected targett flagged, got: {:?}",
+            flagged
+        );
+    }
+
+    #[test]
+    fn v1_flat_silently_ignores_finalize() {
+        // finalize is a v2/nested-only feature.
+        let yaml = r#"
+version: 1
+src: file
+dest: pq
+finalize:
+  - run: sf
+    lua: x.lua
+tables:
+  - name: users
+    filename: "out.parquet"
+"#;
+        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        assert!(configs[0].finalize.is_empty());
     }
 }

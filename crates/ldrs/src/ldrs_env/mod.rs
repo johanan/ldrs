@@ -152,13 +152,30 @@ handlebars_helper!(shouty_snake_case: |s: str| s.to_shouty_snake_case());
 handlebars_helper!(schema_of: |s: str| s.split_once('.').map(|(a, _)| a).unwrap_or(""));
 handlebars_helper!(table_of: |s: str| s.split_once('.').map(|(_, b)| b).unwrap_or(s));
 
+/// The domain helpers paired with their names
+fn helper_defs() -> Vec<(
+    &'static str,
+    Box<dyn handlebars::HelperDef + Send + Sync + 'static>,
+)> {
+    vec![
+        ("now_timestamp", Box::new(now_timestamp)),
+        ("pad", Box::new(pad)),
+        ("shoutySnakeCase", Box::new(shouty_snake_case)),
+        ("schema_of", Box::new(schema_of)),
+        ("table_of", Box::new(table_of)),
+    ]
+}
+
 pub fn setup_handlebars(handle_bars: &mut handlebars::Handlebars) -> () {
-    handle_bars.register_helper("now_timestamp", Box::new(now_timestamp));
-    handle_bars.register_helper("pad", Box::new(pad));
-    handle_bars.register_helper("shoutySnakeCase", Box::new(shouty_snake_case));
-    handle_bars.register_helper("schema_of", Box::new(schema_of));
-    handle_bars.register_helper("table_of", Box::new(table_of));
+    for (name, def) in helper_defs() {
+        handle_bars.register_helper(name, def);
+    }
     handle_bars.set_strict_mode(true);
+}
+
+/// The registered helper names, for surfacing in a render error alongside the bound variables.
+pub fn helper_names() -> Vec<&'static str> {
+    helper_defs().into_iter().map(|(name, _)| name).collect()
 }
 
 #[derive(Debug)]
@@ -213,7 +230,20 @@ impl<'a> LdrsExecutionContext<'a> {
     pub fn render_template(&self, template: &str) -> Result<String, anyhow::Error> {
         self.handlebars
             .render_template(template, &self.context)
-            .map_err(|e| e.into())
+            .map_err(|e| self.explain_render_error(e))
+    }
+
+    /// Attach the bound variable names and available helpers to a render failure.
+    fn explain_render_error(&self, e: handlebars::RenderError) -> anyhow::Error {
+        let vars = self
+            .context
+            .as_object()
+            .map(|m| m.keys().cloned().collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        anyhow::Error::from(e).context(format!(
+            "template render failed — bound variables: [{vars}]; helpers: [{}]",
+            helper_names().join(", ")
+        ))
     }
 
     /// Derive a per-destination context: clone the base, insert (overwriting) the given vars,
@@ -324,7 +354,10 @@ mod tests {
         let mut hb = handlebars::Handlebars::new();
         setup_handlebars(&mut hb);
         let rendered = hb
-            .render_template("{{ shoutySnakeCase name }}", &json!({ "name": "public.users" }))
+            .render_template(
+                "{{ shoutySnakeCase name }}",
+                &json!({ "name": "public.users" }),
+            )
             .unwrap();
         assert_eq!(rendered, "PUBLIC_USERS");
     }
@@ -336,8 +369,14 @@ mod tests {
         let mut hb = handlebars::Handlebars::new();
         setup_handlebars(&mut hb);
         let context = LdrsExecutionContext::try_new("test.table", &hb, &[]).unwrap();
-        assert_eq!(context.render_template("{{ schema_of name }}").unwrap(), "test");
-        assert_eq!(context.render_template("{{ table_of name }}").unwrap(), "table");
+        assert_eq!(
+            context.render_template("{{ schema_of name }}").unwrap(),
+            "test"
+        );
+        assert_eq!(
+            context.render_template("{{ table_of name }}").unwrap(),
+            "table"
+        );
         assert_eq!(
             context
                 .render_template("{{ schema_of name }}.{{ table_of name }}")
@@ -348,6 +387,25 @@ mod tests {
         // no dot: schema_of is empty (permissive, never an error), table_of is the whole name
         let context = LdrsExecutionContext::try_new("table", &hb, &[]).unwrap();
         assert_eq!(context.render_template("{{ schema_of name }}").unwrap(), "");
-        assert_eq!(context.render_template("{{ table_of name }}").unwrap(), "table");
+        assert_eq!(
+            context.render_template("{{ table_of name }}").unwrap(),
+            "table"
+        );
+    }
+
+    #[test_log::test]
+    fn render_error_lists_variables_and_helpers() {
+        // Strict mode makes an unknown variable an error; the message should name what is in scope.
+        let mut hb = handlebars::Handlebars::new();
+        setup_handlebars(&mut hb);
+        let context = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
+        let err = context.render_template("{{ nonexistent }}").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bound variables"), "got: {msg}");
+        assert!(
+            msg.contains("name"),
+            "should list the bound `name` var, got: {msg}"
+        );
+        assert!(msg.contains("schema_of"), "should list helpers, got: {msg}");
     }
 }
