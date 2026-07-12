@@ -150,52 +150,47 @@ fn time_unit_from(pq_unit: &parquet::basic::TimeUnit) -> TimeUnit {
     }
 }
 
-pub fn columnspec_from_parquet(
-    field: &Arc<parquet::schema::types::Type>,
-) -> Result<ColumnSpec, anyhow::Error> {
+/// Map a parquet primitive field to a `ColumnSpec` from its metadata.
+pub fn columnspec_from_parquet(field: &Arc<parquet::schema::types::Type>) -> Option<ColumnSpec> {
     match field.as_ref() {
-        GroupType { .. } => Err(anyhow::Error::msg("Cannot convert GroupType to ColumnSpec")),
+        GroupType { .. } => None,
         PrimitiveType { basic_info, .. } => {
             let name = field.name().to_string();
-            let pq_type: ColumnSpec = match basic_info {
-                bi if bi.logical_type_ref().is_some() => {
-                    // we have a logical type, use that
-                    match bi.logical_type_ref().unwrap() {
-                        LogicalType::String => ColumnSpec::Text { name },
-                        LogicalType::Timestamp {
-                            is_adjusted_to_u_t_c: true,
-                            unit,
-                        } => ColumnSpec::TimestampTz {
-                            name,
-                            time_unit: time_unit_from(unit),
-                        },
-                        LogicalType::Timestamp {
-                            is_adjusted_to_u_t_c: false,
-                            unit,
-                        } => ColumnSpec::Timestamp {
-                            name,
-                            time_unit: time_unit_from(unit),
-                        },
-                        LogicalType::Uuid => ColumnSpec::Uuid { name },
-                        LogicalType::Json => ColumnSpec::Jsonb { name },
-                        LogicalType::Decimal { scale, precision } => ColumnSpec::Numeric {
-                            name,
-                            precision: *precision,
-                            scale: *scale,
-                        },
-                        _ => ColumnSpec::Text { name },
-                    }
-                }
-                _ => match field.get_physical_type() {
-                    parquet::basic::Type::FLOAT => ColumnSpec::Real { name },
-                    parquet::basic::Type::DOUBLE => ColumnSpec::Double { name },
-                    parquet::basic::Type::INT32 => ColumnSpec::Integer { name },
-                    parquet::basic::Type::INT64 => ColumnSpec::BigInt { name },
-                    parquet::basic::Type::BOOLEAN => ColumnSpec::Boolean { name },
-                    _ => ColumnSpec::Text { name },
+            match basic_info {
+                bi if bi.logical_type_ref().is_some() => match bi.logical_type_ref().unwrap() {
+                    LogicalType::String => Some(ColumnSpec::Text { name }),
+                    LogicalType::Timestamp {
+                        is_adjusted_to_u_t_c: true,
+                        unit,
+                    } => Some(ColumnSpec::TimestampTz {
+                        name,
+                        time_unit: time_unit_from(unit),
+                    }),
+                    LogicalType::Timestamp {
+                        is_adjusted_to_u_t_c: false,
+                        unit,
+                    } => Some(ColumnSpec::Timestamp {
+                        name,
+                        time_unit: time_unit_from(unit),
+                    }),
+                    LogicalType::Uuid => Some(ColumnSpec::Uuid { name }),
+                    LogicalType::Json => Some(ColumnSpec::Jsonb { name }),
+                    LogicalType::Decimal { scale, precision } => Some(ColumnSpec::Numeric {
+                        name,
+                        precision: *precision,
+                        scale: *scale,
+                    }),
+                    _ => None,
                 },
-            };
-            Ok(pq_type)
+                _ => match field.get_physical_type() {
+                    parquet::basic::Type::FLOAT => Some(ColumnSpec::Real { name }),
+                    parquet::basic::Type::DOUBLE => Some(ColumnSpec::Double { name }),
+                    parquet::basic::Type::INT32 => Some(ColumnSpec::Integer { name }),
+                    parquet::basic::Type::INT64 => Some(ColumnSpec::BigInt { name }),
+                    parquet::basic::Type::BOOLEAN => Some(ColumnSpec::Boolean { name }),
+                    _ => None,
+                },
+            }
         }
     }
 }

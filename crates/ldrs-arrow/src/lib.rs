@@ -122,7 +122,10 @@ pub fn map_arrow_to_abstract(field: &FieldRef) -> Option<ColumnSpec> {
         arrow_schema::DataType::FixedSizeBinary(size) => {
             Some(ColumnSpec::FixedSizeBinary { name, size: *size })
         }
-        arrow_schema::DataType::Decimal128(precision, scale) => Some(ColumnSpec::Numeric {
+        arrow_schema::DataType::Decimal32(precision, scale)
+        | arrow_schema::DataType::Decimal64(precision, scale)
+        | arrow_schema::DataType::Decimal128(precision, scale)
+        | arrow_schema::DataType::Decimal256(precision, scale) => Some(ColumnSpec::Numeric {
             name,
             precision: (*precision).into(),
             scale: (*scale).into(),

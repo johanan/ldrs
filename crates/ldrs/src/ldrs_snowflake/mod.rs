@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use url::Url;
 
 #[derive(Clone)]
@@ -19,6 +19,8 @@ pub struct SnowflakeConnection {
     pub conn_url: Url,
     pub raw_conn_url: String,
     pub binary_path: PathBuf,
+    pub pem_key: Option<String>,
+    pub pem_file: Option<String>,
 }
 
 pub struct SnowflakeStreamResult<S> {
@@ -28,7 +30,11 @@ pub struct SnowflakeStreamResult<S> {
 }
 
 impl SnowflakeConnection {
-    pub fn create_connection(conn_url: &str) -> Result<SnowflakeConnection, anyhow::Error> {
+    pub fn create_connection(
+        conn_url: &str,
+        pem_key: Option<String>,
+        pem_file: Option<String>,
+    ) -> Result<SnowflakeConnection, anyhow::Error> {
         let parsed_url = Url::parse(conn_url).with_context(|| "Failed to parse connection URL")?;
         let binary_path =
             which::which("ldrs-sf").with_context(|| "Failed to find ldrs-sf binary in PATH")?;
@@ -43,6 +49,8 @@ impl SnowflakeConnection {
             conn_url: parsed_url,
             raw_conn_url: conn_url.to_string(),
             binary_path,
+            pem_key,
+            pem_file,
         });
     }
 
@@ -60,13 +68,19 @@ impl SnowflakeConnection {
             cmd.arg("--sql").arg(sql);
         }
 
-        debug!(
-            "Running ldrs-sf exec: {} statement(s)",
-            statements.len()
-        );
+        debug!("Running ldrs-sf exec: {} statement(s)", statements.len());
 
+        let parent: Vec<(String, String)> = std::env::vars().collect();
+        let managed = sf_auth_env(
+            &self.raw_conn_url,
+            self.pem_key.as_deref(),
+            self.pem_file.as_deref(),
+        )
+        .into_iter()
+        .chain(sf_param_env(&[]))
+        .collect();
+        apply_child_env(&mut cmd, &parent, managed);
         let output = cmd
-            .env("LDRS_SF_SOURCE", &self.raw_conn_url)
             .output()
             .with_context(|| "Failed to execute ldrs-sf command")?;
 
@@ -80,9 +94,75 @@ impl SnowflakeConnection {
     }
 }
 
+/// Build the ordered `LDRS_SF_PARAM_P<n>` env pairs for ldrs-sf, one per bound parameter. Names
+/// are zero-padded to the count's width so ldrs-sf's lexical sort of the names matches this
+/// positional order past nine params (`P10` would otherwise sort between `P1` and `P2`).
+fn sf_param_env(params: &[(String, Option<ColumnType>)]) -> Vec<(String, String)> {
+    let width = params.len().to_string().len();
+    params
+        .iter()
+        .enumerate()
+        .map(|(i, (value, _))| {
+            (
+                format!("LDRS_SF_PARAM_P{:0width$}", i + 1, width = width),
+                value.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Resolve the Snowflake credentials co-located with a resolved connection `base`. Strict co-location
+pub fn resolve_conn_creds(
+    vars: &[(String, String)],
+    base: &str,
+) -> (Option<String>, Option<String>) {
+    let at = |attr: &str| -> Option<String> {
+        let key = format!("{base}_{attr}");
+        vars.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+            .map(|(_, v)| v.clone())
+    };
+    (at("PEM_KEY"), at("PEM_FILE"))
+}
+
+/// The connection auth env: the source URL and, if resolved, the PEM credential.
+fn sf_auth_env(
+    source: &str,
+    pem_key: Option<&str>,
+    pem_file: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env = vec![("LDRS_SF_SOURCE".to_string(), source.to_string())];
+    if let Some(pk) = pem_key {
+        env.push(("LDRS_SF_PEM_KEY".to_string(), pk.to_string()));
+    }
+    if let Some(pf) = pem_file {
+        env.push(("LDRS_SF_PEM_FILE".to_string(), pf.to_string()));
+    }
+    env
+}
+
+/// Wire the managed env onto a spawned ldrs-sf Command. The child inherits the parent env
+/// (fork-like); this strips the parent's `LDRS_*` config vars but leaves `LDRS_SF_*` in place, so
+/// user-set `LDRS_SF_*` reach the child by inheritance (each is warned). `managed` is then set on
+/// top, so ldrs's resolved values win over any inherited `LDRS_SF_*` they collide with.
+fn apply_child_env(cmd: &mut Command, parent: &[(String, String)], managed: Vec<(String, String)>) {
+    for (k, _) in parent {
+        match k {
+            _ if k.starts_with("LDRS_SF_") => {
+                warn!("inherited user-set {k} reaches ldrs-sf; execution not guaranteed for env ldrs does not manage");
+            }
+            _ if k.starts_with("LDRS_") => {
+                cmd.env_remove(k);
+            }
+            _ => {}
+        }
+    }
+    cmd.envs(managed);
+}
+
 /// Execute a SQL query and stream the results as Arrow RecordBatches.
 /// This uses the ldrs-sf binary to execute the query and stream the results.
-/// `bind_params` should already be sorted by key and this is the value and type of the parameter.
+/// `bind_params` are the parameter values and types, in the order they bind.
 pub async fn sf_arrow_stream(
     conn: &SnowflakeConnection,
     sql: &str,
@@ -96,19 +176,20 @@ pub async fn sf_arrow_stream(
     let sql = sql.to_string();
     let conn_url = conn.raw_conn_url.clone();
     let binary_path = conn.binary_path.clone();
+    let pem_key = conn.pem_key.clone();
+    let pem_file = conn.pem_file.clone();
 
     let command_handle = task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&binary_path);
         let args = vec!["query", "--sql", &sql];
         let cmd = cmd.args(args);
         debug!("Running command: {:?}", cmd);
-        let cmd = cmd.env("LDRS_SF_SOURCE", conn_url);
-        // bind the parameters in order for ldrs-sf
-        let sf_named_params = bind_params.into_iter().enumerate().map(|(i, (value, _))| {
-            let name = format!("LDRS_SF_PARAM_P{}", i + 1);
-            (name, value)
-        });
-        let cmd = cmd.envs(sf_named_params);
+        let parent: Vec<(String, String)> = std::env::vars().collect();
+        let managed = sf_auth_env(&conn_url, pem_key.as_deref(), pem_file.as_deref())
+            .into_iter()
+            .chain(sf_param_env(&bind_params))
+            .collect();
+        apply_child_env(cmd, &parent, managed);
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
@@ -185,4 +266,92 @@ pub async fn sf_arrow_stream(
         schema_stream: schema_future,
         command_handle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sf_param_env_zero_pads_names() {
+        let params: Vec<(String, Option<ColumnType>)> =
+            (1..=10).map(|i| (format!("v{i}"), None)).collect();
+        let env = sf_param_env(&params);
+        assert_eq!(env[0].0, "LDRS_SF_PARAM_P01", "first param, zero-padded");
+        assert_eq!(env[9].0, "LDRS_SF_PARAM_P10", "tenth param");
+        // ldrs-sf sorts these names lexically; zero-padding must make that match positional order.
+        let names: Vec<String> = env.iter().map(|(k, _)| k.clone()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "padded names must sort lexically into positional order"
+        );
+    }
+
+    #[test]
+    fn conn_creds_are_strictly_co_located() {
+        let vars = vec![
+            ("LDRS_SRC_SF".to_string(), "snowflake://acct".to_string()),
+            ("LDRS_SRC_SF_PEM_KEY".to_string(), "KEYMATERIAL".to_string()),
+        ];
+        let (pk, pf) = resolve_conn_creds(&vars, "LDRS_SRC_SF");
+        assert_eq!(pk.as_deref(), Some("KEYMATERIAL"));
+        assert_eq!(pf, None);
+        // a different base (e.g. a per-name URL) does NOT inherit the kind-scoped key
+        let (pk2, _) = resolve_conn_creds(&vars, "LDRS_SRC_SALES");
+        assert_eq!(
+            pk2, None,
+            "credential must be co-located with the resolved connection base"
+        );
+    }
+
+    #[test]
+    fn managed_env_is_auth_keys_then_params() {
+        let params = vec![("v1".to_string(), None), ("v2".to_string(), None)];
+        let env = sf_auth_env("snowflake://acct", Some("KEY"), None)
+            .into_iter()
+            .chain(sf_param_env(&params))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            env,
+            vec![
+                ("LDRS_SF_SOURCE".to_string(), "snowflake://acct".to_string()),
+                ("LDRS_SF_PEM_KEY".to_string(), "KEY".to_string()),
+                ("LDRS_SF_PARAM_P1".to_string(), "v1".to_string()),
+                ("LDRS_SF_PARAM_P2".to_string(), "v2".to_string()),
+            ],
+            "managed env is auth keys (no PEM_FILE when None) then ordered params"
+        );
+    }
+
+    #[test]
+    fn apply_child_env_strips_config_keeps_sf_and_sets_managed() {
+        let parent = vec![
+            ("LDRS_SRC_SF".to_string(), "url".to_string()),
+            ("LDRS_SF_PEM_KEY".to_string(), "legacy".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ];
+        let managed = vec![("LDRS_SF_SOURCE".to_string(), "resolved".to_string())];
+        let mut cmd = Command::new("true");
+        apply_child_env(&mut cmd, &parent, managed);
+
+        // get_envs() reports only our explicit modifications: Some(v) = set, None = remove.
+        let mods: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        // the config var is queued for removal; the managed key is set
+        assert!(mods.contains(&("LDRS_SRC_SF".to_string(), None)));
+        assert!(mods.contains(&("LDRS_SF_SOURCE".to_string(), Some("resolved".to_string()))));
+        // a user LDRS_SF_ key is left inherited (no modification), and non-LDRS is untouched
+        assert!(!mods.iter().any(|(k, _)| k == "LDRS_SF_PEM_KEY"));
+        assert!(!mods.iter().any(|(k, _)| k == "PATH"));
+    }
 }

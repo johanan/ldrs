@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.1] - 2026-07-12
+
+### Bug Fixes
+
+- *(parquet)* Type resolution improvements
+
+Bug fix for defaults leaking through. Now ldrs uses the correct decimal
+datatype in arrow. And it does not default everything it does not know
+to text, but will fallback to what arrow maps the column as.
+
+- *(sf)* Better ldrs-sf handling
+
+ldrs will now correctly bind params in the order defined in the config.
+
+ldrs can handle multiple ldrs-sf connections in the env and execute each
+ldrs-sf that owns its own env.
+
+
 ## [0.21.0] - 2026-07-09
 
 ### Features

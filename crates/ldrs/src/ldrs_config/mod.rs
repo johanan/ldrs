@@ -37,9 +37,12 @@ use crate::{
         parse_table, validate_configs, LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource,
     },
     ldrs_env::{
-        collect_params, collect_vars_by_prefix, setup_handlebars, shouty, LdrsExecutionContext,
+        collect_params, collect_vars_by_prefix, explain_render_error, setup_handlebars, shouty,
+        LdrsExecutionContext,
     },
-    ldrs_snowflake::{sf_arrow_stream, snowflake_source::SFSource, SnowflakeConnection},
+    ldrs_snowflake::{
+        resolve_conn_creds, sf_arrow_stream, snowflake_source::SFSource, SnowflakeConnection,
+    },
     phase::{DeltaStrategy, DestinationOutcome, FileWritten, PhaseOutput},
     postgres::{execute::PgSink, postgres_destination::split_pg_plan},
     sink::{drive, ArrowStdoutSink, BatchTransform, Sink, Transforms},
@@ -106,23 +109,38 @@ pub fn get_env_value<'a>(
         .find_map(|key| vars.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)))
 }
 
+/// Resolve a connection URL against the tier chain for `base` (`LDRS_SRC` or `LDRS_DEST`), most
+/// specific first: the exact `base_<ident>` (the canonical key, highest precedence), then its
+/// screaming-snake `base_<SHOUTY>` as the env-var-safe fallback (a name's dots and the like aren't
+/// valid in a shell env name), then the kind `base_<KIND>`, then the bare `base`. Logs each
+/// candidate and which one landed, so `RUST_LOG=ldrs=debug` shows exactly which key to set (and
+/// the error names them all on a miss).
+fn resolve_scoped_url<'a>(
+    vars: &'a [(String, String)],
+    base: &str,
+    ident: &str,
+    prefix: &str,
+) -> Result<&'a (String, String), anyhow::Error> {
+    let raw = format!("{base}_{ident}");
+    let snake = format!("{base}_{}", shouty(ident));
+    let prefix_key = format!("{base}_{prefix}");
+    let candidates = [raw.as_str(), snake.as_str(), prefix_key.as_str(), base];
+    let resolved = get_env_value(vars, &candidates);
+    debug!(
+        "{base} for '{ident}': tried {candidates:?} resolved {}",
+        resolved
+            .map(|(k, _)| k.as_str())
+            .unwrap_or("(none matched)")
+    );
+    resolved.ok_or_else(|| anyhow::anyhow!("No env var found; set one of {candidates:?}"))
+}
+
 pub fn get_src_url<'a>(
     vars: &'a [(String, String)],
     ident: &str,
     prefix: &str,
 ) -> Result<&'a (String, String), anyhow::Error> {
-    // identity (raw, then screaming-snake for OS env), then kind, then the bare fallback
-    let raw = format!("LDRS_SRC_{}", ident);
-    let snake = format!("LDRS_SRC_{}", shouty(ident));
-    let prefix_key = format!("LDRS_SRC_{}", prefix);
-    get_env_value(vars, &[&raw, &snake, &prefix_key, "LDRS_SRC"]).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No env var found for {}, {}, {}, or LDRS_SRC",
-            raw,
-            snake,
-            prefix_key
-        )
-    })
+    resolve_scoped_url(vars, "LDRS_SRC", ident, prefix)
 }
 
 pub fn get_dest_url<'a>(
@@ -130,18 +148,7 @@ pub fn get_dest_url<'a>(
     ident: &str,
     prefix: &str,
 ) -> Result<&'a (String, String), anyhow::Error> {
-    // identity (raw, then screaming-snake for OS env), then kind, then the bare fallback
-    let raw = format!("LDRS_DEST_{}", ident);
-    let snake = format!("LDRS_DEST_{}", shouty(ident));
-    let prefix_key = format!("LDRS_DEST_{}", prefix);
-    get_env_value(vars, &[&raw, &snake, &prefix_key, "LDRS_DEST"]).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No env var found for {}, {}, {}, or LDRS_DEST",
-            raw,
-            snake,
-            prefix_key
-        )
-    })
+    resolve_scoped_url(vars, "LDRS_DEST", ident, prefix)
 }
 
 fn is_object_store_url(url: &Url) -> bool {
@@ -335,12 +342,10 @@ async fn run_finalize(
                 let resolved = context
                     .render_template(target)
                     .map_err(|e| format!("finalize target render failed: {e:#}"))?;
-                let url = get_dest_url(ldrs_env, &resolved, "sf")
-                    .map_err(|e| format!("{e:#}"))?
-                    .1
-                    .clone();
-                let conn =
-                    SnowflakeConnection::create_connection(&url).map_err(|e| format!("{e:#}"))?;
+                let dest = get_dest_url(ldrs_env, &resolved, "SF").map_err(|e| format!("{e:#}"))?;
+                let (pem_key, pem_file) = resolve_conn_creds(ldrs_env, &dest.0);
+                let conn = SnowflakeConnection::create_connection(&dest.1, pem_key, pem_file)
+                    .map_err(|e| format!("{e:#}"))?;
                 let commands = call_finalize::<SfCommand>(&sf.lua, phase, context)
                     .map_err(|e| format!("{e:#}"))?;
                 tokio::task::spawn_blocking(move || run_sf(&conn, commands))
@@ -374,7 +379,7 @@ pub async fn execute_task(
                 LdrsExecutionContext::try_new(&file.name, &handlebars, &handlebars_vars)?;
             // if the filename is not provided, use the name as the filename
             let file_name = file.filename.as_deref().unwrap_or(file.name.as_str());
-            let src_value = get_src_url(ldrs_env, &file.name, "file")?;
+            let src_value = get_src_url(ldrs_env, &file.name, "FILE")?;
             // render the filename template, then join it onto the source base
             let file_name = ldrs_context.render_template(file_name)?;
             let src_url = join_into_url(src_value.1.as_str(), &file_name)?;
@@ -389,7 +394,7 @@ pub async fn execute_task(
             let stream = builder.with_batch_size(2048).build()?;
             let source_cols = fields
                 .iter()
-                .filter_map(|pq| columnspec_from_parquet(pq).ok())
+                .filter_map(columnspec_from_parquet)
                 .collect::<Vec<_>>();
             (
                 LdrsSrcStream {
@@ -408,13 +413,14 @@ pub async fn execute_task(
                 SFSource::Table(table) => format!("SELECT * FROM {}", table.name),
             };
             let name = sf.get_name();
-            let sf_src = get_src_url(ldrs_env, &name, "sf")?;
+            let sf_src = get_src_url(ldrs_env, &name, "SF")?;
             let ldrs_context = LdrsExecutionContext::try_new(&name, &handlebars, &handlebars_vars)?;
             let handled_name = ldrs_context.render_template("{{ shoutySnakeCase name }}")?;
             let sf_params = sf.try_get_env_params(&handled_name, &env_params)?;
             debug!("Snowflake Params: {:?}", sf_params);
             let rendered_sql = ldrs_context.render_template(&sf_sql)?;
-            let conn = SnowflakeConnection::create_connection(&sf_src.1)?;
+            let (pem_key, pem_file) = resolve_conn_creds(ldrs_env, &sf_src.0);
+            let conn = SnowflakeConnection::create_connection(&sf_src.1, pem_key, pem_file)?;
             let arrow_stream = sf_arrow_stream(&conn, &rendered_sql, sf_params).await?;
             let schema = arrow_stream.schema_stream.await;
             (
@@ -622,7 +628,7 @@ async fn build_one(
                 ("load_table", &load_table),
                 ("load_table_name", &load_table_name),
             ]);
-            let dest_value = get_dest_url(ldrs_env, &resolved_target, "pg")?;
+            let dest_value = get_dest_url(ldrs_env, &resolved_target, "PG")?;
             let (pg_url, role) = check_for_role(dest_value.1.as_str())?;
             let role = role.or(get_env_value(
                 ldrs_env,
@@ -653,7 +659,7 @@ async fn build_one(
             let resolved_target =
                 context.render_template(parq.target.as_deref().unwrap_or(&parq.name))?;
             let dest_ctx = context.with_vars(&[("target", &resolved_target)]);
-            let dest_value = get_dest_url(ldrs_env, &resolved_target, "pq")?;
+            let dest_value = get_dest_url(ldrs_env, &resolved_target, "PQ")?;
             let (_target_cols, out_schema, transform) =
                 resolve_transform(source_cols, parq.columns, schema)?;
             let props = with_bloom_filters(default_writer_props(), parq.bloom_filters);
@@ -682,7 +688,7 @@ async fn build_one(
                     m.common.columns.clone(),
                 ),
             };
-            let dest_value = get_dest_url(ldrs_env, &resolved_target, "delta")?;
+            let dest_value = get_dest_url(ldrs_env, &resolved_target, "DELTA")?;
             let storage_url = dest_value.1.strip_prefix("delta+").unwrap_or(&dest_value.1);
             let table_path = join_into_url(storage_url, &resolved_target)?.to_string();
             let (_target_cols, out_schema, transform) =
@@ -851,7 +857,7 @@ fn build_index_namer(
         ctx["index"] = serde_json::json!(index);
         handlebars
             .render_template(&template, &ctx)
-            .map_err(Into::into)
+            .map_err(|e| explain_render_error(&ctx, e))
     })
 }
 
@@ -882,6 +888,20 @@ mod tests {
         assert_eq!(namer(0).unwrap(), "out/public.users_00000.parquet");
         assert_eq!(namer(1).unwrap(), "out/public.users_00001.parquet");
         assert_eq!(namer(42).unwrap(), "out/public.users_00042.parquet");
+    }
+
+    #[test]
+    fn index_namer_render_error_is_enriched() {
+        let mut hb = handlebars::Handlebars::new();
+        setup_handlebars(&mut hb);
+        let context = serde_json::json!({ "name": "public.users" });
+        let namer = build_index_namer(hb, &context, "out/{{ missing }}.parquet");
+        let err = namer(0).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("template render failed") && msg.contains("bound variables"),
+            "render error should carry the enriched context, got: {msg}"
+        );
     }
 
     #[test]

@@ -56,7 +56,7 @@ fn usage_block() -> Value {
             "snowflake_to_local_parquet": "LDRS_DEST=file:///tmp/probe ldrs run --src sf.query --dest pq --name probe --sql 'SELECT 1 AS x' --opt filename=probe.snappy.parquet",
             "pipe_arrow_to_duckdb": "ldrs run --src sf.query --dest arrow --name probe --sql 'SELECT 1 AS x' | duckdb -c \"INSTALL nanoarrow FROM community; LOAD nanoarrow; FROM read_arrow('/dev/stdin')\"",
             "pipe_arrow_to_pyarrow": "ldrs run --src sf.query --dest arrow --name probe --sql 'SELECT 1' | python3 -c 'import pyarrow.ipc, sys; print(pyarrow.ipc.open_stream(sys.stdin.buffer).read_all())'",
-            "parameterized_sf_query": "LDRS_PARAM_P1=42 LDRS_PARAM_P2=2026-01-01 ldrs run --src sf.query --dest pq --name probe --sql 'SELECT * FROM t WHERE org_id = ? AND created_at >= ?' --config-inline 'param_keys: [P1, P2]' --opt filename=probe.parquet Note: env vars bind positionally in lexicographic order of the name, so zero-pad past nine (P01..P10) since lex order sorts P10 between P1 and P2"
+            "parameterized_sf_query": "LDRS_PARAM_P1=42 LDRS_PARAM_P2=2026-01-01 ldrs run --src sf.query --dest pq --name probe --sql 'SELECT * FROM t WHERE org_id = ? AND created_at >= ?' --config-inline 'param_keys: [P1, P2]' --opt filename=probe.parquet Note: values bind in the order listed in param_keys; without param_keys they fall back to lexicographic order of the env-var name"
         }
     })
 }
