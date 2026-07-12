@@ -136,10 +136,13 @@ pub fn get_env_values_by_keys<'a>(
     keys: &'a [String],
     env_vars: &'a [(String, String, Option<ColumnType>)],
 ) -> Vec<(String, Option<ColumnType>)> {
-    env_vars
-        .iter()
-        .filter(|(k, _, _)| keys.iter().any(|key| k.eq_ignore_ascii_case(key)))
-        .map(|(_, v, t)| (v.clone(), t.clone()))
+    keys.iter()
+        .filter_map(|key| {
+            env_vars
+                .iter()
+                .find(|(k, _, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v, t)| (v.clone(), t.clone()))
+        })
         .collect::<Vec<_>>()
 }
 
@@ -176,6 +179,18 @@ pub fn setup_handlebars(handle_bars: &mut handlebars::Handlebars) -> () {
 /// The registered helper names, for surfacing in a render error alongside the bound variables.
 pub fn helper_names() -> Vec<&'static str> {
     helper_defs().into_iter().map(|(name, _)| name).collect()
+}
+
+/// Attach the bound variable names and available helpers to a render failure
+pub fn explain_render_error(context: &Value, e: handlebars::RenderError) -> anyhow::Error {
+    let vars = context
+        .as_object()
+        .map(|m| m.keys().cloned().collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    anyhow::Error::from(e).context(format!(
+        "template render failed — bound variables: [{vars}]; helpers: [{}]",
+        helper_names().join(", ")
+    ))
 }
 
 #[derive(Debug)]
@@ -230,20 +245,7 @@ impl<'a> LdrsExecutionContext<'a> {
     pub fn render_template(&self, template: &str) -> Result<String, anyhow::Error> {
         self.handlebars
             .render_template(template, &self.context)
-            .map_err(|e| self.explain_render_error(e))
-    }
-
-    /// Attach the bound variable names and available helpers to a render failure.
-    fn explain_render_error(&self, e: handlebars::RenderError) -> anyhow::Error {
-        let vars = self
-            .context
-            .as_object()
-            .map(|m| m.keys().cloned().collect::<Vec<_>>().join(", "))
-            .unwrap_or_default();
-        anyhow::Error::from(e).context(format!(
-            "template render failed — bound variables: [{vars}]; helpers: [{}]",
-            helper_names().join(", ")
-        ))
+            .map_err(|e| explain_render_error(&self.context, e))
     }
 
     /// Derive a per-destination context: clone the base, insert (overwriting) the given vars,
@@ -267,6 +269,23 @@ mod tests {
     use tracing::info;
 
     use super::*;
+
+    #[test]
+    fn env_values_bind_in_key_order_not_lexical() {
+        // collect_params leaves env vars lexically sorted; when param_keys is given, binding must
+        // follow the param_keys order, not that lexical order (the P10-between-P1-P2 footgun).
+        let env_vars: Vec<(String, String, Option<ColumnType>)> = vec![
+            ("P1".to_string(), "one".to_string(), None),
+            ("P2".to_string(), "two".to_string(), None),
+        ];
+        let keys = vec!["P2".to_string(), "P1".to_string()];
+        let bound = get_env_values_by_keys(&keys, &env_vars);
+        assert_eq!(
+            bound,
+            vec![("two".to_string(), None), ("one".to_string(), None)],
+            "params must bind in param_keys order (P2, P1), not lexical env order"
+        );
+    }
 
     #[test_log::test]
     fn test_handlebars_time() {

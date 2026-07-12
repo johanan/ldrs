@@ -11,7 +11,7 @@ pub struct SFQuery {
     pub name: String,
     #[serde(default)]
     #[schemars(
-        description = "Names of the `LDRS_PARAM_<NAME>` env vars to bind into `sql`. Each entry names a distinct env var. Binding is positional in lexicographic order of the env-var names, array order in this field is ignored. Snowflake's driver uses `?` as the placeholder; this is part of the binding contract, not ldrs's surface. Optional per-position type coercion via the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix."
+        description = "Names of the `LDRS_PARAM_<NAME>` env vars to bind into `sql`. Each entry names a distinct env var. Binding is positional in the order of this array. Snowflake's driver uses `?` as the placeholder; this is part of the binding contract, not ldrs's surface. Optional per-position type coercion via the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix."
     )]
     pub param_keys: Option<Vec<String>>,
 }

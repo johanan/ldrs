@@ -257,7 +257,7 @@ fn main() -> Result<(), anyhow::Error> {
                         Ok(sf_url) => {
                             let conn =
                                 ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
-                                    &sf_url,
+                                    &sf_url, None, None,
                                 )?;
                             let message = conn.exec(&[sql])?;
                             info!("Snowflake exec result: {}", message);
@@ -295,7 +295,9 @@ fn main() -> Result<(), anyhow::Error> {
                             &context,
                         )?;
                         let conn =
-                            ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(&sf_url)?;
+                            ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
+                                &sf_url, None, None,
+                            )?;
 
                         if matches!(process_result.strategy, SnowflakeStrategy::Ingest) {
                             Err(anyhow::anyhow!("Ingest is not implemented"))?
