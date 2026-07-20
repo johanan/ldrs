@@ -1,0 +1,26 @@
+[package]
+name = "ldrs-core"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+deadpool-postgres.workspace = true
+futures.workspace = true
+ldrs-arrow = { path = "../ldrs-arrow" }
+ldrs-delta = { path = "../ldrs-delta" }
+ldrs-parquet = { path = "../ldrs-parquet" }
+ldrs-postgres = { path = "../ldrs-postgres" }
+parquet.workspace = true
+schemars.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream = "0.1.18"
+tracing.workspace = true
+url.workspace = true

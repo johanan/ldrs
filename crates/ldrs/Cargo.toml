@@ -24,6 +24,7 @@ deadpool-postgres.workspace = true
 dotenvy = "0.15.7"
 futures.workspace = true
 ldrs-arrow = { path = "../ldrs-arrow" }
+ldrs-core = { path = "../ldrs-core" }
 ldrs-delta = { path = "../ldrs-delta" }
 ldrs-parquet = { path = "../ldrs-parquet" }
 ldrs-postgres = { path = "../ldrs-postgres" }

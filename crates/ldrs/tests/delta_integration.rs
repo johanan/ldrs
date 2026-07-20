@@ -427,7 +427,11 @@ tables:
         .to_string();
 
     // `public.users` has an explicit `target`, so it lands at `public.users_curated`, not its name.
-    let table_names = ["public.users_curated", "public.numbers", "public.string_values"];
+    let table_names = [
+        "public.users_curated",
+        "public.numbers",
+        "public.string_values",
+    ];
 
     // cleanup before test
     for name in &table_names {

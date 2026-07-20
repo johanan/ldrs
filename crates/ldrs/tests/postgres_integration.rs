@@ -46,13 +46,13 @@ tables:
     filename: public.users/public.users.snappy.parquet
     delete_keys: [created]
 ",
-    // test with param types
+    // test the general LDRS_PARAM_<COL> fallback: `name` has no table-scoped var set,
+    // only LDRS_PARAM_NAME, so resolution falls through to the general form.
     "
 tables:
   - name: public_test.users
     filename: public.users/public.users.snappy.parquet
-    delete_keys: [created]
-    param_keys: [ { name: created, type: timestamp } ]
+    delete_keys: [name]
 ",
     "
 tables:
@@ -72,9 +72,10 @@ async fn test_postgres_file_drop() {
         ("LDRS_SRC".to_string(), file_url.to_string()),
         ("LDRS_DEST".to_string(), pg_role_url.to_string()),
         (
-            "LDRS_PARAM_PUBLIC_TEST_USERS_P1_TIMESTAMP".to_string(),
+            "LDRS_PARAM_PUBLIC_TEST_USERS_CREATED".to_string(),
             "2024-10-08T17:22:00".to_string(),
         ),
+        ("LDRS_PARAM_NAME".to_string(), "John Doe".to_string()),
     ];
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -86,7 +87,9 @@ async fn test_postgres_file_drop() {
     let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
     for config in TEST_CASES {
         let client = create_connection(pg_url).await.unwrap();
-        let _ = client.batch_execute("DROP SCHEMA IF EXISTS public_test CASCADE");
+        let _ = client
+            .batch_execute("DROP SCHEMA IF EXISTS public_test CASCADE")
+            .await;
         let ex = execute_configs(
             parse_yaml_config(&config, &ldrs_env).unwrap(),
             None,

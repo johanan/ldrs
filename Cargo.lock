@@ -1844,6 +1844,7 @@ dependencies = [
  "handlebars",
  "heck",
  "ldrs-arrow",
+ "ldrs-core",
  "ldrs-delta",
  "ldrs-parquet",
  "ldrs-postgres",
@@ -1888,6 +1889,29 @@ dependencies = [
  "test-log",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ldrs-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "deadpool-postgres",
+ "futures",
+ "ldrs-arrow",
+ "ldrs-delta",
+ "ldrs-parquet",
+ "ldrs-postgres",
+ "parquet",
+ "schemars",
+ "serde",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "url",
 ]
 
 [[package]]

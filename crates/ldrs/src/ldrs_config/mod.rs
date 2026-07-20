@@ -1,32 +1,21 @@
 pub mod config;
 pub mod field_validation;
 
-use std::{
-    collections::HashMap,
-    io::{self, IsTerminal},
-    pin::pin,
-    sync::Arc,
-};
+use std::collections::HashMap;
 
 use anyhow::Context;
-use arrow_array::RecordBatch;
-use arrow_schema::{Schema, SchemaRef};
 use deadpool_postgres::Pool;
-use futures::{future::join_all, Stream};
-use ldrs_arrow::{
-    build_arrow_transform_strategy, build_source_and_target_schema, ArrowColumnTransformStrategy,
-    ColumnSpec, ColumnType,
+use futures::future::join_all;
+use ldrs_arrow::ColumnType;
+use ldrs_core::execute::run_task;
+use ldrs_core::phase::PhaseOutput;
+use ldrs_core::plan::{
+    ArrowDest, DeltaDest, DeltaMode, DestSpec, PgDest, PqDest, SourceSpec, Task,
 };
-use ldrs_delta::{ensure_table, DeltaMergeSink, DeltaOverwriteSink, MergeConfig, TxnConfig};
-use ldrs_parquet::{
-    builder_from_url, columnspec_from_parquet, default_writer_props, get_fields,
-    with_bloom_filters, FileNamer, ParquetSink,
-};
-use ldrs_postgres::{build_pg_pool, check_for_role};
+use ldrs_delta::{MergeConfig, TxnConfig};
+use ldrs_parquet::FileNamer;
+use ldrs_postgres::check_for_role;
 use ldrs_storage::join_into_url;
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
-use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
@@ -41,41 +30,13 @@ use crate::{
         LdrsExecutionContext,
     },
     ldrs_snowflake::{
-        resolve_conn_creds, sf_arrow_stream, snowflake_source::SFSource, SnowflakeConnection,
+        resolve_conn_creds, sf_spawned, snowflake_source::SFSource, SnowflakeConnection,
     },
-    phase::{DeltaStrategy, DestinationOutcome, FileWritten, PhaseOutput},
-    postgres::{execute::PgSink, postgres_destination::split_pg_plan},
-    sink::{drive, ArrowStdoutSink, BatchTransform, Sink, Transforms},
+    postgres::{
+        postgres_destination::{split_pg_plan, PgPlan},
+        resolve::resolve_command,
+    },
 };
-
-enum StreamType {
-    Parquet(ParquetRecordBatchStream<ParquetObjectReader>),
-    Receiver(ReceiverStream<Result<RecordBatch, anyhow::Error>>),
-}
-
-impl Stream for StreamType {
-    type Item = Result<RecordBatch, anyhow::Error>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        match self.get_mut() {
-            StreamType::Parquet(stream) => pin!(stream)
-                .poll_next(cx)
-                .map(|opt| opt.map(|res| res.map_err(Into::into))),
-            StreamType::Receiver(stream) => pin!(stream).poll_next(cx),
-        }
-    }
-}
-
-struct LdrsSrcStream {
-    schema: Option<arrow_schema::SchemaRef>,
-    stream_type: StreamType,
-    source_cols: Vec<ColumnSpec>,
-    cleanup_handle: Option<JoinHandle<Result<(), anyhow::Error>>>,
-    source_files: Option<Vec<String>>,
-}
 
 struct ExecutionEnv<'a> {
     ldrs_env: &'a [(String, String)],
@@ -206,30 +167,6 @@ fn resolve_txn_config(
             })
         }
     }
-}
-
-fn column_helper(
-    source_cols: Vec<ColumnSpec>,
-    dest_cols: Vec<ColumnSpec>,
-    schema: &SchemaRef,
-) -> Result<
-    (
-        Vec<ColumnSpec>,
-        Vec<std::option::Option<ArrowColumnTransformStrategy>>,
-    ),
-    anyhow::Error,
-> {
-    let (src_cols, target_cols) =
-        build_source_and_target_schema(schema, source_cols, vec![dest_cols])?;
-    let strategies: Vec<Option<ArrowColumnTransformStrategy>> = src_cols
-        .iter()
-        .zip(target_cols.iter())
-        .zip(schema.fields().iter())
-        .map(|((source, target), field)| {
-            build_arrow_transform_strategy(source, target, field.data_type())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((target_cols, strategies))
 }
 
 pub fn parse_yaml_config(
@@ -373,39 +310,76 @@ pub async fn execute_task(
 ) -> Result<Option<u64>, anyhow::Error> {
     let name = task.src.name().to_string();
     let finalize_items = task.finalize;
-    let (src, context) = match task.src {
+    let context = LdrsExecutionContext::try_new(&name, &handlebars, &handlebars_vars)?;
+    let source = resolve_source(task.src, &context, env_params, ldrs_env)?;
+    let dests = task
+        .dests
+        .into_iter()
+        .map(|dest| resolve_dest(dest, &context, ldrs_env))
+        .collect::<Result<Vec<_>, _>>()?;
+    let task = Task {
+        name,
+        source,
+        dests,
+    };
+
+    let phase = match run_task(cloud_io_rt, pg_pools, task).await? {
+        Some(phase) => phase,
+        None => return Ok(None),
+    };
+    debug!("finalize phase output: {:?}", phase);
+    let finalize_failures = run_finalize(&finalize_items, &phase, ldrs_env, &context).await;
+    let load_failures: Vec<String> = phase
+        .destinations
+        .iter()
+        .filter_map(|d| d.status().err().cloned())
+        .collect();
+    // Load and finalize are distinct phases. Each
+    // failure is its own structured log line; the returned error is a summary, since the detail
+    // lives in the logs.
+    for f in &load_failures {
+        error!(phase = "load", "{f}");
+    }
+    for f in &finalize_failures {
+        error!(phase = "finalize", "{f}");
+    }
+    let mut summary = Vec::new();
+    if !load_failures.is_empty() {
+        summary.push(format!("{} load", load_failures.len()));
+    }
+    if !finalize_failures.is_empty() {
+        summary.push(format!("{} finalize", finalize_failures.len()));
+    }
+    if summary.is_empty() {
+        Ok(Some(phase.rows))
+    } else {
+        Err(anyhow::anyhow!(
+            "task '{}' failed (see logs): {} error(s)",
+            phase.name,
+            summary.join(", ")
+        ))
+    }
+}
+
+/// Resolve a source DTO into its plan spec: render templates and resolve `LDRS_*` env against the
+/// shared context.
+fn resolve_source(
+    src: LdrsSource,
+    context: &LdrsExecutionContext<'_>,
+    env_params: &[(String, String, Option<ColumnType>)],
+    ldrs_env: &[(String, String)],
+) -> Result<SourceSpec, anyhow::Error> {
+    match src {
         LdrsSource::File(file) => {
-            let ldrs_context =
-                LdrsExecutionContext::try_new(&file.name, &handlebars, &handlebars_vars)?;
             // if the filename is not provided, use the name as the filename
             let file_name = file.filename.as_deref().unwrap_or(file.name.as_str());
             let src_value = get_src_url(ldrs_env, &file.name, "FILE")?;
             // render the filename template, then join it onto the source base
-            let file_name = ldrs_context.render_template(file_name)?;
+            let file_name = context.render_template(file_name)?;
             let src_url = join_into_url(src_value.1.as_str(), &file_name)?;
-            let builder = builder_from_url(src_url.clone(), cloud_io_rt.clone()).await?;
-
-            let schema = builder.schema().clone();
-
-            let file_md = builder.metadata().clone();
-            let fields = get_fields(file_md.file_metadata())?;
-
-            // matches DuckDB STANDARD_VECTOR_SIZE
-            let stream = builder.with_batch_size(2048).build()?;
-            let source_cols = fields
-                .iter()
-                .filter_map(columnspec_from_parquet)
-                .collect::<Vec<_>>();
-            (
-                LdrsSrcStream {
-                    schema: Some(schema),
-                    stream_type: StreamType::Parquet(stream),
-                    source_cols,
-                    cleanup_handle: None,
-                    source_files: Some(vec![src_url.to_string()]),
-                },
-                ldrs_context,
-            )
+            Ok(SourceSpec::File {
+                url: src_url.to_string(),
+            })
         }
         LdrsSource::SF(sf) => {
             let sf_sql = match &sf {
@@ -414,201 +388,25 @@ pub async fn execute_task(
             };
             let name = sf.get_name();
             let sf_src = get_src_url(ldrs_env, &name, "SF")?;
-            let ldrs_context = LdrsExecutionContext::try_new(&name, &handlebars, &handlebars_vars)?;
-            let handled_name = ldrs_context.render_template("{{ shoutySnakeCase name }}")?;
-            let sf_params = sf.try_get_env_params(&handled_name, &env_params)?;
+            let handled_name = context.render_template("{{ shoutySnakeCase name }}")?;
+            let sf_params = sf.try_get_env_params(&handled_name, env_params)?;
             debug!("Snowflake Params: {:?}", sf_params);
-            let rendered_sql = ldrs_context.render_template(&sf_sql)?;
+            let rendered_sql = context.render_template(&sf_sql)?;
             let (pem_key, pem_file) = resolve_conn_creds(ldrs_env, &sf_src.0);
             let conn = SnowflakeConnection::create_connection(&sf_src.1, pem_key, pem_file)?;
-            let arrow_stream = sf_arrow_stream(&conn, &rendered_sql, sf_params).await?;
-            let schema = arrow_stream.schema_stream.await;
-            (
-                LdrsSrcStream {
-                    schema,
-                    stream_type: StreamType::Receiver(arrow_stream.batch_stream),
-                    source_cols: vec![],
-                    cleanup_handle: Some(arrow_stream.command_handle),
-                    source_files: None,
-                },
-                ldrs_context,
-            )
-        }
-    };
-
-    let rows = match src.schema {
-        Some(schema) => {
-            // Matching destinations share one transform; otherwise each casts its own.
-            let shared = all_columns_match(&task.dests);
-            let built = build_sinks(
-                task.dests,
-                &src.source_cols,
-                &schema,
-                &context,
-                ldrs_env,
-                env_params,
-                pg_pools,
-            )
-            .await?;
-            let (mut sinks, per_dest): (Vec<Sink>, Vec<Option<BatchTransform>>) =
-                built.into_iter().unzip();
-            let transforms = if shared {
-                Transforms::Shared(per_dest.into_iter().next().flatten())
-            } else {
-                Transforms::PerDest(per_dest)
-            };
-            match drive(src.stream_type, &mut sinks, &transforms).await {
-                Ok(rows) => {
-                    let destinations = finish_all(sinks, env_params).await?;
-                    let phase = PhaseOutput {
-                        name,
-                        source_files: src.source_files,
-                        success: destinations.iter().all(|d| d.succeeded()),
-                        rows,
-                        destinations,
-                    };
-                    debug!("finalize phase output: {:?}", phase);
-                    let finalize_failures =
-                        run_finalize(&finalize_items, &phase, ldrs_env, &context).await;
-                    let load_failures: Vec<String> = phase
-                        .destinations
-                        .iter()
-                        .filter_map(|d| d.status().err().cloned())
-                        .collect();
-                    // Load and finalize are distinct phases (data didn't land vs. post-load work
-                    // didn't run). Each failure is its own structured log line; the returned error
-                    // is a summary, since the detail lives in the logs.
-                    for f in &load_failures {
-                        error!(phase = "load", "{f}");
-                    }
-                    for f in &finalize_failures {
-                        error!(phase = "finalize", "{f}");
-                    }
-                    let mut summary = Vec::new();
-                    if !load_failures.is_empty() {
-                        summary.push(format!("{} load", load_failures.len()));
-                    }
-                    if !finalize_failures.is_empty() {
-                        summary.push(format!("{} finalize", finalize_failures.len()));
-                    }
-                    if summary.is_empty() {
-                        Ok(Some(rows))
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "task '{}' failed (see logs): {} error(s)",
-                            phase.name,
-                            summary.join(", ")
-                        ))
-                    }
-                }
-                Err(e) => {
-                    abort_all(sinks).await;
-                    Err(e)
-                }
-            }
-        }
-        None => {
-            warn!("No schema found, most likely the load failed or no Arrow Record Batches were produced.");
-            Ok(None)
-        }
-    }?;
-
-    if let Some(handle) = src.cleanup_handle {
-        match handle.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(anyhow::anyhow!("ldrs-sf task panicked: {}", e)),
-        }?
-    }
-    Ok(rows)
-}
-
-/// Whether every destination resolved to the same column specs.
-/// If they all match it is the same transforms as the source columns are the same as well.
-fn all_columns_match(dests: &[LdrsDestination]) -> bool {
-    dests.len() > 1 && dests.windows(2).all(|w| w[0].columns() == w[1].columns())
-}
-
-/// Get the pool for `url` from the registry, building and caching it on first use. Returns a
-/// clone of the cached pool.
-fn pool_for(pools: &mut HashMap<String, Pool>, url: &str) -> Result<Pool, anyhow::Error> {
-    if let Some(pool) = pools.get(url) {
-        return Ok(pool.clone());
-    }
-    let pool = build_pg_pool(url)?;
-    pools.insert(url.to_string(), pool.clone());
-    Ok(pool)
-}
-
-/// Build one sink per destination, paired with the transform it needs (the executor owns
-/// the cast; sinks are passthrough writers). Aborts already-built sinks if a later one
-/// fails to construct.
-pub async fn build_sinks(
-    dests: Vec<LdrsDestination>,
-    source_cols: &[ColumnSpec],
-    schema: &SchemaRef,
-    context: &LdrsExecutionContext<'_>,
-    ldrs_env: &[(String, String)],
-    env_params: &[(String, String, Option<ColumnType>)],
-    pg_pools: &mut HashMap<String, Pool>,
-) -> Result<Vec<(Sink, Option<BatchTransform>)>, anyhow::Error> {
-    let mut built = Vec::with_capacity(dests.len());
-    for dest in dests {
-        match build_one(
-            dest,
-            source_cols,
-            schema,
-            context,
-            ldrs_env,
-            env_params,
-            pg_pools,
-        )
-        .await
-        {
-            Ok(pair) => built.push(pair),
-            Err(e) => {
-                abort_all(built.into_iter().map(|(sink, _)| sink).collect()).await;
-                return Err(e);
-            }
+            let spawned = sf_spawned(&conn, &rendered_sql, sf_params);
+            Ok(SourceSpec::Spawned(spawned))
         }
     }
-    Ok(built)
 }
 
-/// Resolve a destination's column specs into its target columns, output schema, and the
-/// transform the executor will run (`None` when no cast is needed).
-fn resolve_transform(
-    source_cols: &[ColumnSpec],
-    columns: Vec<ColumnSpec>,
-    schema: &SchemaRef,
-) -> Result<(Vec<ColumnSpec>, SchemaRef, Option<BatchTransform>), anyhow::Error> {
-    let (target_cols, strategies) = column_helper(source_cols.to_vec(), columns, schema)?;
-    if strategies.iter().any(|s| s.is_some()) {
-        let out_schema = Arc::new(Schema::new(
-            target_cols
-                .iter()
-                .map(|col| col.to_arrow_field())
-                .collect::<Vec<_>>(),
-        ));
-        Ok((
-            target_cols,
-            out_schema.clone(),
-            Some((strategies, out_schema)),
-        ))
-    } else {
-        Ok((target_cols, schema.clone(), None))
-    }
-}
-
-async fn build_one(
+/// Resolve a destination DTO into its plan spec: render templates, resolve `LDRS_*` env, and expand
+/// the PG strategy into command sequences.
+fn resolve_dest(
     dest: LdrsDestination,
-    source_cols: &[ColumnSpec],
-    schema: &SchemaRef,
     context: &LdrsExecutionContext<'_>,
     ldrs_env: &[(String, String)],
-    env_params: &[(String, String, Option<ColumnType>)],
-    pg_pools: &mut HashMap<String, Pool>,
-) -> Result<(Sink, Option<BatchTransform>), anyhow::Error> {
+) -> Result<DestSpec, anyhow::Error> {
     match dest {
         LdrsDestination::Pg(pg_dest) => {
             let resolved_target =
@@ -638,43 +436,46 @@ async fn build_one(
                 ],
             )
             .map(|(_, v)| v.to_string()));
-            let plan = split_pg_plan(pg_dest.to_pg_commands())?;
-            // PG keeps `target_cols` for COPY encoding; the cast runs in the executor.
-            let (target_cols, _out_schema, transform) =
-                resolve_transform(source_cols, pg_dest.get_columns(), schema)?;
-            let pool = pool_for(pg_pools, &pg_url)?;
-            let pg = PgSink::open(
-                pool,
+            let PgPlan {
+                before,
+                load_table: load_table_tmpl,
+                after,
+            } = split_pg_plan(pg_dest.to_pg_commands())?;
+            let before = before
+                .iter()
+                .map(|c| resolve_command(c, &pg_ctx, ldrs_env, &resolved_target))
+                .collect::<Result<Vec<_>, _>>()?;
+            let after = after
+                .iter()
+                .map(|c| resolve_command(c, &pg_ctx, ldrs_env, &resolved_target))
+                .collect::<Result<Vec<_>, _>>()?;
+            let load_table = pg_ctx.render_template(&load_table_tmpl)?;
+            Ok(DestSpec::Pg(PgDest {
+                conn_url: pg_url,
                 role,
-                plan,
-                target_cols,
-                resolved_target,
-                &pg_ctx,
-                env_params,
-            )
-            .await?;
-            Ok((Sink::Pg(pg), transform))
+                before,
+                load_table,
+                after,
+                target: resolved_target,
+                columns: pg_dest.get_columns(),
+            }))
         }
         LdrsDestination::Pq(parq) => {
             let resolved_target =
                 context.render_template(parq.target.as_deref().unwrap_or(&parq.name))?;
             let dest_ctx = context.with_vars(&[("target", &resolved_target)]);
             let dest_value = get_dest_url(ldrs_env, &resolved_target, "PQ")?;
-            let (_target_cols, out_schema, transform) =
-                resolve_transform(source_cols, parq.columns, schema)?;
-            let props = with_bloom_filters(default_writer_props(), parq.bloom_filters);
             let mut namer_hb = handlebars::Handlebars::new();
             setup_handlebars(&mut namer_hb);
             let namer = build_index_namer(namer_hb, &dest_ctx.context, &parq.filename);
-            let sink = ParquetSink::new(
-                &dest_value.1,
-                out_schema,
-                parq.max_rows,
-                parq.max_bytes,
+            Ok(DestSpec::Pq(PqDest {
+                url: dest_value.1.clone(),
                 namer,
-                Some(props),
-            )?;
-            Ok((Sink::Pq(sink), transform))
+                bloom_filters: parq.bloom_filters,
+                max_rows: parq.max_rows,
+                max_bytes: parq.max_bytes,
+                columns: parq.columns,
+            }))
         }
         LdrsDestination::Delta(delta_dest) => {
             let (resolved_target, columns) = match &delta_dest {
@@ -691,16 +492,11 @@ async fn build_one(
             let dest_value = get_dest_url(ldrs_env, &resolved_target, "DELTA")?;
             let storage_url = dest_value.1.strip_prefix("delta+").unwrap_or(&dest_value.1);
             let table_path = join_into_url(storage_url, &resolved_target)?.to_string();
-            let (_target_cols, out_schema, transform) =
-                resolve_transform(source_cols, columns, schema)?;
-
-            ensure_table(&table_path, &out_schema).await?;
-            match delta_dest {
-                DeltaDestination::Overwrite(o) => {
-                    let sink =
-                        DeltaOverwriteSink::new(&table_path, out_schema, o.max_rows, o.max_bytes)?;
-                    Ok((Sink::DeltaOverwrite(sink), transform))
-                }
+            let mode = match delta_dest {
+                DeltaDestination::Overwrite(o) => DeltaMode::Overwrite {
+                    max_rows: o.max_rows,
+                    max_bytes: o.max_bytes,
+                },
                 DeltaDestination::Merge(m) => {
                     let DeltaMerge {
                         merge_keys,
@@ -725,121 +521,24 @@ async fn build_one(
                     };
                     let dest_ctx = context.with_vars(&[("target", &resolved_target)]);
                     let txn_config = resolve_txn_config(txn, &dest_ctx)?;
-                    let merge_config = MergeConfig {
+                    DeltaMode::Merge(MergeConfig {
                         merge_keys,
                         allow_null_keys,
                         max_rows: m.common.max_rows,
                         max_bytes: m.common.max_bytes,
                         txn_config,
-                    };
-                    let sink = DeltaMergeSink::new(&table_path, out_schema, merge_config)?;
-                    Ok((Sink::DeltaMerge(sink), transform))
-                }
-            }
-        }
-        LdrsDestination::Arrow(arrow_dest) => {
-            if io::stdout().is_terminal() {
-                return Err(anyhow::Error::msg("Outputting Arrow IPC Stream to stdout is not supported in a terminal. Please redirect the output to a file or pipe it to another command."));
-            }
-            let (_target_cols, out_schema, transform) =
-                resolve_transform(source_cols, arrow_dest.columns, schema)?;
-            let sink = ArrowStdoutSink::new(io::stdout(), out_schema)?;
-            Ok((Sink::Arrow(sink), transform))
-        }
-    }
-}
-
-/// Finish every sink after a successful stream, recording each one's outcome. Sinks finish
-/// concurrently; each commit is independent, so one failure does not stop the others.
-pub async fn finish_all(
-    sinks: Vec<Sink>,
-    env_params: &[(String, String, Option<ColumnType>)],
-) -> Result<Vec<DestinationOutcome>, anyhow::Error> {
-    let destinations: Vec<DestinationOutcome> = join_all(sinks.into_iter().map(|sink| {
-        async move {
-            match sink {
-                Sink::Pg(pg) => {
-                    let table = pg.target().to_string();
-                    let result = pg
-                        .commit(env_params)
-                        .await
-                        .with_context(|| format!("postgres load to {table} failed"))
-                        .map_err(|e| format!("{e:#}"));
-                    Some(DestinationOutcome::Pg { table, result })
-                }
-                Sink::Pq(s) => {
-                    let location = s.base_path().to_string();
-                    Some(DestinationOutcome::Parquet {
-                        location: location.clone(),
-                        result: s
-                            .finish()
-                            .await
-                            .map(|metas| {
-                                metas
-                                    .into_iter()
-                                    .map(|(path, md)| FileWritten {
-                                        path,
-                                        rows: md.file_metadata().num_rows().max(0) as u64,
-                                    })
-                                    .collect()
-                            })
-                            .with_context(|| format!("parquet write to {location} failed"))
-                            .map_err(|e| format!("{e:#}")),
                     })
                 }
-                Sink::DeltaOverwrite(s) => {
-                    let location = s.base_path().to_string();
-                    Some(DestinationOutcome::Delta {
-                        location: location.clone(),
-                        strategy: DeltaStrategy::Overwrite,
-                        result: s
-                            .finish()
-                            .await
-                            .with_context(|| format!("delta overwrite at {location} failed"))
-                            .map_err(|e| format!("{e:#}")),
-                    })
-                }
-                Sink::DeltaMerge(s) => {
-                    let location = s.base_path().to_string();
-                    Some(DestinationOutcome::Delta {
-                        location: location.clone(),
-                        strategy: DeltaStrategy::Merge,
-                        result: s
-                            .finish()
-                            .await
-                            .map(|_| ())
-                            .with_context(|| format!("delta merge at {location} failed"))
-                            .map_err(|e| format!("{e:#}")),
-                    })
-                }
-                // arrow: terminal, no outcome entry; a finish error (e.g. closed pipe) is logged, not fatal
-                Sink::Arrow(s) => {
-                    if let Err(e) = s.finish() {
-                        warn!("arrow sink finish failed: {e}");
-                    }
-                    None
-                }
-            }
+            };
+            Ok(DestSpec::Delta(DeltaDest {
+                table_path,
+                mode,
+                columns,
+            }))
         }
-    }))
-    .await
-    .into_iter()
-    .flatten()
-    .collect();
-    Ok(destinations)
-}
-
-/// Failure-path cleanup. Each sink undoes what it can: Postgres rolls back, the file
-/// sinks delete their incomplete output, Arrow is a no-op. Best-effort.
-pub async fn abort_all(sinks: Vec<Sink>) {
-    for sink in sinks {
-        match sink {
-            Sink::Pg(pg) => pg.rollback().await,
-            Sink::Pq(s) => s.abort().await,
-            Sink::DeltaOverwrite(s) => s.abort().await,
-            Sink::DeltaMerge(s) => s.abort().await,
-            Sink::Arrow(s) => s.abort(),
-        }
+        LdrsDestination::Arrow(arrow_dest) => Ok(DestSpec::Arrow(ArrowDest {
+            columns: arrow_dest.columns,
+        })),
     }
 }
 
@@ -867,17 +566,6 @@ mod tests {
     use ldrs_arrow::{ColumnType, TimeUnit};
 
     use super::*;
-
-    #[test]
-    fn pool_for_caches_pools_by_url() {
-        // build_pg_pool is lazy (no connection), so this exercises the registry offline.
-        let mut pools = HashMap::new();
-        let _ = pool_for(&mut pools, "postgresql://localhost/db1").unwrap();
-        let _ = pool_for(&mut pools, "postgresql://localhost/db1").unwrap();
-        assert_eq!(pools.len(), 1, "same URL reuses one pool");
-        let _ = pool_for(&mut pools, "postgresql://localhost/db2").unwrap();
-        assert_eq!(pools.len(), 2, "a different URL gets its own pool");
-    }
 
     #[test]
     fn index_namer_renders_padded_distinct_names() {

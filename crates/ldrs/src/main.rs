@@ -27,12 +27,6 @@ pub struct DeltaLoad {
     pub table_name: String,
 }
 
-#[derive(Subcommand)]
-pub enum DeltaCommands {
-    /// Load data into Delta Lake
-    Load(DeltaLoad),
-}
-
 #[derive(Args)]
 struct ConfigArgs {
     #[arg(short, long)]
@@ -44,8 +38,6 @@ struct ConfigArgs {
 
 #[derive(Subcommand)]
 pub enum SnowflakeCommands {
-    /// Execute a SQL statement (non-data retrieval)
-    Exec { sql: String },
     Ingest {
         #[arg(long, short)]
         file_url: String,
@@ -93,11 +85,6 @@ struct RunArgs {
 enum Destination {
     /// Load from a config file. All sources and destinations
     Ld(ConfigArgs),
-    /// Delta Lake destination
-    Delta {
-        #[command(subcommand)]
-        command: DeltaCommands,
-    },
     /// Snowflake destination
     Sf {
         #[command(subcommand)]
@@ -207,12 +194,6 @@ fn main() -> Result<(), anyhow::Error> {
                 let configs = parse_yaml_config(&config_string, &ldrs_env)?;
                 execute_configs(configs, args.select, &ldrs_env, &rt.handle()).await
             }
-            Destination::Delta { command } => match command {
-                DeltaCommands::Load(args) => {
-                    debug!("delta load with {:?}", args);
-                    Ok(())
-                }
-            },
             Destination::Run(args) => {
                 let ldrs_env = get_all_ldrs_env_vars();
                 let config = build_run_block(&args)?;
@@ -252,20 +233,6 @@ fn main() -> Result<(), anyhow::Error> {
                 }
             },
             Destination::Sf { command } => match command {
-                SnowflakeCommands::Exec { sql } => {
-                    match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
-                        Ok(sf_url) => {
-                            let conn =
-                                ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
-                                    &sf_url, None, None,
-                                )?;
-                            let message = conn.exec(&[sql])?;
-                            info!("Snowflake exec result: {}", message);
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
                 SnowflakeCommands::Ingest {
                     file_url,
                     pattern,
@@ -294,10 +261,9 @@ fn main() -> Result<(), anyhow::Error> {
                             None,
                             &context,
                         )?;
-                        let conn =
-                            ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
-                                &sf_url, None, None,
-                            )?;
+                        let conn = ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
+                            &sf_url, None, None,
+                        )?;
 
                         if matches!(process_result.strategy, SnowflakeStrategy::Ingest) {
                             Err(anyhow::anyhow!("Ingest is not implemented"))?

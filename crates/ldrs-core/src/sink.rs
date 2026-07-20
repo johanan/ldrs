@@ -1,6 +1,7 @@
 use std::io::{BufWriter, Stdout, Write};
 use std::pin::pin;
 
+use anyhow::Context;
 use arrow::ipc::writer::StreamWriter;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -8,8 +9,10 @@ use futures::{future::join_all, StreamExt, TryStream, TryStreamExt};
 use ldrs_arrow::{transform_batch, ArrowColumnTransformStrategy};
 use ldrs_delta::{DeltaMergeSink, DeltaOverwriteSink};
 use ldrs_parquet::ParquetSink;
+use ldrs_postgres::PgSink;
+use tracing::warn;
 
-use crate::postgres::execute::PgSink;
+use crate::phase::{DeltaStrategy, DestinationOutcome, FileWritten};
 
 /// Streams Arrow record batches to `writer` as an Arrow IPC stream.
 pub struct ArrowStdoutSink<W: Write = Stdout> {
@@ -138,6 +141,97 @@ where
         }
     }
     Ok(total_rows)
+}
+
+/// Finish every sink after a successful stream, recording each one's outcome. Sinks finish
+/// concurrently; each commit is independent, so one failure does not stop the others.
+pub async fn finish_all(sinks: Vec<Sink>) -> Result<Vec<DestinationOutcome>, anyhow::Error> {
+    let destinations: Vec<DestinationOutcome> = join_all(sinks.into_iter().map(|sink| {
+        async move {
+            match sink {
+                Sink::Pg(pg) => {
+                    let table = pg.target().to_string();
+                    let result = pg
+                        .commit()
+                        .await
+                        .with_context(|| format!("postgres load to {table} failed"))
+                        .map_err(|e| format!("{e:#}"));
+                    Some(DestinationOutcome::Pg { table, result })
+                }
+                Sink::Pq(s) => {
+                    let location = s.base_path().to_string();
+                    Some(DestinationOutcome::Parquet {
+                        location: location.clone(),
+                        result: s
+                            .finish()
+                            .await
+                            .map(|metas| {
+                                metas
+                                    .into_iter()
+                                    .map(|(path, md)| FileWritten {
+                                        path,
+                                        rows: md.file_metadata().num_rows().max(0) as u64,
+                                    })
+                                    .collect()
+                            })
+                            .with_context(|| format!("parquet write to {location} failed"))
+                            .map_err(|e| format!("{e:#}")),
+                    })
+                }
+                Sink::DeltaOverwrite(s) => {
+                    let location = s.base_path().to_string();
+                    Some(DestinationOutcome::Delta {
+                        location: location.clone(),
+                        strategy: DeltaStrategy::Overwrite,
+                        result: s
+                            .finish()
+                            .await
+                            .with_context(|| format!("delta overwrite at {location} failed"))
+                            .map_err(|e| format!("{e:#}")),
+                    })
+                }
+                Sink::DeltaMerge(s) => {
+                    let location = s.base_path().to_string();
+                    Some(DestinationOutcome::Delta {
+                        location: location.clone(),
+                        strategy: DeltaStrategy::Merge,
+                        result: s
+                            .finish()
+                            .await
+                            .map(|_| ())
+                            .with_context(|| format!("delta merge at {location} failed"))
+                            .map_err(|e| format!("{e:#}")),
+                    })
+                }
+                // arrow: terminal, no outcome entry; a finish error (e.g. closed pipe) is logged, not fatal
+                Sink::Arrow(s) => {
+                    if let Err(e) = s.finish() {
+                        warn!("arrow sink finish failed: {e}");
+                    }
+                    None
+                }
+            }
+        }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    Ok(destinations)
+}
+
+/// Failure-path cleanup. Each sink undoes what it can: Postgres rolls back, the file
+/// sinks delete their incomplete output, Arrow is a no-op. Best-effort.
+pub async fn abort_all(sinks: Vec<Sink>) {
+    for sink in sinks {
+        match sink {
+            Sink::Pg(pg) => pg.rollback().await,
+            Sink::Pq(s) => s.abort().await,
+            Sink::DeltaOverwrite(s) => s.abort().await,
+            Sink::DeltaMerge(s) => s.abort().await,
+            Sink::Arrow(s) => s.abort(),
+        }
+    }
 }
 
 #[cfg(test)]

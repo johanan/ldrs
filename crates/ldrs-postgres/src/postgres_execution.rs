@@ -1,5 +1,3 @@
-use std::iter::zip;
-
 use anyhow::Context;
 use ldrs_arrow::{ColumnSpec, ColumnType};
 use postgres_types::ToSql;
@@ -39,23 +37,26 @@ pub async fn execute_sql(client: &Client, sql: &str) -> Result<(), anyhow::Error
 pub async fn execute_prepared_stmt(
     client: &Client,
     sql: &str,
-    params: &[(String, Option<ColumnType>)],
-    stmt_types: Option<&[ColumnType]>,
+    params: &[(String, String)],
+    cols: &[ColumnSpec],
 ) -> Result<(), anyhow::Error> {
-    // if stmt has types use them, otherwise use from the matched_params
-    let param_types = match stmt_types {
-        Some(types) => {
-            if types.len() != params.len() {
-                return Err(anyhow::anyhow!("Mismatched parameter types length. Please make sure the number of types matches the number of parameters."));
-            }
-            // zip together with the string value and column type
-            zip(params.iter().map(|(k, _)| k), types.iter().map(Some)).collect::<Vec<_>>()
-        }
-        None => params
-            .iter()
-            .map(|(k, ct)| (k, ct.as_ref()))
-            .collect::<Vec<_>>(),
-    };
+    // Type each bind from the target columns by name. The table's columns are the resolved
+    // schema, so a bound key is present by definition; an unmatched name has no type and binds
+    // as text (its string value passes through unchanged).
+    let typed: Vec<(&String, Option<ColumnType>)> = params
+        .iter()
+        .map(|(name, value)| {
+            let ty = cols
+                .iter()
+                .find(|c| c.name().eq_ignore_ascii_case(name))
+                .map(ColumnType::from);
+            (value, ty)
+        })
+        .collect();
+    let param_types = typed
+        .iter()
+        .map(|(value, ty)| (*value, ty.as_ref()))
+        .collect::<Vec<_>>();
 
     let param_values = param_types
         .iter()

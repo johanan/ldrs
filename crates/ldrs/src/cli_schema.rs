@@ -1,5 +1,6 @@
 use clap::Subcommand;
 use ldrs_arrow::{ColumnSpec, ColumnType};
+use ldrs_core::phase::PhaseOutput;
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde_json::{json, Value};
 
@@ -10,7 +11,6 @@ use crate::{
     ldrs_config::config::{ArrowDestination, LdrsConfig},
     ldrs_snowflake::snowflake_source::SFSource,
     parquet::ParquetDestination,
-    phase::PhaseOutput,
     postgres::postgres_destination::PgDestination,
 };
 

@@ -4,6 +4,7 @@ members = ["crates/*"]
 default-members = [
     "crates/ldrs",
     "crates/ldrs-arrow",
+    "crates/ldrs-core",
     "crates/ldrs-delta",
     "crates/ldrs-parquet",
     "crates/ldrs-postgres",
