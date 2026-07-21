@@ -29,7 +29,10 @@ fn test_schema() -> SchemaRef {
 }
 
 fn make_batch(id_range: Range<i64>, value_offset: i64, base_ts: i64) -> RecordBatch {
-    let ids: Vec<i64> = id_range.collect();
+    make_batch_from_ids(id_range.collect(), value_offset, base_ts)
+}
+
+fn make_batch_from_ids(ids: Vec<i64>, value_offset: i64, base_ts: i64) -> RecordBatch {
     let values: Vec<i64> = ids.iter().map(|id| id + value_offset).collect();
     let names: Vec<String> = ids.iter().map(|id| format!("row-{:06}", id)).collect();
     let timestamps: Vec<i64> = ids.iter().map(|id| base_ts + id * TS_STEP).collect();
@@ -1040,4 +1043,128 @@ async fn test_merge_small_change_uses_inline_dv() {
     // Interop: both merges were pure updates logical table is still ids 1..=1000.
     // This also proves DuckDB can decode our inline DV bytes (storageType "i").
     verify_duckdb_count(&table_path, 1000);
+}
+
+// Recovering an existing *sidecar* ('u') DV descriptor for the remove action: the first merge
+// deletes enough scattered rows to spill the DV past the inline threshold into a `.bin` file, then
+// the second merge touches the same file and must tombstone it with that exact sidecar descriptor
+// (storageType "u", offset present).
+#[tokio::test]
+#[test_log::test]
+async fn test_merge_recovers_existing_sidecar_dv() {
+    let table_path = test_table_path("sidecar_dv");
+    cleanup_table(&table_path);
+
+    let schema = test_schema();
+    let table_url = format!("file://{}/", table_path);
+
+    // Target: 2000 contiguous rows in one file.
+    let target = make_target_batch(1..2001);
+    overwrite_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(target)]),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let config = MergeConfig {
+        merge_keys: vec!["id".to_string()],
+        allow_null_keys: false,
+        max_rows: None,
+        max_bytes: None,
+        txn_config: TxnConfig::None,
+    };
+
+    // First merge: update every even id (1000 scattered rows). Scattered deletes defeat roaring's
+    // run compression, so the serialized bitmap exceeds the 1024-byte inline threshold and lands in
+    // a sidecar file (storageType "u").
+    let even_ids: Vec<i64> = (1..=2000).filter(|id| id % 2 == 0).collect();
+    let first_source = make_batch_from_ids(even_ids, 10_000, SOURCE_BASE_TS);
+    let stats1 = merge_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(first_source)]),
+        config.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats1.matched_rows, 1000);
+    assert_eq!(stats1.files_with_dvs, 1, "one target file should get a DV");
+
+    // v2 add carries a sidecar DV; capture its descriptor path so we can assert the remove
+    // references the exact same DV.
+    let v2 = read_log_actions(&table_path, 2);
+    let v2_dv_adds: Vec<&serde_json::Value> = v2
+        .iter()
+        .filter_map(|a| a.get("add"))
+        .filter(|a| a.get("deletionVector").is_some())
+        .collect();
+    assert_eq!(v2_dv_adds.len(), 1, "exactly one add should carry a DV");
+    let first_dv = &v2_dv_adds[0]["deletionVector"];
+    assert_eq!(
+        first_dv["storageType"].as_str(),
+        Some("u"),
+        "1000 scattered deletes should spill to a sidecar DV; got: {first_dv}"
+    );
+    let first_dv_path = first_dv["pathOrInlineDv"].as_str().map(str::to_string);
+
+    // Second merge: touch three odd ids still live in the same file. This forces recovery of the
+    // existing sidecar descriptor for the remove action.
+    let second_source = make_batch_from_ids(vec![1, 3, 5], 10_000, SOURCE_BASE_TS);
+    let stats2 = merge_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(second_source)]),
+        config.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats2.matched_rows, 3, "second merge matches the 3 odd ids");
+
+    // v3 must tombstone the file with the exact sidecar descriptor recovered from the scan output.
+    let v3 = read_log_actions(&table_path, 3);
+    let dv_removes: Vec<&serde_json::Value> = v3
+        .iter()
+        .filter_map(|a| a.get("remove"))
+        .filter(|r| r.get("deletionVector").is_some())
+        .collect();
+    assert_eq!(
+        dv_removes.len(),
+        1,
+        "second merge should tombstone the one DV'd file"
+    );
+    let removed_dv = &dv_removes[0]["deletionVector"];
+    assert_eq!(
+        removed_dv["storageType"].as_str(),
+        Some("u"),
+        "recovered descriptor should be the sidecar DV; got: {removed_dv}"
+    );
+    assert_eq!(
+        removed_dv["offset"].as_i64(),
+        Some(1),
+        "sidecar DV descriptor carries offset=1; got: {removed_dv}"
+    );
+    assert_eq!(
+        removed_dv["pathOrInlineDv"].as_str().map(str::to_string),
+        first_dv_path,
+        "remove must reference the exact existing sidecar DV from v2"
+    );
+
+    // Union DV covers 1000 evens + 3 odds.
+    let v3_cardinality: i64 = v3
+        .iter()
+        .filter_map(|a| a.get("add"))
+        .filter(|a| a.get("deletionVector").is_some())
+        .map(|a| a["deletionVector"]["cardinality"].as_i64().unwrap())
+        .sum();
+    assert_eq!(
+        v3_cardinality, 1003,
+        "second merge's DV should union with the sidecar DV from v2 (1000 + 3)"
+    );
+
+    // Interop: both merges were pure updates logical table is still ids 1..=2000.
+    verify_duckdb_count(&table_path, 2000);
 }

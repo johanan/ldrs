@@ -2,7 +2,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::row::{RowConverter, SortField};
-use arrow_array::{cast::AsArray, types::Int64Type, ArrayRef, RecordBatch};
+use arrow_array::{
+    cast::AsArray,
+    types::{Int32Type, Int64Type},
+    Array, ArrayRef, RecordBatch,
+};
 use arrow_schema::SchemaRef;
 use futures::{Stream, StreamExt};
 use ldrs_parquet::{
@@ -28,6 +32,8 @@ use super::stats::{
     delta_stats_to_json, key_bounds_as_scalars, max_stat_as_i64, parquet_metadata_to_delta_stats,
     select_row_groups_by_scalars,
 };
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{Expression as Expr, Predicate as Pred};
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::Snapshot;
@@ -337,7 +343,7 @@ async fn commit_merge(
         }
 
         // find candidate target files whose stats overlap the source's key range on the first merge key
-        let candidate_files = find_candidate_target_files(
+        let (candidate_files, existing_dvs) = find_candidate_target_files(
             &snapshot,
             engine.as_ref(),
             schema,
@@ -404,23 +410,29 @@ async fn commit_merge(
             _ => None,
         };
 
-        // Removes must include the existing DV descriptor (if any) to tombstone the correct add
-        let paths_of_interest: HashSet<&str> = file_matches
-            .iter()
-            .map(|fm| fm.scan_file.path.as_str())
-            .collect();
-        let existing_dvs = load_existing_dvs(store, base_path, &paths_of_interest).await?;
-
+        // Removes must include the existing DV descriptor (if any) to tombstone the correct add.
+        // We must remove the target so we required the dv descriptor to exist if the engine says it exists.
         let removes: Vec<DeltaRemove> = file_matches
             .iter()
-            .map(|fm| DeltaRemove {
-                path: fm.scan_file.path.clone(),
-                deletion_timestamp: now,
-                data_change: true,
-                size: fm.scan_file.size,
-                deletion_vector: existing_dvs.get(&fm.scan_file.path).cloned(),
+            .map(|fm| {
+                let deletion_vector = existing_dvs.get(&fm.scan_file.path).cloned();
+                if fm.scan_file.dv_info.has_vector() && deletion_vector.is_none() {
+                    anyhow::bail!(
+                        "matched target file {} has a deletion vector but its descriptor could \
+                         not be recovered from the scan output; refusing to commit a remove that \
+                         would leave a ghost file",
+                        fm.scan_file.path
+                    );
+                }
+                Ok(DeltaRemove {
+                    path: fm.scan_file.path.clone(),
+                    deletion_timestamp: now,
+                    data_change: true,
+                    size: fm.scan_file.size,
+                    deletion_vector,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
         const DV_INLINE_THRESHOLD: usize = 1024;
 
@@ -693,13 +705,21 @@ fn compute_batch_version(
 
 /// Find target files whose stats overlap the source's key range on the first merge key.
 /// Uses a delta-kernel predicate scan — file-level skipping based on min/max stats.
+/// Returns the candidate files and, keyed by path, the existing DV descriptor of every file
+/// that currently carries one.
 fn find_candidate_target_files(
     snapshot: &delta_kernel::SnapshotRef,
     engine: &dyn delta_kernel::Engine,
     schema: &SchemaRef,
     source_files: &[(String, ParquetMetaData)],
     first_key: &str,
-) -> Result<Vec<ScanFile>, anyhow::Error> {
+) -> Result<
+    (
+        Vec<ScanFile>,
+        HashMap<String, super::dv::DeletionVectorDescriptor>,
+    ),
+    anyhow::Error,
+> {
     let scalar_bounds = key_bounds_as_scalars(source_files, first_key, schema);
 
     let scan = if let Some((min_scalar, max_scalar)) = scalar_bounds {
@@ -718,67 +738,81 @@ fn find_candidate_target_files(
     };
 
     let mut candidate_files: Vec<ScanFile> = Vec::new();
+    let mut existing_dvs: HashMap<String, super::dv::DeletionVectorDescriptor> = HashMap::new();
     for scan_meta in scan.scan_metadata(engine)? {
         let scan_meta = scan_meta?;
         fn collect(acc: &mut Vec<ScanFile>, file: ScanFile) {
             acc.push(file);
         }
+        // `visit_scan_files` applies the selection vector and yields typed `ScanFile`s, but
+        // `DvInfo` hides the descriptor; read it off the same batch's `deletionVector` column.
         candidate_files = scan_meta.visit_scan_files(candidate_files, collect)?;
+        existing_dvs.extend(read_existing_dvs(&scan_meta.scan_files)?);
     }
-    Ok(candidate_files)
+    Ok((candidate_files, existing_dvs))
 }
 
-/// Walk the delta log in reverse, finding the latest `add` action for each path of interest.
-/// Returns a map from path to its current DV descriptor (only entries for paths that have a DV).
-/// Paths whose latest add had no DV are absent from the returned map.
-/// Does not handle checkpoints. To be added later
-async fn load_existing_dvs(
-    store: &Arc<dyn ObjectStore>,
-    base_path: &object_store::path::Path,
-    paths_of_interest: &HashSet<&str>,
+/// Read the as-stored `deletionVector` descriptors off one scan-output batch, keyed by file path.
+/// Uses the engine scan for a full output of possible files.
+fn read_existing_dvs(
+    scan_files: &FilteredEngineData,
 ) -> Result<HashMap<String, super::dv::DeletionVectorDescriptor>, anyhow::Error> {
-    use futures::TryStreamExt;
+    let batch = scan_files
+        .data()
+        .any_ref()
+        .downcast_ref::<ArrowEngineData>()
+        .ok_or_else(|| anyhow::anyhow!("scan output was not ArrowEngineData"))?
+        .record_batch();
+    let selection = scan_files.selection_vector();
 
-    let log_dir = base_path.clone().join("_delta_log");
-    let mut log_files: Vec<object_store::ObjectMeta> = store
-        .list(Some(&log_dir))
-        .try_filter(|m| {
-            let is_json = m.location.as_ref().ends_with(".json");
-            async move { is_json }
-        })
-        .try_collect()
-        .await?;
-    // reverse sort: newest first
-    log_files.sort_by(|a, b| b.location.as_ref().cmp(a.location.as_ref()));
+    let paths = batch
+        .column_by_name("path")
+        .expect("scan row schema has `path`")
+        .as_string::<i32>();
+    let dv = batch
+        .column_by_name("deletionVector")
+        .expect("scan row schema has `deletionVector`")
+        .as_struct();
+    let storage_type = dv
+        .column_by_name("storageType")
+        .expect("deletionVector has `storageType`")
+        .as_string::<i32>();
+    let path_or_inline = dv
+        .column_by_name("pathOrInlineDv")
+        .expect("deletionVector has `pathOrInlineDv`")
+        .as_string::<i32>();
+    let offset = dv
+        .column_by_name("offset")
+        .expect("deletionVector has `offset`")
+        .as_primitive::<Int32Type>();
+    let size_in_bytes = dv
+        .column_by_name("sizeInBytes")
+        .expect("deletionVector has `sizeInBytes`")
+        .as_primitive::<Int32Type>();
+    let cardinality = dv
+        .column_by_name("cardinality")
+        .expect("deletionVector has `cardinality`")
+        .as_primitive::<Int64Type>();
 
-    let mut found: HashMap<String, super::dv::DeletionVectorDescriptor> = HashMap::new();
-    let mut paths_remaining: HashSet<&str> = paths_of_interest.clone();
-
-    for log_file in log_files {
-        if paths_remaining.is_empty() {
-            break;
+    let mut out = HashMap::new();
+    for row in 0..batch.num_rows() {
+        // selection vector may be shorter than the batch; a missing tail entry means selected
+        let selected = selection.get(row).copied().unwrap_or(true);
+        if !selected || dv.is_null(row) {
+            continue;
         }
-        let bytes = store.get(&log_file.location).await?.bytes().await?;
-        let content = std::str::from_utf8(&bytes)?;
-
-        for line in content.lines() {
-            let action: serde_json::Value = serde_json::from_str(line)?;
-            if let Some(add) = action.get("add") {
-                let path = add["path"].as_str().unwrap_or("");
-                if paths_remaining.contains(path) {
-                    if let Some(dv) = add.get("deletionVector") {
-                        let dv_desc: super::dv::DeletionVectorDescriptor =
-                            serde_json::from_value(dv.clone())?;
-                        found.insert(path.to_string(), dv_desc);
-                    }
-                    // Found the latest add for this path — stop tracking either way
-                    paths_remaining.remove(path);
-                }
-            }
-        }
+        out.insert(
+            paths.value(row).to_string(),
+            super::dv::DeletionVectorDescriptor {
+                storage_type: storage_type.value(row).to_string(),
+                path_or_inline_dv: path_or_inline.value(row).to_string(),
+                offset: (!offset.is_null(row)).then(|| offset.value(row)),
+                size_in_bytes: size_in_bytes.value(row),
+                cardinality: cardinality.value(row),
+            },
+        );
     }
-
-    Ok(found)
+    Ok(out)
 }
 
 #[cfg(test)]
