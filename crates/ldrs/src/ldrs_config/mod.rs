@@ -7,7 +7,7 @@ use anyhow::Context;
 use deadpool_postgres::Pool;
 use futures::future::join_all;
 use ldrs_arrow::ColumnType;
-use ldrs_core::execute::run_task;
+use ldrs_core::execute::{build_pools, run_task};
 use ldrs_core::phase::PhaseOutput;
 use ldrs_core::plan::{
     ArrowDest, DeltaDest, DeltaMode, DestSpec, PgDest, PqDest, SourceSpec, Task,
@@ -113,10 +113,8 @@ pub fn get_dest_url<'a>(
 }
 
 fn is_object_store_url(url: &Url) -> bool {
-    matches!(
-        url.scheme(),
-        "file" | "az" | "adl" | "azure" | "abfs" | "abfss" | "https"
-    )
+    // Delegate to object_store's own scheme parser so this never drifts from the backends
+    object_store::ObjectStoreScheme::parse(url).is_ok()
 }
 
 pub fn infer_env_type(env_type: &str, vars: &[(String, String)]) -> Option<String> {
@@ -129,7 +127,7 @@ pub fn infer_env_type(env_type: &str, vars: &[(String, String)]) -> Option<Strin
             u if u.scheme().starts_with("snowflake") => Some("sf".to_string()),
             u if u.scheme().starts_with("delta+") => Some("delta".to_string()),
             u if is_object_store_url(&u) => Some("file".to_string()),
-            u if u.scheme() == "postgres" => Some("pg".to_string()),
+            u if matches!(u.scheme(), "postgres" | "postgresql") => Some("pg".to_string()),
             _ => None,
         },
         None => None,
@@ -211,8 +209,19 @@ pub async fn execute_configs(
     validate_configs(&filtered_tasks)?;
 
     let exec_env = ExecutionEnv::create(ldrs_env);
-    // One connection pool per database URL, shared across every task for the whole run.
-    let mut pg_pools: HashMap<String, Pool> = HashMap::new();
+    // One connection pool per Postgres destination URL, shared read-only across every task. Strip
+    // the role query param via `check_for_role` exactly as dest resolution does, so the pool key
+    // matches the resolved `conn_url` (reuse) and the URL is poolable on its own (role= is not a
+    // libpq connection param).
+    let pg_urls: Vec<String> = ldrs_env
+        .iter()
+        .filter(|(k, _)| k.starts_with("LDRS_DEST"))
+        .filter(|(_, v)| {
+            Url::parse(v).is_ok_and(|u| matches!(u.scheme(), "postgres" | "postgresql"))
+        })
+        .map(|(_, v)| check_for_role(v).map(|(url, _)| url))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pg_pools = build_pools(&pg_urls)?;
     let total_tasks = filtered_tasks.len();
     for (i, task) in filtered_tasks.into_iter().enumerate() {
         let task_start = std::time::Instant::now();
@@ -249,7 +258,7 @@ pub async fn execute_configs(
             &exec_env.handlebars_vars,
             &exec_env.typed_params,
             cloud_io_rt,
-            &mut pg_pools,
+            &pg_pools,
         )
         .await?;
         let task_end = std::time::Instant::now();
@@ -306,7 +315,7 @@ pub async fn execute_task(
     handlebars_vars: &[(String, String)],
     env_params: &[(String, String, Option<ColumnType>)],
     cloud_io_rt: &tokio::runtime::Handle,
-    pg_pools: &mut HashMap<String, Pool>,
+    pg_pools: &HashMap<String, Pool>,
 ) -> Result<Option<u64>, anyhow::Error> {
     let name = task.src.name().to_string();
     let finalize_items = task.finalize;
