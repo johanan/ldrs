@@ -10,12 +10,12 @@ const DV_FILE_VERSION: u8 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DeletionVectorDescriptor {
-    storage_type: String,
-    path_or_inline_dv: String,
+    pub(crate) storage_type: String,
+    pub(crate) path_or_inline_dv: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    offset: Option<i32>,
-    size_in_bytes: i32,
-    cardinality: i64,
+    pub(crate) offset: Option<i32>,
+    pub(crate) size_in_bytes: i32,
+    pub(crate) cardinality: i64,
 }
 
 pub(crate) fn serialize_dv(bitmap: &RoaringTreemap) -> Vec<u8> {

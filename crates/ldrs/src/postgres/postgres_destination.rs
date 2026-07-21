@@ -1,5 +1,5 @@
 use anyhow::Context;
-use ldrs_arrow::{ColumnSpec, ColumnType};
+use ldrs_arrow::ColumnSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -27,8 +27,6 @@ pub struct PgDeleteInsert {
     #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
     pub delete_keys: Vec<String>,
-    #[schemars(schema_with = "crate::cli_schema::param_keys_schema")]
-    pub param_keys: Option<Vec<ColumnType>>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, JsonSchema)]
@@ -44,31 +42,27 @@ pub struct PgMerge {
     pub merge_keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgPreparedStmt {
     pub stmt: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub types: Option<Vec<ColumnType>>,
+    /// The delete-key column names, in `$1..$n` order. Each resolves its bind value from the
+    /// environment and its type from the load's columns.
+    pub keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgMergeConfig {
     pub target: String,
     pub source: String,
     pub keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgDestCommand {
     CreateTable(String),
     CreateTempTable(String),
     Merge(PgMergeConfig),
-    #[serde(rename = "load")]
     Load(String),
-    #[serde(rename = "stmt")]
     Prepared(PgPreparedStmt),
     Sql(String),
 }
@@ -229,8 +223,7 @@ impl PgDestination {
                         PgDestCommand::CreateTable("{{ name }}".to_string()),
                         PgDestCommand::Prepared(PgPreparedStmt {
                             stmt: del_stmt,
-                            key: Some("{{ shoutySnakeCase name }}".to_string()),
-                            types: del.param_keys.clone(),
+                            keys: del.delete_keys.clone(),
                         }),
                         PgDestCommand::Load("{{ name }}".to_string()),
                     ])
@@ -283,9 +276,6 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
         .and_then(|v| Vec::<String>::deserialize(v).ok());
     let delete_keys = get_either(yaml, "pg.delete_keys", "delete_keys")
         .and_then(|v| Vec::<String>::deserialize(v).ok());
-    let param_keys = get_either(yaml, "pg.param_keys", "param_keys")
-        .and_then(|v| Vec::<ColumnType>::deserialize(v).ok());
-
     // create destination
     match (merge_keys, delete_keys) {
         (Some(_), Some(_)) => Err(anyhow::anyhow!("Both merge_keys and delete_keys are set")),
@@ -311,7 +301,6 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination,
                     role,
                     columns,
                     delete_keys,
-                    param_keys,
                 }))
             }
             _ => Err(anyhow::anyhow!("Invalid tag for delete_insert destination")),
@@ -419,7 +408,6 @@ post_sql: DROP TABLE IF EXISTS my_table;
 role: my_role
 columns: []
 delete_keys: [id]
-param_keys: [Integer]
 "#;
 
         let pg_delete_insert: PgDestination = serde_yaml::from_str(yaml).unwrap();
@@ -442,7 +430,6 @@ param_keys: [Integer]
             role: Some("my_role".to_string()),
             columns: vec![],
             delete_keys: vec!["id".to_string()],
-            param_keys: Some(vec![ColumnType::Integer]),
         });
 
         assert_eq!(pg_delete_insert, expected);

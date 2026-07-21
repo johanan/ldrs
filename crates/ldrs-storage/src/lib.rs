@@ -74,11 +74,23 @@ pub fn build_store(
     let (scheme, path) = ObjectStoreScheme::parse(url).with_context(|| "Not an ObjectStore URL")?;
     // ensure that cloud providers use the env to utilize their credential providers instead of relying on credentials in the URL
     let store: Arc<dyn ObjectStore> = match scheme {
+        ObjectStoreScheme::AmazonS3 => Arc::new(
+            object_store::aws::AmazonS3Builder::from_env()
+                .with_url(url.to_string())
+                .build()
+                .context("Could not build S3 store")?,
+        ),
         ObjectStoreScheme::MicrosoftAzure => Arc::new(
             object_store::azure::MicrosoftAzureBuilder::from_env()
                 .with_url(url.to_string())
                 .build()
                 .context("Could not build Azure store")?,
+        ),
+        ObjectStoreScheme::GoogleCloudStorage => Arc::new(
+            object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                .with_url(url.to_string())
+                .build()
+                .context("Could not build GCP store")?,
         ),
         _ => {
             let (boxed, _) = object_store::parse_url(url).context("Could not build store")?;

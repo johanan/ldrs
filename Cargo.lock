@@ -914,20 +914,21 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel"
-version = "0.21.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f35ed3e674a2e60ad8da26f254dd60ce6d2ad90e76c57d876ae481e02b02d752"
+checksum = "211cca5ebd681951d798ac8567101adb05f3ff36fb18f02d0350b0b22ea77096"
 dependencies = [
  "arrow",
  "bytes",
  "chrono",
  "crc",
  "delta_kernel_derive",
- "futures",
  "indexmap",
  "itertools 0.14.0",
  "object_store",
  "parquet",
+ "percent-encoding",
+ "rand 0.9.4",
  "reqwest 0.13.3",
  "roaring",
  "rustc_version",
@@ -935,18 +936,35 @@ dependencies = [
  "serde_json",
  "strum",
  "thiserror",
- "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "z85",
 ]
 
 [[package]]
-name = "delta_kernel_derive"
-version = "0.21.0"
+name = "delta_kernel_default_engine"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f4472e97910e8c1362dbe7cf0715a8cf7c821b42604d7b71f6f7c7df80e6f35"
+checksum = "f24c6e18b90d85f7827163da12d7e324133a5a9bd0e4290b5860e421b3b5c647"
+dependencies = [
+ "bytes",
+ "delta_kernel",
+ "futures",
+ "itertools 0.14.0",
+ "reqwest 0.13.3",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "delta_kernel_derive"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "262100725819438b64c0dc8c4dd5621e3ec68c9a51953df2149b8e5dd858acce"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1827,7 +1845,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "ldrs"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1844,6 +1862,7 @@ dependencies = [
  "handlebars",
  "heck",
  "ldrs-arrow",
+ "ldrs-core",
  "ldrs-delta",
  "ldrs-parquet",
  "ldrs-postgres",
@@ -1891,6 +1910,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ldrs-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "deadpool-postgres",
+ "futures",
+ "ldrs-arrow",
+ "ldrs-delta",
+ "ldrs-parquet",
+ "ldrs-postgres",
+ "parquet",
+ "schemars",
+ "serde",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "ldrs-delta"
 version = "0.1.0"
 dependencies = [
@@ -1902,6 +1944,7 @@ dependencies = [
  "chrono",
  "crc",
  "delta_kernel",
+ "delta_kernel_default_engine",
  "futures",
  "ldrs-arrow",
  "ldrs-parquet",
@@ -2041,9 +2084,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.185"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libm"

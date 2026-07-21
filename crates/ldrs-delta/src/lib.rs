@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{DataType as DeltaDataType, StructField, StructType};
 use delta_kernel::{Engine, Snapshot, Version};

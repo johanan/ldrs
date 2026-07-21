@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.2] - 2026-07-21
+
+### Bug Fixes
+
+- *(delta)* New delta version and dv fix
+
+Upgraded to delta-kernel-rs to 0.25.0.
+
+Fixed a known issue where a checkpoint would create issues with DV
+descriptors. This is fixed by using the engines methods to find the
+correct dv info.
+
+- *(postgres)* Pg pools now immutable
+
+The shared pg pool hashmap did not need to be mutable. ldrs will
+construct all the connections up front and use that through all tasks.
+
+- *(object_store)* AWS and GCP
+
+Adding the other 2 big cloud providers. Fixed infer_env_type to properly
+handle the new options.
+
+
+### Refactor
+
+- *(core)* Execution and config are split
+
+ldrs-core holds resolved execution primitives that higher level crates
+can build. The current ldrs crate now just parses YAML config and calls
+ldrs-core.
+
+
 ## [0.21.1] - 2026-07-12
 
 ### Bug Fixes

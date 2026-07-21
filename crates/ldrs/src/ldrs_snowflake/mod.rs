@@ -1,17 +1,10 @@
 pub mod snowflake_source;
 
 use anyhow::Context;
-use arrow::ipc::reader::StreamReader;
-use arrow_array::RecordBatch;
 use ldrs_arrow::ColumnType;
-use std::{
-    future::Future,
-    path::PathBuf,
-    process::{Command, Stdio},
-};
-use tokio::task;
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, trace, warn};
+use ldrs_core::spawn::Spawned;
+use std::{path::PathBuf, process::Command};
+use tracing::{debug, warn};
 use url::Url;
 
 #[derive(Clone)]
@@ -21,12 +14,6 @@ pub struct SnowflakeConnection {
     pub binary_path: PathBuf,
     pub pem_key: Option<String>,
     pub pem_file: Option<String>,
-}
-
-pub struct SnowflakeStreamResult<S> {
-    pub batch_stream: ReceiverStream<Result<RecordBatch, anyhow::Error>>,
-    pub schema_stream: S,
-    pub command_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
 }
 
 impl SnowflakeConnection {
@@ -79,7 +66,9 @@ impl SnowflakeConnection {
         .into_iter()
         .chain(sf_param_env(&[]))
         .collect();
-        apply_child_env(&mut cmd, &parent, managed);
+        let env = build_child_env(parent, "LDRS_SF_", managed);
+        cmd.env_clear();
+        cmd.envs(env);
         let output = cmd
             .output()
             .with_context(|| "Failed to execute ldrs-sf command")?;
@@ -141,131 +130,52 @@ fn sf_auth_env(
     env
 }
 
-/// Wire the managed env onto a spawned ldrs-sf Command. The child inherits the parent env
-/// (fork-like); this strips the parent's `LDRS_*` config vars but leaves `LDRS_SF_*` in place, so
-/// user-set `LDRS_SF_*` reach the child by inheritance (each is warned). `managed` is then set on
-/// top, so ldrs's resolved values win over any inherited `LDRS_SF_*` they collide with.
-fn apply_child_env(cmd: &mut Command, parent: &[(String, String)], managed: Vec<(String, String)>) {
-    for (k, _) in parent {
-        match k {
-            _ if k.starts_with("LDRS_SF_") => {
-                warn!("inherited user-set {k} reaches ldrs-sf; execution not guaranteed for env ldrs does not manage");
+/// Build the complete child env: inherit the parent, drop its `LDRS_*` config vars (leaving
+/// `keep_prefix` warned), then overlay the
+/// managed set so ldrs's resolved values win over any inherited collision.
+fn build_child_env(
+    parent: Vec<(String, String)>,
+    keep_prefix: &str,
+    managed: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = parent
+        .into_iter()
+        .filter(|(k, _)| {
+            if k.starts_with(keep_prefix) {
+                warn!("inherited user-set {k} reaches the child; execution not guaranteed for env ldrs does not manage");
+                true
+            } else {
+                !k.starts_with("LDRS_")
             }
-            _ if k.starts_with("LDRS_") => {
-                cmd.env_remove(k);
-            }
-            _ => {}
-        }
-    }
-    cmd.envs(managed);
+        })
+        .collect();
+    env.extend(managed);
+    env
 }
 
-/// Execute a SQL query and stream the results as Arrow RecordBatches.
-/// This uses the ldrs-sf binary to execute the query and stream the results.
-/// `bind_params` are the parameter values and types, in the order they bind.
-pub async fn sf_arrow_stream(
+/// Build the ldrs-sf spawn spec: binary, `query --sql` args, and the resolved child env. The
+/// caller spawns it via `spawn_arrow_source`. `bind_params` are the parameter values and types, in
+/// bind order.
+pub fn sf_spawned(
     conn: &SnowflakeConnection,
     sql: &str,
     bind_params: Vec<(String, Option<ColumnType>)>,
-) -> Result<
-    SnowflakeStreamResult<impl Future<Output = Option<arrow_schema::SchemaRef>> + Send>,
-    anyhow::Error,
-> {
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let (schema_tx, schema_rx) = tokio::sync::oneshot::channel();
-    let sql = sql.to_string();
-    let conn_url = conn.raw_conn_url.clone();
-    let binary_path = conn.binary_path.clone();
-    let pem_key = conn.pem_key.clone();
-    let pem_file = conn.pem_file.clone();
-
-    let command_handle = task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new(&binary_path);
-        let args = vec!["query", "--sql", &sql];
-        let cmd = cmd.args(args);
-        debug!("Running command: {:?}", cmd);
-        let parent: Vec<(String, String)> = std::env::vars().collect();
-        let managed = sf_auth_env(&conn_url, pem_key.as_deref(), pem_file.as_deref())
-            .into_iter()
-            .chain(sf_param_env(&bind_params))
-            .collect();
-        apply_child_env(cmd, &parent, managed);
-
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("Failed to spawn ldrs-sf"))?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
-
-        let buf_reader = std::io::BufReader::new(stdout);
-        let stream_reader = StreamReader::try_new(buf_reader, None).ok();
-        let stream_opened = stream_reader.is_some();
-
-        if let Some(mut stream_reader) = stream_reader {
-            let schema = stream_reader.schema();
-            if schema_tx.send(schema).is_err() {
-                return Err(anyhow::anyhow!("Failed to send schema: receiver dropped"));
-            }
-
-            // Stream batches
-            while let Some(batch_result) = stream_reader.next() {
-                trace!("Processing batch");
-                if tx
-                    .blocking_send(batch_result.map_err(anyhow::Error::from))
-                    .is_err()
-                {
-                    return Err(anyhow::anyhow!("Failed to send batch"));
-                }
-            }
-        }
-        let status = child.wait()?;
-
-        match (status.success(), stream_opened) {
-            (true, true) => Ok(()),
-            (true, false) => Err(anyhow::anyhow!(
-                "Command succeeded but failed to open Arrow stream"
-            )),
-            (false, _) => {
-                let mut stderr_output = String::new();
-                std::io::Read::read_to_string(&mut stderr, &mut stderr_output)?;
-                Err(anyhow::anyhow!(
-                    "ldrs-sf command failed with status: {}. Stderr: {}",
-                    status,
-                    stderr_output
-                ))
-            }
-        }
-    });
-
-    let batch_stream = ReceiverStream::new(rx);
-    let schema_future = async move {
-        match schema_rx.await {
-            Ok(schema) => {
-                if schema.fields().is_empty() {
-                    None
-                } else {
-                    debug!("Schema: {:?}", schema);
-                    Some(schema)
-                }
-            }
-            Err(_) => None,
-        }
-    };
-
-    Ok(SnowflakeStreamResult {
-        batch_stream,
-        schema_stream: schema_future,
-        command_handle,
-    })
+) -> Spawned {
+    let managed: Vec<(String, String)> = sf_auth_env(
+        &conn.raw_conn_url,
+        conn.pem_key.as_deref(),
+        conn.pem_file.as_deref(),
+    )
+    .into_iter()
+    .chain(sf_param_env(&bind_params))
+    .collect();
+    let env = build_child_env(std::env::vars().collect(), "LDRS_SF_", managed);
+    Spawned {
+        binary: conn.binary_path.clone(),
+        args: vec!["query".to_string(), "--sql".to_string(), sql.to_string()],
+        stdin: None,
+        env,
+    }
 }
 
 #[cfg(test)]
@@ -326,32 +236,19 @@ mod tests {
     }
 
     #[test]
-    fn apply_child_env_strips_config_keeps_sf_and_sets_managed() {
+    fn build_child_env_strips_config_keeps_sf_and_overlays_managed() {
         let parent = vec![
             ("LDRS_SRC_SF".to_string(), "url".to_string()),
             ("LDRS_SF_PEM_KEY".to_string(), "legacy".to_string()),
             ("PATH".to_string(), "/usr/bin".to_string()),
         ];
         let managed = vec![("LDRS_SF_SOURCE".to_string(), "resolved".to_string())];
-        let mut cmd = Command::new("true");
-        apply_child_env(&mut cmd, &parent, managed);
+        let env = build_child_env(parent, "LDRS_SF_", managed);
 
-        // get_envs() reports only our explicit modifications: Some(v) = set, None = remove.
-        let mods: Vec<(String, Option<String>)> = cmd
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
-
-        // the config var is queued for removal; the managed key is set
-        assert!(mods.contains(&("LDRS_SRC_SF".to_string(), None)));
-        assert!(mods.contains(&("LDRS_SF_SOURCE".to_string(), Some("resolved".to_string()))));
-        // a user LDRS_SF_ key is left inherited (no modification), and non-LDRS is untouched
-        assert!(!mods.iter().any(|(k, _)| k == "LDRS_SF_PEM_KEY"));
-        assert!(!mods.iter().any(|(k, _)| k == "PATH"));
+        // config var dropped; the kept-prefix and non-LDRS vars retained; managed overlaid
+        assert!(!env.iter().any(|(k, _)| k == "LDRS_SRC_SF"));
+        assert!(env.contains(&("LDRS_SF_PEM_KEY".to_string(), "legacy".to_string())));
+        assert!(env.contains(&("PATH".to_string(), "/usr/bin".to_string())));
+        assert!(env.contains(&("LDRS_SF_SOURCE".to_string(), "resolved".to_string())));
     }
 }

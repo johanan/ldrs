@@ -8,7 +8,7 @@
 
 use crate::ldrs_env::LdrsExecutionContext;
 use crate::ldrs_snowflake::SnowflakeConnection;
-use crate::phase::PhaseOutput;
+use ldrs_core::phase::PhaseOutput;
 use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -106,7 +106,7 @@ pub fn run_sf(conn: &SnowflakeConnection, commands: Vec<SfCommand>) -> Result<()
 mod tests {
     use super::*;
     use crate::ldrs_env::setup_handlebars;
-    use crate::phase::{DeltaStrategy, DestinationOutcome, PhaseOutput};
+    use ldrs_core::phase::{DeltaStrategy, DestinationOutcome, PhaseOutput};
 
     fn delta_phase() -> PhaseOutput {
         PhaseOutput {
