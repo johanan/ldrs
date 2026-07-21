@@ -1,5 +1,5 @@
 //! The execution side of a task: build sinks from resolved destination specs (computing the
-//! schema-derived target columns and cast), and the pg pool registry they draw connections from.
+//! schema-derived target columns and cast), and the shared pg pool map they draw connections from.
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
@@ -29,7 +29,7 @@ use crate::source::open_source;
 /// produced no schema (nothing to load). Errors on a stream, settlement, or sink-build failure.
 pub async fn run_task(
     cloud_io_rt: &tokio::runtime::Handle,
-    pg_pools: &mut HashMap<String, Pool>,
+    pg_pools: &HashMap<String, Pool>,
     task: Task,
 ) -> Result<Option<PhaseOutput>, anyhow::Error> {
     // Matching destinations share one transform; otherwise each casts its own.
@@ -89,7 +89,7 @@ pub async fn build_sinks(
     dests: Vec<DestSpec>,
     source_cols: &[ColumnSpec],
     schema: &SchemaRef,
-    pg_pools: &mut HashMap<String, Pool>,
+    pg_pools: &HashMap<String, Pool>,
 ) -> Result<Vec<(Sink, Option<BatchTransform>)>, anyhow::Error> {
     let mut built = Vec::with_capacity(dests.len());
     for dest in dests {
@@ -110,7 +110,7 @@ async fn build_sink(
     dest: DestSpec,
     source_cols: &[ColumnSpec],
     schema: &SchemaRef,
-    pg_pools: &mut HashMap<String, Pool>,
+    pg_pools: &HashMap<String, Pool>,
 ) -> Result<(Sink, Option<BatchTransform>), anyhow::Error> {
     match dest {
         DestSpec::Pg(pg) => {
@@ -247,29 +247,51 @@ async fn reap_source(
     }
 }
 
-/// Get the pool for `url` from the registry, building and caching it on first use. Returns a clone
-/// of the cached pool.
-fn pool_for(pools: &mut HashMap<String, Pool>, url: &str) -> Result<Pool, anyhow::Error> {
-    if let Some(pool) = pools.get(url) {
-        return Ok(pool.clone());
+/// Build one lazy pool per distinct connection URL. `build_pg_pool` opens no connections, so a URL
+/// no task ends up using costs only a few structs; connections materialize at first checkout and
+/// stay warm across tasks. Duplicate URLs collapse to one pool.
+pub fn build_pools(urls: &[String]) -> Result<HashMap<String, Pool>, anyhow::Error> {
+    let mut pools = HashMap::new();
+    for url in urls {
+        if !pools.contains_key(url) {
+            pools.insert(url.clone(), build_pg_pool(url)?);
+        }
     }
-    let pool = build_pg_pool(url)?;
-    pools.insert(url.to_string(), pool.clone());
-    Ok(pool)
+    Ok(pools)
+}
+
+/// Return the pool for `url`. A hit clones the shared, warm pool; a miss builds a task-local pool
+fn pool_for(pools: &HashMap<String, Pool>, url: &str) -> Result<Pool, anyhow::Error> {
+    match pools.get(url) {
+        Some(pool) => Ok(pool.clone()),
+        None => build_pg_pool(url),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // build_pg_pool is lazy (no connection), so these exercise the map offline.
+
     #[test]
-    fn pool_for_caches_pools_by_url() {
-        // build_pg_pool is lazy (no connection), so this exercises the registry offline.
-        let mut pools = HashMap::new();
-        let _ = pool_for(&mut pools, "postgresql://localhost/db1").unwrap();
-        let _ = pool_for(&mut pools, "postgresql://localhost/db1").unwrap();
-        assert_eq!(pools.len(), 1, "same URL reuses one pool");
-        let _ = pool_for(&mut pools, "postgresql://localhost/db2").unwrap();
-        assert_eq!(pools.len(), 2, "a different URL gets its own pool");
+    fn build_pools_dedups_by_url() {
+        let pools = build_pools(&[
+            "postgresql://localhost/db1".to_string(),
+            "postgresql://localhost/db1".to_string(),
+            "postgresql://localhost/db2".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(pools.len(), 2, "duplicate URLs collapse to one pool");
+    }
+
+    #[test]
+    fn pool_for_falls_back_on_miss_without_mutating() {
+        let pools = build_pools(&["postgresql://localhost/db1".to_string()]).unwrap();
+        // hit: served from the shared map
+        pool_for(&pools, "postgresql://localhost/db1").unwrap();
+        // miss: a task-local pool is built; the shared map is untouched
+        pool_for(&pools, "postgresql://localhost/db2").unwrap();
+        assert_eq!(pools.len(), 1, "a miss does not mutate the shared map");
     }
 }
