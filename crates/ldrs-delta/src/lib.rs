@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{DataType as DeltaDataType, StructField, StructType};
 use delta_kernel::{Engine, Snapshot, Version};
+use delta_kernel_default_engine::DefaultEngineBuilder;
 use futures::{Stream, StreamExt};
 use ldrs_storage::{base_or_relative_path, build_store};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
@@ -311,10 +311,12 @@ fn snapshot_table_state(
     })
 }
 
+
 fn build_add(
     filename: &str,
     metadata: &parquet::file::metadata::ParquetMetaData,
-    obj_meta: &object_store::ObjectMeta,
+    size: u64,
+    modification_time: i64,
     schema: &SchemaRef,
 ) -> Result<DeltaAdd, anyhow::Error> {
     let file_stats = parquet_metadata_to_delta_stats(metadata, schema);
@@ -322,8 +324,8 @@ fn build_add(
     Ok(DeltaAdd {
         path: filename.to_string(),
         partition_values: HashMap::new(),
-        size: obj_meta.size as i64,
-        modification_time: obj_meta.last_modified.timestamp_millis(),
+        size: size as i64,
+        modification_time,
         data_change: true,
         stats: Some(stats_json),
         deletion_vector: None,
@@ -337,9 +339,9 @@ fn version_to_log_filename(version: Version) -> String {
 async fn cleanup_source_files(
     store: &Arc<dyn ObjectStore>,
     base_path: &object_store::path::Path,
-    source_files: &[(String, parquet::file::metadata::ParquetMetaData)],
+    source_files: &[(String, parquet::file::metadata::ParquetMetaData, u64)],
 ) {
-    for (filename, _) in source_files {
+    for (filename, _, _) in source_files {
         let path = base_path.clone().join(filename.as_str());
         let _ = store.delete(&path).await;
     }

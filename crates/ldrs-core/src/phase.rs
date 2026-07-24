@@ -1,37 +1,57 @@
 //! Per-destination outcome of a completed load phase, assembled by the executor.
 
+use ldrs_arrow::ColumnSpec;
 use schemars::JsonSchema;
 use serde::Serialize;
 
+/// What a committed Delta write did. `Overwrite` carries nothing; `Merge` carries the merge stats
 #[derive(Debug, Serialize, JsonSchema)]
-pub enum DeltaStrategy {
+#[serde(tag = "op", rename_all = "lowercase")]
+pub enum DeltaCommit {
     Overwrite,
-    Merge,
+    Merge {
+        skipped: bool,
+        skipped_version: Option<i64>,
+        source_rows: u64,
+        matched_rows: u64,
+        inserted_rows: u64,
+        files_scanned: u64,
+        files_written: u64,
+    },
 }
 
-/// One parquet file written by the run.
+/// One parquet file written by the run. `full_url` is the file's fully-qualified URL; `path` is the
+/// writer's path relative to the destination base (the namer output), portable across environments.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct FileWritten {
+    pub full_url: String,
     pub path: String,
     pub rows: u64,
 }
 
-/// One destination's identity (the variant and its fields) and its outcome (`result`). Identity
-/// is known regardless of outcome; `result` carries the success output or the error.
+/// One destination's identity and its outcome (`result`). Identity is known regardless of outcome;
+/// `result` carries the success output or the error. `target` is the resolved logical name
+/// The URL-backed variants carry `full_url` (fully qualified: the Delta table, the
+/// Parquet base directory). `columns` is the post-cast schema that actually landed. Parquet's files
+/// are listed per-entry in `result`.
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum DestinationOutcome {
     Pg {
-        table: String,
+        target: String,
+        columns: Vec<ColumnSpec>,
         result: Result<(), String>,
     },
     Delta {
-        location: String,
-        strategy: DeltaStrategy,
-        result: Result<(), String>,
+        target: String,
+        full_url: String,
+        columns: Vec<ColumnSpec>,
+        result: Result<DeltaCommit, String>,
     },
     Parquet {
-        location: String,
+        target: String,
+        full_url: String,
+        columns: Vec<ColumnSpec>,
         result: Result<Vec<FileWritten>, String>,
     },
 }

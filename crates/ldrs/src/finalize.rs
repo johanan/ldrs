@@ -8,11 +8,14 @@
 
 use crate::ldrs_env::LdrsExecutionContext;
 use crate::ldrs_snowflake::SnowflakeConnection;
+use crate::lua_logic::UrlData;
+use crate::path_pattern::{extracted_segments_to_value, PathPattern};
 use ldrs_core::phase::PhaseOutput;
 use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tracing::info;
+use url::Url;
 
 #[derive(Debug, PartialEq, Deserialize, JsonSchema)]
 pub struct SfFinalize {
@@ -42,6 +45,19 @@ fn finalize_lua() -> Result<Lua, mlua::Error> {
     )
 }
 
+/// `outputs_of(phase, kind)` returns the destinations of a given kind as a list (empty when none match).
+const FINALIZE_PRELUDE: &str = r#"
+function outputs_of(phase, kind)
+    local out = {}
+    for _, d in ipairs(phase.destinations) do
+        if d.kind == kind then
+            out[#out + 1] = d
+        end
+    end
+    return out
+end
+"#;
+
 pub fn call_finalize<T: serde::de::DeserializeOwned>(
     lua_path: &str,
     phase: &PhaseOutput,
@@ -61,6 +77,9 @@ fn call_finalize_script<T: serde::de::DeserializeOwned>(
 ) -> Result<Vec<T>, anyhow::Error> {
     let lua =
         finalize_lua().map_err(|e| anyhow::anyhow!("failed to initialize finalize lua: {e}"))?;
+    lua.load(FINALIZE_PRELUDE)
+        .exec()
+        .map_err(|e| anyhow::anyhow!("failed to load finalize prelude: {e}"))?;
     lua.load(script)
         .exec()
         .map_err(|e| anyhow::anyhow!("lua error in {source}: {e}"))?;
@@ -80,6 +99,21 @@ fn call_finalize_script<T: serde::de::DeserializeOwned>(
                     .map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))
             })?;
             lua.globals().set("render", render)?;
+            let parse_path = scope.create_function(|lua, (pattern, path): (String, String)| {
+                let pat = PathPattern::new(&pattern)
+                    .map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))?;
+                let extracted = pat
+                    .parse_path(&path)
+                    .map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))?;
+                lua.to_value(&extracted_segments_to_value(&extracted))
+            })?;
+            lua.globals().set("parse_path", parse_path)?;
+            let parse_url = scope.create_function(|lua, url: String| {
+                let parsed =
+                    Url::parse(&url).map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))?;
+                lua.to_value(&UrlData::from(parsed))
+            })?;
+            lua.globals().set("parse_url", parse_url)?;
             func.call::<mlua::Value>(phase_value)
         })
         .map_err(|e| anyhow::anyhow!("finalize() failed in {source}: {e}"))?;
@@ -106,7 +140,8 @@ pub fn run_sf(conn: &SnowflakeConnection, commands: Vec<SfCommand>) -> Result<()
 mod tests {
     use super::*;
     use crate::ldrs_env::setup_handlebars;
-    use ldrs_core::phase::{DeltaStrategy, DestinationOutcome, PhaseOutput};
+    use ldrs_arrow::ColumnSpec;
+    use ldrs_core::phase::{DeltaCommit, DestinationOutcome, PhaseOutput};
 
     fn delta_phase() -> PhaseOutput {
         PhaseOutput {
@@ -115,9 +150,18 @@ mod tests {
             success: true,
             rows: 10,
             destinations: vec![DestinationOutcome::Delta {
-                location: "az://curated/acme/users".to_string(),
-                strategy: DeltaStrategy::Overwrite,
-                result: Ok(()),
+                target: "public.users".to_string(),
+                full_url: "az://curated/acme/users".to_string(),
+                columns: vec![
+                    ColumnSpec::BigInt {
+                        name: "id".to_string(),
+                    },
+                    ColumnSpec::Varchar {
+                        name: "email".to_string(),
+                        length: 255,
+                    },
+                ],
+                result: Ok(DeltaCommit::Overwrite),
             }],
         }
     }
@@ -139,7 +183,7 @@ mod tests {
                 local cmds = {}
                 for _, d in ipairs(phase.destinations) do
                     if d.kind == "delta" then
-                        table.insert(cmds, "CREATE EXTERNAL TABLE t LOCATION '" .. d.location .. "'")
+                        table.insert(cmds, "CREATE EXTERNAL TABLE t LOCATION '" .. d.full_url .. "'")
                         table.insert(cmds, "ALTER EXTERNAL TABLE t REFRESH")
                     end
                 end
@@ -150,6 +194,123 @@ mod tests {
         assert_eq!(cmds.len(), 2);
         match &cmds[0] {
             SfCommand::Sql(sql) => assert!(sql.contains("az://curated/acme/users")),
+        }
+    }
+
+    #[test]
+    fn finalize_columns_reach_the_handler() {
+        // The post-cast columns are on each destination: a handler builds typed DDL from them.
+        let hb = test_handlebars();
+        let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
+        let script = r#"
+            function finalize(phase)
+                local cols = {}
+                for _, d in ipairs(phase.destinations) do
+                    for _, c in ipairs(d.columns) do
+                        if c.type == "varchar" then
+                            table.insert(cols, c.name .. " VARCHAR(" .. c.length .. ")")
+                        else
+                            table.insert(cols, c.name)
+                        end
+                    end
+                end
+                return { "COLS " .. table.concat(cols, ", ") }
+            end
+        "#;
+        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        match &cmds[0] {
+            SfCommand::Sql(sql) => assert_eq!(sql, "COLS id, email VARCHAR(255)"),
+        }
+    }
+
+    #[test]
+    fn finalize_outputs_of_filters_by_kind() {
+        // `outputs_of` returns the destinations of a kind as a list; empty (not nil) when none match.
+        let hb = test_handlebars();
+        let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
+        let script = r#"
+            function finalize(phase)
+                local deltas = outputs_of(phase, "delta")
+                local pgs = outputs_of(phase, "pg")
+                return { #deltas .. ":" .. deltas[1].target .. ":" .. #pgs }
+            end
+        "#;
+        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        match &cmds[0] {
+            SfCommand::Sql(sql) => assert_eq!(sql, "1:public.users:0"),
+        }
+    }
+
+    #[test]
+    fn finalize_sees_skipped_merge() {
+        // A source-watermark idempotent skip must be distinguishable from a real merge so the
+        // handler can decline to re-run downstream work.
+        let hb = test_handlebars();
+        let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
+        let phase = PhaseOutput {
+            name: "public.users".to_string(),
+            source_files: None,
+            success: true,
+            rows: 10,
+            destinations: vec![DestinationOutcome::Delta {
+                target: "public.users".to_string(),
+                full_url: "az://curated/acme/users".to_string(),
+                columns: vec![],
+                result: Ok(DeltaCommit::Merge {
+                    skipped: true,
+                    skipped_version: Some(42),
+                    source_rows: 10,
+                    matched_rows: 0,
+                    inserted_rows: 0,
+                    files_scanned: 0,
+                    files_written: 0,
+                }),
+            }],
+        };
+        let script = r#"
+            function finalize(phase)
+                local c = phase.destinations[1].result.Ok
+                if c.op == "merge" and c.skipped then
+                    return { "SKIP " .. c.skipped_version }
+                end
+                return { "RUN" }
+            end
+        "#;
+        let cmds = call_finalize_script::<SfCommand>(script, "test", &phase, &ctx).unwrap();
+        match &cmds[0] {
+            SfCommand::Sql(sql) => assert_eq!(sql, "SKIP 42"),
+        }
+    }
+
+    #[test]
+    fn finalize_parse_path_extracts_segments() {
+        let hb = test_handlebars();
+        let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
+        let script = r#"
+            function finalize(phase)
+                local seg = parse_path("{env}/{schema}.{table}", "prod/public.users")
+                return { seg.env .. ":" .. seg.schema .. ":" .. seg.table }
+            end
+        "#;
+        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        match &cmds[0] {
+            SfCommand::Sql(sql) => assert_eq!(sql, "prod:public:users"),
+        }
+    }
+
+    #[test]
+    fn finalize_parse_url_decomposes_url() {
+        let hb = test_handlebars();
+        let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
+        let script = r#"
+            function finalize(phase)
+                local u = parse_url("s3://my-bucket/prod/users")
+                return { u.scheme .. ":" .. u.host }
+            end
+        "#;
+        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        match &cmds[0] {
+            SfCommand::Sql(sql) => assert_eq!(sql, "s3:my-bucket"),
         }
     }
 

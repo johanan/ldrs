@@ -69,6 +69,17 @@ fn coerce_to_logical(scalar: Option<Scalar>, data_type: &DataType) -> Option<Sca
         (Scalar::Long(v), Timestamp(_, Some(_))) => Some(Scalar::Timestamp(v)),
         (Scalar::Long(v), Timestamp(_, None)) => Some(Scalar::TimestampNtz(v)),
         (Scalar::Integer(v), Date32) => Some(Scalar::Date(v)),
+        // We need to go between an integer backed decimal and make sure it is the correct type
+        // based on the logical type
+        (Scalar::Integer(v), Decimal32(p, s) | Decimal64(p, s) | Decimal128(p, s)) => {
+            Scalar::decimal(v, *p, *s as u8).ok()
+        }
+        (Scalar::Long(v), Decimal32(p, s) | Decimal64(p, s) | Decimal128(p, s)) => {
+            Scalar::decimal(v, *p, *s as u8).ok()
+        }
+        (Scalar::Binary(bytes), Decimal128(p, s)) => {
+            Scalar::decimal(decimal_be_bytes_to_i128(&bytes), *p, *s as u8).ok()
+        }
         (scalar, _) => Some(scalar),
     }
 }
@@ -85,6 +96,19 @@ fn pick_bound(current: Option<Scalar>, new: Option<Scalar>, ordering: Ordering) 
             }
         }
     }
+}
+
+fn decimal_be_bytes_to_i128(bytes: &[u8]) -> i128 {
+    // check sign and then fill based on negative or not
+    let mut buf = if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+        [0xFF_u8; 16]
+    } else {
+        [0u8; 16]
+    };
+    // figure out where to start the bytes in the array
+    let start = 16 - bytes.len();
+    buf[start..].copy_from_slice(bytes);
+    i128::from_be_bytes(buf)
 }
 
 fn format_decimal_value(unscaled: i128, scale: u8) -> String {
@@ -134,20 +158,9 @@ fn scalar_to_json_value(
             })
         }
 
-        // Decimal128 can have fewer than 16 bytes if the precision is smaller
-        (Scalar::Binary(bytes), Decimal128(_precision, scale)) => {
-            // check sign and then fill based on negative or not
-            let mut buf = if bytes.first().is_some_and(|b| b & 0x80 != 0) {
-                [0xFF_u8; 16]
-            } else {
-                [0u8; 16]
-            };
-            // figure out where to start the bytes in the array
-            let start = 16 - bytes.len();
-            buf[start..].copy_from_slice(bytes);
-            let value = i128::from_be_bytes(buf);
-            Some(serde_json::json!(format_decimal_value(value, *scale as u8)))
-        }
+        (Scalar::Binary(bytes), Decimal128(_precision, scale)) => Some(serde_json::json!(
+            format_decimal_value(decimal_be_bytes_to_i128(bytes), *scale as u8)
+        )),
         (Scalar::Integer(v), Decimal32(_p, scale) | Decimal128(_p, scale)) => Some(
             serde_json::json!(format_decimal_value(*v as i128, *scale as u8)),
         ),
@@ -224,7 +237,7 @@ fn scalar_to_i64(scalar: &Scalar) -> Result<i64, anyhow::Error> {
 }
 
 pub(crate) fn max_stat_as_i64(
-    source_files: &[(String, ParquetMetaData)],
+    source_files: &[(String, ParquetMetaData, u64)],
     col_name: &str,
     schema: &SchemaRef,
 ) -> Result<i64, anyhow::Error> {
@@ -232,7 +245,7 @@ pub(crate) fn max_stat_as_i64(
 
     let max_scalar = source_files
         .iter()
-        .flat_map(|(_, m)| m.row_groups())
+        .flat_map(|(_, m, _)| m.row_groups())
         .filter_map(|rg| rg.column(col_idx).statistics())
         .fold(None, |acc, stats| {
             let (_, new_max) = stats_to_scalars(stats);
@@ -244,7 +257,7 @@ pub(crate) fn max_stat_as_i64(
 }
 
 pub(crate) fn key_bounds_as_scalars(
-    source_files: &[(String, ParquetMetaData)],
+    source_files: &[(String, ParquetMetaData, u64)],
     key_col_name: &str,
     schema: &SchemaRef,
 ) -> Option<(Scalar, Scalar)> {
@@ -253,7 +266,7 @@ pub(crate) fn key_bounds_as_scalars(
 
     let (min, max) = source_files
         .iter()
-        .flat_map(|(_, m)| m.row_groups())
+        .flat_map(|(_, m, _)| m.row_groups())
         .filter_map(|rg| rg.column(col_idx).statistics())
         .fold(None, |acc, stats| {
             let (new_min, new_max) = stats_to_scalars(stats);
@@ -376,6 +389,36 @@ mod tests {
         assert_eq!(
             scalar_to_json_value(&Scalar::Integer(-1), &DataType::Date32),
             Some(json!("1969-12-31"))
+        );
+    }
+
+    #[test]
+    fn coerce_int_backed_decimal_to_decimal_scalar() {
+        // A Decimal(12,0) key is stored physically as int64 in parquet, so its stats yield a
+        // Scalar::Long. It must lift to a Decimal scalar
+        match coerce_to_logical(Some(Scalar::Long(42)), &DataType::Decimal64(12, 0)) {
+            Some(Scalar::Decimal(d)) => {
+                assert_eq!(d.bits(), 42);
+                assert_eq!(d.scale(), 0);
+            }
+            other => panic!("int64-backed decimal should coerce to Decimal, got {other:?}"),
+        }
+        // int32-backed (Decimal32) and byte-backed (precision > 18) also lift
+        assert!(matches!(
+            coerce_to_logical(Some(Scalar::Integer(7)), &DataType::Decimal32(5, 0)),
+            Some(Scalar::Decimal(_))
+        ));
+        assert!(matches!(
+            coerce_to_logical(
+                Some(Scalar::Binary(1234i128.to_be_bytes().to_vec())),
+                &DataType::Decimal128(38, 2),
+            ),
+            Some(Scalar::Decimal(_))
+        ));
+        // non-decimal targets pass through unchanged
+        assert_eq!(
+            coerce_to_logical(Some(Scalar::Long(5)), &DataType::Int64),
+            Some(Scalar::Long(5))
         );
     }
 

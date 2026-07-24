@@ -68,6 +68,7 @@ pub struct DeltaDest {
     pub table_path: String,
     pub mode: DeltaMode,
     pub columns: Vec<ColumnSpec>,
+    pub target: String,
 }
 
 pub enum DeltaMode {
@@ -87,6 +88,7 @@ pub struct PqDest {
     pub max_rows: Option<usize>,
     pub max_bytes: Option<usize>,
     pub columns: Vec<ColumnSpec>,
+    pub target: String,
 }
 
 /// A resolved Arrow-IPC-to-stdout destination.

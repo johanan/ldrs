@@ -26,7 +26,7 @@ pub struct ParquetSink {
     namer: FileNamer,
     // running state the split-writer loop locals
     writer: Option<AsyncArrowWriter<ParquetObjectWriter>>,
-    results: Vec<(String, ParquetMetaData)>,
+    results: Vec<(String, ParquetMetaData, u64)>,
     file_index: usize,
     current_rows: usize,
     current_filename: String,
@@ -116,9 +116,12 @@ impl ParquetSink {
                 .is_some_and(|limit| w.bytes_written() >= limit);
 
         if should_rotate {
-            let metadata = self.writer.take().unwrap().close().await?;
+            // `finish` (not `close`) finalizes without consuming, so `bytes_written` can be read
+            let mut w = self.writer.take().unwrap();
+            let metadata = w.finish().await?;
+            let size = w.bytes_written() as u64;
             self.results
-                .push((std::mem::take(&mut self.current_filename), metadata));
+                .push((std::mem::take(&mut self.current_filename), metadata, size));
             self.file_index += 1;
             self.current_rows = 0;
         }
@@ -128,10 +131,13 @@ impl ParquetSink {
     /// Trailing flush. A zero-row stream opened no writer, so this returns an
     /// empty vec and writes nothing. If the final close fails, the files already
     /// completed are deleted before returning the error.
-    pub async fn finish(mut self) -> Result<Vec<(String, ParquetMetaData)>, anyhow::Error> {
-        if let Some(w) = self.writer.take() {
-            match w.close().await {
-                Ok(metadata) => self.results.push((self.current_filename, metadata)),
+    pub async fn finish(mut self) -> Result<Vec<(String, ParquetMetaData, u64)>, anyhow::Error> {
+        if let Some(mut w) = self.writer.take() {
+            match w.finish().await {
+                Ok(metadata) => {
+                    let size = w.bytes_written() as u64;
+                    self.results.push((self.current_filename, metadata, size));
+                }
                 Err(e) => {
                     self.delete_completed().await;
                     return Err(e.into());
@@ -144,7 +150,7 @@ impl ParquetSink {
     /// Marker capability for zero-row streams: writes one schema-only, zero-row
     /// file named `namer(0)`. The orchestrator calls this instead of `finish`
     /// when no rows arrived and the destination asked for a marker file.
-    pub async fn finish_empty(self) -> Result<Vec<(String, ParquetMetaData)>, anyhow::Error> {
+    pub async fn finish_empty(self) -> Result<Vec<(String, ParquetMetaData, u64)>, anyhow::Error> {
         anyhow::ensure!(
             self.writer.is_none() && self.results.is_empty(),
             "finish_empty called on a sink that has written rows"
@@ -152,13 +158,14 @@ impl ParquetSink {
         let filename = (self.namer)(0)?;
         let file_path = join_relative(&self.base_path, &filename);
         let parq_writer = ParquetObjectWriter::new(self.store, file_path);
-        let writer = AsyncArrowWriter::try_new(parq_writer, self.schema, Some(self.props))?;
-        let metadata = writer.close().await?;
-        Ok(vec![(filename, metadata)])
+        let mut writer = AsyncArrowWriter::try_new(parq_writer, self.schema, Some(self.props))?;
+        let metadata = writer.finish().await?;
+        let size = writer.bytes_written() as u64;
+        Ok(vec![(filename, metadata, size)])
     }
 
     async fn delete_completed(&self) {
-        for (filename, _) in &self.results {
+        for (filename, _, _) in &self.results {
             let path = join_relative(&self.base_path, filename);
             if let Err(e) = self.store.delete(&path).await {
                 warn!("could not delete {}: {}", filename, e);

@@ -4,14 +4,14 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use ldrs_parquet::{default_writer_props, FileNamer, ParquetSink};
 use ldrs_storage::base_or_relative_path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use parquet::file::metadata::ParquetMetaData;
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    build_add, build_engine, build_overwrite_commit, cleanup_source_files, snapshot_table_state,
-    version_to_log_filename, MAX_COMMIT_RETRIES,
+    build_add, build_engine, build_overwrite_commit, cleanup_source_files,
+    snapshot_table_state, version_to_log_filename, MAX_COMMIT_RETRIES,
 };
 
 /// Streaming Delta overwrite. Writes data files through an embedded [`ParquetSink`]
@@ -98,20 +98,12 @@ async fn commit_overwrite(
     base_path: &object_store::path::Path,
     url: &Url,
     schema: &SchemaRef,
-    files: &[(String, ParquetMetaData)],
+    files: &[(String, ParquetMetaData, u64)],
 ) -> Result<(), anyhow::Error> {
-    let file_paths: Vec<_> = files
-        .iter()
-        .map(|(filename, _)| base_path.clone().join(filename.as_str()))
-        .collect();
-
-    let obj_metas =
-        futures::future::try_join_all(file_paths.iter().map(|path| store.head(path))).await?;
-
+    let now = chrono::Utc::now().timestamp_millis();
     let adds = files
         .iter()
-        .zip(obj_metas.iter())
-        .map(|((filename, metadata), obj_meta)| build_add(filename, metadata, obj_meta, schema))
+        .map(|(filename, metadata, size)| build_add(filename, metadata, *size, now, schema))
         .collect::<Result<Vec<_>, _>>()?;
 
     let engine = build_engine(store.clone());

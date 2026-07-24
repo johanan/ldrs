@@ -6,13 +6,14 @@ use arrow::ipc::writer::StreamWriter;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use futures::{future::join_all, StreamExt, TryStream, TryStreamExt};
-use ldrs_arrow::{transform_batch, ArrowColumnTransformStrategy};
+use ldrs_arrow::{transform_batch, ArrowColumnTransformStrategy, ColumnSpec};
 use ldrs_delta::{DeltaMergeSink, DeltaOverwriteSink};
 use ldrs_parquet::ParquetSink;
 use ldrs_postgres::PgSink;
+use ldrs_storage::join_into_url;
 use tracing::warn;
 
-use crate::phase::{DeltaStrategy, DestinationOutcome, FileWritten};
+use crate::phase::{DeltaCommit, DestinationOutcome, FileWritten};
 
 /// Streams Arrow record batches to `writer` as an Arrow IPC stream.
 pub struct ArrowStdoutSink<W: Write = Stdout> {
@@ -49,12 +50,12 @@ impl<W: Write> ArrowStdoutSink<W> {
 /// a `Vec<Sink>` through one loop. `write_batch` is the only operation that is
 /// uniform across destinations; construction, finish, and abort differ per
 /// destination and live in their own match arms (in orchestration, where the
-/// transaction/command context is in scope).
+/// transaction/command context is in scope). Each outcome-producing variant carries its columns and target
 pub enum Sink {
-    Pg(PgSink),
-    Pq(ParquetSink),
-    DeltaOverwrite(DeltaOverwriteSink),
-    DeltaMerge(DeltaMergeSink),
+    Pg(PgSink, (Vec<ColumnSpec>, String)),
+    Pq(ParquetSink, (Vec<ColumnSpec>, String, String)),
+    DeltaOverwrite(DeltaOverwriteSink, (Vec<ColumnSpec>, String, String)),
+    DeltaMerge(DeltaMergeSink, (Vec<ColumnSpec>, String, String)),
     Arrow(ArrowStdoutSink),
 }
 
@@ -63,10 +64,10 @@ impl Sink {
     /// `write_batch`. The only method shared across every variant.
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), anyhow::Error> {
         match self {
-            Sink::Pg(s) => s.write_batch(batch).await,
-            Sink::Pq(s) => s.write_batch(batch).await,
-            Sink::DeltaOverwrite(s) => s.write_batch(batch).await,
-            Sink::DeltaMerge(s) => s.write_batch(batch).await,
+            Sink::Pg(s, _) => s.write_batch(batch).await,
+            Sink::Pq(s, _) => s.write_batch(batch).await,
+            Sink::DeltaOverwrite(s, _) => s.write_batch(batch).await,
+            Sink::DeltaMerge(s, _) => s.write_batch(batch).await,
             Sink::Arrow(s) => s.write_batch(batch),
         }
     }
@@ -149,58 +150,75 @@ pub async fn finish_all(sinks: Vec<Sink>) -> Result<Vec<DestinationOutcome>, any
     let destinations: Vec<DestinationOutcome> = join_all(sinks.into_iter().map(|sink| {
         async move {
             match sink {
-                Sink::Pg(pg) => {
-                    let table = pg.target().to_string();
+                Sink::Pg(pg, (columns, target)) => {
                     let result = pg
                         .commit()
                         .await
-                        .with_context(|| format!("postgres load to {table} failed"))
+                        .with_context(|| format!("postgres load to {target} failed"))
                         .map_err(|e| format!("{e:#}"));
-                    Some(DestinationOutcome::Pg { table, result })
+                    Some(DestinationOutcome::Pg {
+                        target,
+                        columns,
+                        result,
+                    })
                 }
-                Sink::Pq(s) => {
-                    let location = s.base_path().to_string();
+                Sink::Pq(s, (columns, target, base_url)) => {
+                    let result = s
+                        .finish()
+                        .await
+                        .map(|metas| {
+                            metas
+                                .into_iter()
+                                .map(|(name, md, _size)| FileWritten {
+                                    full_url: qualify_file(&base_url, &name),
+                                    path: name,
+                                    rows: md.file_metadata().num_rows().max(0) as u64,
+                                })
+                                .collect()
+                        })
+                        .with_context(|| format!("parquet write to {base_url} failed"))
+                        .map_err(|e| format!("{e:#}"));
                     Some(DestinationOutcome::Parquet {
-                        location: location.clone(),
-                        result: s
-                            .finish()
-                            .await
-                            .map(|metas| {
-                                metas
-                                    .into_iter()
-                                    .map(|(path, md)| FileWritten {
-                                        path,
-                                        rows: md.file_metadata().num_rows().max(0) as u64,
-                                    })
-                                    .collect()
-                            })
-                            .with_context(|| format!("parquet write to {location} failed"))
-                            .map_err(|e| format!("{e:#}")),
+                        target,
+                        full_url: base_url,
+                        columns,
+                        result,
                     })
                 }
-                Sink::DeltaOverwrite(s) => {
-                    let location = s.base_path().to_string();
+                Sink::DeltaOverwrite(s, (columns, target, full_url)) => {
+                    let result = s
+                        .finish()
+                        .await
+                        .map(|_| DeltaCommit::Overwrite)
+                        .with_context(|| format!("delta overwrite at {full_url} failed"))
+                        .map_err(|e| format!("{e:#}"));
                     Some(DestinationOutcome::Delta {
-                        location: location.clone(),
-                        strategy: DeltaStrategy::Overwrite,
-                        result: s
-                            .finish()
-                            .await
-                            .with_context(|| format!("delta overwrite at {location} failed"))
-                            .map_err(|e| format!("{e:#}")),
+                        target,
+                        full_url,
+                        columns,
+                        result,
                     })
                 }
-                Sink::DeltaMerge(s) => {
-                    let location = s.base_path().to_string();
+                Sink::DeltaMerge(s, (columns, target, full_url)) => {
+                    let result = s
+                        .finish()
+                        .await
+                        .map(|st| DeltaCommit::Merge {
+                            skipped: st.skipped,
+                            skipped_version: st.skipped_version,
+                            source_rows: st.source_rows as u64,
+                            matched_rows: st.matched_rows as u64,
+                            inserted_rows: st.inserted_rows as u64,
+                            files_scanned: st.files_scanned as u64,
+                            files_written: st.files_written as u64,
+                        })
+                        .with_context(|| format!("delta merge at {full_url} failed"))
+                        .map_err(|e| format!("{e:#}"));
                     Some(DestinationOutcome::Delta {
-                        location: location.clone(),
-                        strategy: DeltaStrategy::Merge,
-                        result: s
-                            .finish()
-                            .await
-                            .map(|_| ())
-                            .with_context(|| format!("delta merge at {location} failed"))
-                            .map_err(|e| format!("{e:#}")),
+                        target,
+                        full_url,
+                        columns,
+                        result,
                     })
                 }
                 // arrow: terminal, no outcome entry; a finish error (e.g. closed pipe) is logged, not fatal
@@ -220,15 +238,28 @@ pub async fn finish_all(sinks: Vec<Sink>) -> Result<Vec<DestinationOutcome>, any
     Ok(destinations)
 }
 
+/// Fully qualify a written file under its destination base. Non-fatal: the file is already
+/// committed by the time this runs, so a join failure falls back to the relative name rather than
+/// turning a successful write into a reported failure.
+fn qualify_file(base_url: &str, name: &str) -> String {
+    match join_into_url(base_url, name) {
+        Ok(url) => url.to_string(),
+        Err(e) => {
+            warn!("could not qualify parquet file '{name}' under '{base_url}': {e:#}");
+            name.to_string()
+        }
+    }
+}
+
 /// Failure-path cleanup. Each sink undoes what it can: Postgres rolls back, the file
 /// sinks delete their incomplete output, Arrow is a no-op. Best-effort.
 pub async fn abort_all(sinks: Vec<Sink>) {
     for sink in sinks {
         match sink {
-            Sink::Pg(pg) => pg.rollback().await,
-            Sink::Pq(s) => s.abort().await,
-            Sink::DeltaOverwrite(s) => s.abort().await,
-            Sink::DeltaMerge(s) => s.abort().await,
+            Sink::Pg(pg, _) => pg.rollback().await,
+            Sink::Pq(s, _) => s.abort().await,
+            Sink::DeltaOverwrite(s, _) => s.abort().await,
+            Sink::DeltaMerge(s, _) => s.abort().await,
             Sink::Arrow(s) => s.abort(),
         }
     }
@@ -353,5 +384,29 @@ mod tests {
         sink.write_batch(&int_batch(&schema, vec![1])).unwrap();
         sink.abort();
         // No panic, nothing to assert beyond a clean return.
+    }
+
+    #[test]
+    fn qualify_file_joins_name_under_base() {
+        assert_eq!(
+            qualify_file("s3://bucket/prod/users", "part_00000.parquet"),
+            "s3://bucket/prod/users/part_00000.parquet"
+        );
+    }
+
+    #[test]
+    fn qualify_file_keeps_subdirectory_names() {
+        // A namer template may emit subdirectories; the whole relative path is preserved.
+        assert_eq!(
+            qualify_file("s3://bucket/prod/users", "dt=2025-07/part_0.parquet"),
+            "s3://bucket/prod/users/dt=2025-07/part_0.parquet"
+        );
+    }
+
+    #[test]
+    fn qualify_file_falls_back_to_name_when_base_is_unqualifiable() {
+        // The file is already committed by the time qualify runs, so a base that can't be joined
+        // degrades to the relative name rather than failing the write.
+        assert_eq!(qualify_file("http://", "part_0.parquet"), "part_0.parquet");
     }
 }

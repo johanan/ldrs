@@ -17,6 +17,7 @@ ldrs-arrow = { path = "../ldrs-arrow" }
 ldrs-delta = { path = "../ldrs-delta" }
 ldrs-parquet = { path = "../ldrs-parquet" }
 ldrs-postgres = { path = "../ldrs-postgres" }
+ldrs-storage = { path = "../ldrs-storage" }
 parquet.workspace = true
 schemars.workspace = true
 serde.workspace = true
