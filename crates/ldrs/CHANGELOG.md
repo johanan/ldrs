@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.3] - 2026-07-24
+
+### Bug Fixes
+
+- *(delta)* Int/decimal fix
+
+ldrs did not have a section to change integer columns back to decimal
+when the logical type was decimal. This created issues when comparing
+the columns.
+
+- *(delta)* Fix file deletion vectors
+
+A missing trailing slash created a bad join on the root to the deletion
+vector file. Switched to the snapshot table root and it will always be
+correct.
+
+- *(finalize)* Added columns, delta output, full url, and lua helpers
+
+Not much more to add, a lot more data flows into the finalize process.
+
+
+### Performance
+
+- *(delta,parquet)* Remove object-store requests
+
+ldrs writes the parquets so we capture the file size after closing. Then
+we use that with delta to avoid making an extra call to object-store to
+get size and modified timestamp.
+
+
+### Refactor
+
+- *(config)* Stdout guard moved to cli binary
+
+The terminal check moved to ldrs instead of core as that is the correct
+abstraction.
+
+
 ## [0.21.2] - 2026-07-21
 
 ### Bug Fixes
