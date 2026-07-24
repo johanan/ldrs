@@ -484,6 +484,7 @@ fn resolve_dest(
                 max_rows: parq.max_rows,
                 max_bytes: parq.max_bytes,
                 columns: parq.columns,
+                target: resolved_target,
             }))
         }
         LdrsDestination::Delta(delta_dest) => {
@@ -543,6 +544,7 @@ fn resolve_dest(
                 table_path,
                 mode,
                 columns,
+                target: resolved_target,
             }))
         }
         LdrsDestination::Arrow(arrow_dest) => Ok(DestSpec::Arrow(ArrowDest {

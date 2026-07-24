@@ -117,6 +117,7 @@ async fn build_sink(
             // PG keeps `target_cols` for COPY encoding; the cast runs in the executor.
             let (target_cols, _out_schema, transform) =
                 resolve_transform(source_cols, pg.columns, schema)?;
+            let target_and_cols = (target_cols.clone(), pg.target.clone());
             let load = PgLoad {
                 role: pg.role,
                 before: pg.before,
@@ -127,10 +128,10 @@ async fn build_sink(
             };
             let conn = pool_for(pg_pools, &pg.conn_url)?.get().await?;
             let sink = PgSink::open(conn, load).await?;
-            Ok((Sink::Pg(sink), transform))
+            Ok((Sink::Pg(sink, target_and_cols), transform))
         }
         DestSpec::Pq(pq) => {
-            let (_target_cols, out_schema, transform) =
+            let (target_cols, out_schema, transform) =
                 resolve_transform(source_cols, pq.columns, schema)?;
             let props = with_bloom_filters(default_writer_props(), pq.bloom_filters);
             let sink = ParquetSink::new(
@@ -141,27 +142,24 @@ async fn build_sink(
                 pq.namer,
                 Some(props),
             )?;
-            Ok((Sink::Pq(sink), transform))
+            Ok((Sink::Pq(sink, (target_cols, pq.target, pq.url)), transform))
         }
         DestSpec::Delta(delta) => {
-            let (_target_cols, out_schema, transform) =
+            let (target_cols, out_schema, transform) =
                 resolve_transform(source_cols, delta.columns, schema)?;
             ensure_table(&delta.table_path, &out_schema).await?;
             let sink = match delta.mode {
                 DeltaMode::Overwrite {
                     max_rows,
                     max_bytes,
-                } => Sink::DeltaOverwrite(DeltaOverwriteSink::new(
-                    &delta.table_path,
-                    out_schema,
-                    max_rows,
-                    max_bytes,
-                )?),
-                DeltaMode::Merge(merge_config) => Sink::DeltaMerge(DeltaMergeSink::new(
-                    &delta.table_path,
-                    out_schema,
-                    merge_config,
-                )?),
+                } => Sink::DeltaOverwrite(
+                    DeltaOverwriteSink::new(&delta.table_path, out_schema, max_rows, max_bytes)?,
+                    (target_cols, delta.target, delta.table_path),
+                ),
+                DeltaMode::Merge(merge_config) => Sink::DeltaMerge(
+                    DeltaMergeSink::new(&delta.table_path, out_schema, merge_config)?,
+                    (target_cols, delta.target, delta.table_path),
+                ),
             };
             Ok((sink, transform))
         }

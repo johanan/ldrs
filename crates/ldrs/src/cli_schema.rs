@@ -146,7 +146,7 @@ fn finalize_doc() -> Value {
         "kind": "finalize",
         "finalize": block,
         "phase": phase,
-        "handler": "The `lua` file must define `finalize(phase)`: called once per item with the run's output (`phase`, schema below), it returns the command list run against the item's target. Config/identity is reached via the `render(template)` helper, not a second argument.",
+        "handler": "The `lua` file must define `finalize(phase)`: called once per item with the run's output (`phase`, schema below), it returns the command list run against the item's target. Each destination carries its resolved `target`, post-cast `columns`, and (for URL-backed destinations) `full_url`; Parquet lists its written files; a Delta `result` carries the commit op (`overwrite`/`merge`, with merge stats including `skipped` for an idempotent no-op). Helpers: `outputs_of(phase, kind)` returns the destinations of a kind as a list, `render(template)` renders a config/identity template, `parse_path(pattern, path)` extracts named segments from a path, `parse_url(url)` decomposes a URL into scheme/host/path.",
         "execution": "Every returned command runs in order, stopping at the first error; each statement's result set is info-logged under phase=\"finalize\".",
         "usage_ref": "ldrs schema usage",
     })
