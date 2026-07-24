@@ -2,6 +2,7 @@ pub mod config;
 pub mod field_validation;
 
 use std::collections::HashMap;
+use std::io::{self, IsTerminal};
 
 use anyhow::Context;
 use deadpool_postgres::Pool;
@@ -547,9 +548,17 @@ fn resolve_dest(
                 target: resolved_target,
             }))
         }
-        LdrsDestination::Arrow(arrow_dest) => Ok(DestSpec::Arrow(ArrowDest {
-            columns: arrow_dest.columns,
-        })),
+        LdrsDestination::Arrow(arrow_dest) => {
+            if io::stdout().is_terminal() {
+                return Err(anyhow::anyhow!(
+                    "Outputting Arrow IPC Stream to stdout is not supported in a terminal. \
+                     Please redirect the output to a file or pipe it to another command."
+                ));
+            }
+            Ok(DestSpec::Arrow(ArrowDest {
+                columns: arrow_dest.columns,
+            }))
+        }
     }
 }
 

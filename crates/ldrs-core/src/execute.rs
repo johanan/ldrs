@@ -2,7 +2,7 @@
 //! schema-derived target columns and cast), and the shared pg pool map they draw connections from.
 
 use std::collections::HashMap;
-use std::io::{self, IsTerminal};
+use std::io;
 use std::sync::Arc;
 
 use arrow_schema::{Schema, SchemaRef};
@@ -164,9 +164,6 @@ async fn build_sink(
             Ok((sink, transform))
         }
         DestSpec::Arrow(arrow) => {
-            if io::stdout().is_terminal() {
-                return Err(anyhow::Error::msg("Outputting Arrow IPC Stream to stdout is not supported in a terminal. Please redirect the output to a file or pipe it to another command."));
-            }
             let (_target_cols, out_schema, transform) =
                 resolve_transform(source_cols, arrow.columns, schema)?;
             let sink = ArrowStdoutSink::new(io::stdout(), out_schema)?;
