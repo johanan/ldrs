@@ -366,7 +366,7 @@ async fn commit_merge(
             store,
             base_path,
             engine.as_ref(),
-            url,
+            snapshot.table_root(),
             &merge_config.merge_keys,
             &key_set,
             &converter,

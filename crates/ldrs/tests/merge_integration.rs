@@ -126,6 +126,108 @@ fn verify_duckdb_count(table_path: &str, expected: i64) {
     );
 }
 
+// Highest committed version in `_delta_log`.
+fn latest_version(table_path: &str) -> u64 {
+    let log_dir = format!("{}/_delta_log", table_path);
+    std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".json"))
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .max()
+        .expect("at least one commit")
+}
+
+// A deletion vector larger than the 1024-byte inline threshold is stored as a file
+// (`storageType: "u"`).
+#[tokio::test]
+#[test_log::test]
+async fn test_merge_file_based_dv_round_trip() {
+    let table_path = test_table_path("file_based_dv");
+    cleanup_table(&table_path);
+
+    let schema = test_schema();
+    // No trailing slash
+    let table_url = format!("file://{}", table_path);
+
+    // Target: ids 1..=2000 in a single file.
+    let target = make_target_batch(1..2001);
+    overwrite_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(target)]),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let config = || MergeConfig {
+        merge_keys: vec!["id".to_string()],
+        allow_null_keys: false,
+        max_rows: None,
+        max_bytes: None,
+        txn_config: TxnConfig::None,
+    };
+
+    // Merge 1: 700 scattered matches
+    let odd_ids: Vec<i64> = (1..=1399).step_by(2).collect();
+    let m1 = odd_ids.len() as i64;
+    let source1 = make_batch_from_ids(odd_ids, 10_000, SOURCE_BASE_TS);
+    let stats1 = merge_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(source1)]),
+        config(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats1.matched_rows as i64, m1);
+
+    let actions1 = read_log_actions(&table_path, latest_version(&table_path));
+    let dv1 = actions1
+        .iter()
+        .filter_map(|a| a.get("add"))
+        .find_map(|add| add.get("deletionVector"))
+        .expect("merge 1 should write a deletion vector");
+    assert_eq!(
+        dv1["storageType"], "u",
+        "DV must be file-based (>1024 B) to exercise the read path"
+    );
+
+    // Merge 2
+    let even_ids: Vec<i64> = (2..=400).step_by(2).collect();
+    let m2 = even_ids.len() as i64;
+    let source2 = make_batch_from_ids(even_ids, 20_000, SOURCE_BASE_TS);
+    let stats2 = merge_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(source2)]),
+        config(),
+    )
+    .await
+    .expect("merge 2 must read the existing file-based DV, not fail on a dropped path segment");
+    assert_eq!(stats2.matched_rows as i64, m2);
+
+    // The re-matched file's DV is now the union of both merges.
+    let actions2 = read_log_actions(&table_path, latest_version(&table_path));
+    let unioned = actions2
+        .iter()
+        .filter_map(|a| a.get("add"))
+        .filter_map(|add| add.get("deletionVector"))
+        .map(|dv| dv["cardinality"].as_i64().unwrap())
+        .max()
+        .expect("merge 2 should write a deletion vector");
+    assert_eq!(unioned, m1 + m2, "DV should be the union of both merges");
+
+    // Updates delete + reinsert, so the logical count is unchanged.
+    verify_duckdb_count(&table_path, 2000);
+}
+
 #[tokio::test]
 #[test_log::test]
 async fn test_merge_basic_int_key() {
