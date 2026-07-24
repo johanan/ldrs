@@ -69,6 +69,17 @@ fn coerce_to_logical(scalar: Option<Scalar>, data_type: &DataType) -> Option<Sca
         (Scalar::Long(v), Timestamp(_, Some(_))) => Some(Scalar::Timestamp(v)),
         (Scalar::Long(v), Timestamp(_, None)) => Some(Scalar::TimestampNtz(v)),
         (Scalar::Integer(v), Date32) => Some(Scalar::Date(v)),
+        // We need to go between an integer backed decimal and make sure it is the correct type
+        // based on the logical type
+        (Scalar::Integer(v), Decimal32(p, s) | Decimal64(p, s) | Decimal128(p, s)) => {
+            Scalar::decimal(v, *p, *s as u8).ok()
+        }
+        (Scalar::Long(v), Decimal32(p, s) | Decimal64(p, s) | Decimal128(p, s)) => {
+            Scalar::decimal(v, *p, *s as u8).ok()
+        }
+        (Scalar::Binary(bytes), Decimal128(p, s)) => {
+            Scalar::decimal(decimal_be_bytes_to_i128(&bytes), *p, *s as u8).ok()
+        }
         (scalar, _) => Some(scalar),
     }
 }
@@ -85,6 +96,19 @@ fn pick_bound(current: Option<Scalar>, new: Option<Scalar>, ordering: Ordering) 
             }
         }
     }
+}
+
+fn decimal_be_bytes_to_i128(bytes: &[u8]) -> i128 {
+    // check sign and then fill based on negative or not
+    let mut buf = if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+        [0xFF_u8; 16]
+    } else {
+        [0u8; 16]
+    };
+    // figure out where to start the bytes in the array
+    let start = 16 - bytes.len();
+    buf[start..].copy_from_slice(bytes);
+    i128::from_be_bytes(buf)
 }
 
 fn format_decimal_value(unscaled: i128, scale: u8) -> String {
@@ -134,20 +158,9 @@ fn scalar_to_json_value(
             })
         }
 
-        // Decimal128 can have fewer than 16 bytes if the precision is smaller
-        (Scalar::Binary(bytes), Decimal128(_precision, scale)) => {
-            // check sign and then fill based on negative or not
-            let mut buf = if bytes.first().is_some_and(|b| b & 0x80 != 0) {
-                [0xFF_u8; 16]
-            } else {
-                [0u8; 16]
-            };
-            // figure out where to start the bytes in the array
-            let start = 16 - bytes.len();
-            buf[start..].copy_from_slice(bytes);
-            let value = i128::from_be_bytes(buf);
-            Some(serde_json::json!(format_decimal_value(value, *scale as u8)))
-        }
+        (Scalar::Binary(bytes), Decimal128(_precision, scale)) => Some(serde_json::json!(
+            format_decimal_value(decimal_be_bytes_to_i128(bytes), *scale as u8)
+        )),
         (Scalar::Integer(v), Decimal32(_p, scale) | Decimal128(_p, scale)) => Some(
             serde_json::json!(format_decimal_value(*v as i128, *scale as u8)),
         ),
