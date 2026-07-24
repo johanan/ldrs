@@ -107,7 +107,7 @@ async fn sink_rotates_by_rows() {
     assert_eq!(results[0].0, "part_00000.parquet");
     assert_eq!(results[1].0, "part_00001.parquet");
     assert_eq!(results[2].0, "part_00002.parquet");
-    for (filename, _) in &results {
+    for (filename, _, _) in &results {
         let (rows, _) = read_rows(&dir, filename);
         assert_eq!(rows, 2);
     }

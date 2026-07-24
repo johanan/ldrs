@@ -14,7 +14,7 @@ use ldrs_parquet::{
     FileNamer, ParquetSink, ROW_NUMBER_COLUMN,
 };
 use ldrs_storage::base_or_relative_path;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::ObjectStore;
 use parquet::file::metadata::ParquetMetaData;
 use url::Url;
 use uuid::Uuid;
@@ -105,7 +105,7 @@ impl MergeStats {
 pub(crate) async fn build_key_set(
     store: Arc<dyn ObjectStore>,
     base_path: &object_store::path::Path,
-    source_files: &[(String, ParquetMetaData)],
+    source_files: &[(String, ParquetMetaData, u64)],
     merge_keys: &[String],
     schema: &SchemaRef,
 ) -> Result<(HashSet<Vec<u8>>, RowConverter), anyhow::Error> {
@@ -120,13 +120,14 @@ pub(crate) async fn build_key_set(
 
     let total_rows: usize = source_files
         .iter()
-        .map(|(_, m)| m.file_metadata().num_rows() as usize)
+        .map(|(_, m, _)| m.file_metadata().num_rows() as usize)
         .sum();
     let mut key_set: HashSet<Vec<u8>> = HashSet::with_capacity(total_rows);
 
-    for (filename, _) in source_files {
+    for (filename, _, size) in source_files {
         let path = base_path.clone().join(filename.as_str());
-        let mut stream = stream_projected_parquet(store.clone(), &path, merge_keys, None).await?;
+        let mut stream =
+            stream_projected_parquet(store.clone(), &path, merge_keys, None, *size).await?;
 
         while let Some(batch) = stream.next().await {
             let batch = batch?;
@@ -145,7 +146,7 @@ pub(crate) async fn build_key_set(
 }
 
 pub(crate) fn validate_no_null_keys(
-    source_files: &[(String, ParquetMetaData)],
+    source_files: &[(String, ParquetMetaData, u64)],
     merge_keys: &[String],
     schema: &SchemaRef,
 ) -> Result<(), anyhow::Error> {
@@ -158,7 +159,7 @@ pub(crate) fn validate_no_null_keys(
 
     let null_key = source_files
         .iter()
-        .flat_map(|(_, metadata)| metadata.row_groups())
+        .flat_map(|(_, metadata, _)| metadata.row_groups())
         .flat_map(|rg| {
             key_indices.iter().map(move |(idx, name)| {
                 let null_count = rg
@@ -296,7 +297,7 @@ async fn commit_merge(
     url: &Url,
     schema: &SchemaRef,
     merge_config: &MergeConfig,
-    source_files: &[(String, ParquetMetaData)],
+    source_files: &[(String, ParquetMetaData, u64)],
 ) -> Result<MergeStats, anyhow::Error> {
     if !merge_config.allow_null_keys {
         validate_no_null_keys(source_files, &merge_config.merge_keys, schema)?;
@@ -460,19 +461,10 @@ async fn commit_merge(
             });
         }
 
-        // Add actions for new source files
-        let file_paths: Vec<_> = source_files
-            .iter()
-            .map(|(filename, _)| base_path.clone().join(filename.as_str()))
-            .collect();
-
-        let obj_metas =
-            futures::future::try_join_all(file_paths.iter().map(|path| store.head(path))).await?;
-
+        let now = chrono::Utc::now().timestamp_millis();
         let new_adds = source_files
             .iter()
-            .zip(obj_metas.iter())
-            .map(|((filename, metadata), obj_meta)| build_add(filename, metadata, obj_meta, schema))
+            .map(|(filename, metadata, size)| build_add(filename, metadata, *size, now, schema))
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut actions: Vec<DeltaAction> = vec![DeltaAction::CommitInfo(&commit_info)];
@@ -510,7 +502,7 @@ async fn commit_merge(
             Ok(_) => {
                 let source_rows: usize = source_files
                     .iter()
-                    .map(|(_, m)| m.file_metadata().num_rows() as usize)
+                    .map(|(_, m, _)| m.file_metadata().num_rows() as usize)
                     .sum();
                 return Ok(MergeStats {
                     source_rows,
@@ -583,6 +575,7 @@ async fn probe_targets_for_matches(
             &path,
             merge_keys,
             Some(probe.eligible_row_groups.clone()),
+            probe.scan_file.size as u64,
         )
         .await?;
 
@@ -634,14 +627,14 @@ async fn narrow_to_eligible_row_groups(
     store: &Arc<dyn ObjectStore>,
     base_path: &object_store::path::Path,
     schema: &SchemaRef,
-    source_files: &[(String, ParquetMetaData)],
+    source_files: &[(String, ParquetMetaData, u64)],
     merge_keys: &[String],
 ) -> Result<Vec<FileProbe>, anyhow::Error> {
     let mut file_probes: Vec<FileProbe> = Vec::new();
 
     for candidate in candidates {
         let path = base_path.clone().join(candidate.path.as_str());
-        let metadata = read_parquet_metadata(store.clone(), &path).await?;
+        let metadata = read_parquet_metadata(store.clone(), &path, candidate.size as u64).await?;
 
         let mut eligible_rgs: Vec<usize> = (0..metadata.num_row_groups()).collect();
 
@@ -681,7 +674,7 @@ async fn narrow_to_eligible_row_groups(
 /// For ProcessingTime, it is the caller's explicit version or wall-clock millis.
 fn compute_batch_version(
     txn_config: &TxnConfig,
-    source_files: &[(String, ParquetMetaData)],
+    source_files: &[(String, ParquetMetaData, u64)],
     schema: &SchemaRef,
 ) -> Result<(Option<String>, Option<i64>), anyhow::Error> {
     match txn_config {
@@ -711,7 +704,7 @@ fn find_candidate_target_files(
     snapshot: &delta_kernel::SnapshotRef,
     engine: &dyn delta_kernel::Engine,
     schema: &SchemaRef,
-    source_files: &[(String, ParquetMetaData)],
+    source_files: &[(String, ParquetMetaData, u64)],
     first_key: &str,
 ) -> Result<
     (
@@ -854,7 +847,11 @@ mod tests {
             ],
         )
         .unwrap();
-        let source_files = vec![("test.parquet".to_string(), metadata_from_batch(&batch))];
+        let source_files = vec![(
+            "test.parquet".to_string(),
+            metadata_from_batch(&batch),
+            0u64,
+        )];
         validate_no_null_keys(&source_files, &["id".to_string()], &schema).unwrap();
     }
 
@@ -873,7 +870,11 @@ mod tests {
             ],
         )
         .unwrap();
-        let source_files = vec![("test.parquet".to_string(), metadata_from_batch(&batch))];
+        let source_files = vec![(
+            "test.parquet".to_string(),
+            metadata_from_batch(&batch),
+            0u64,
+        )];
 
         let err = validate_no_null_keys(&source_files, &["id".to_string()], &schema)
             .expect_err("should error on null keys");

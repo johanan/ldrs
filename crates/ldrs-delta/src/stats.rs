@@ -237,7 +237,7 @@ fn scalar_to_i64(scalar: &Scalar) -> Result<i64, anyhow::Error> {
 }
 
 pub(crate) fn max_stat_as_i64(
-    source_files: &[(String, ParquetMetaData)],
+    source_files: &[(String, ParquetMetaData, u64)],
     col_name: &str,
     schema: &SchemaRef,
 ) -> Result<i64, anyhow::Error> {
@@ -245,7 +245,7 @@ pub(crate) fn max_stat_as_i64(
 
     let max_scalar = source_files
         .iter()
-        .flat_map(|(_, m)| m.row_groups())
+        .flat_map(|(_, m, _)| m.row_groups())
         .filter_map(|rg| rg.column(col_idx).statistics())
         .fold(None, |acc, stats| {
             let (_, new_max) = stats_to_scalars(stats);
@@ -257,7 +257,7 @@ pub(crate) fn max_stat_as_i64(
 }
 
 pub(crate) fn key_bounds_as_scalars(
-    source_files: &[(String, ParquetMetaData)],
+    source_files: &[(String, ParquetMetaData, u64)],
     key_col_name: &str,
     schema: &SchemaRef,
 ) -> Option<(Scalar, Scalar)> {
@@ -266,7 +266,7 @@ pub(crate) fn key_bounds_as_scalars(
 
     let (min, max) = source_files
         .iter()
-        .flat_map(|(_, m)| m.row_groups())
+        .flat_map(|(_, m, _)| m.row_groups())
         .filter_map(|rg| rg.column(col_idx).statistics())
         .fold(None, |acc, stats| {
             let (new_min, new_max) = stats_to_scalars(stats);
@@ -389,6 +389,36 @@ mod tests {
         assert_eq!(
             scalar_to_json_value(&Scalar::Integer(-1), &DataType::Date32),
             Some(json!("1969-12-31"))
+        );
+    }
+
+    #[test]
+    fn coerce_int_backed_decimal_to_decimal_scalar() {
+        // A Decimal(12,0) key is stored physically as int64 in parquet, so its stats yield a
+        // Scalar::Long. It must lift to a Decimal scalar
+        match coerce_to_logical(Some(Scalar::Long(42)), &DataType::Decimal64(12, 0)) {
+            Some(Scalar::Decimal(d)) => {
+                assert_eq!(d.bits(), 42);
+                assert_eq!(d.scale(), 0);
+            }
+            other => panic!("int64-backed decimal should coerce to Decimal, got {other:?}"),
+        }
+        // int32-backed (Decimal32) and byte-backed (precision > 18) also lift
+        assert!(matches!(
+            coerce_to_logical(Some(Scalar::Integer(7)), &DataType::Decimal32(5, 0)),
+            Some(Scalar::Decimal(_))
+        ));
+        assert!(matches!(
+            coerce_to_logical(
+                Some(Scalar::Binary(1234i128.to_be_bytes().to_vec())),
+                &DataType::Decimal128(38, 2),
+            ),
+            Some(Scalar::Decimal(_))
+        ));
+        // non-decimal targets pass through unchanged
+        assert_eq!(
+            coerce_to_logical(Some(Scalar::Long(5)), &DataType::Int64),
+            Some(Scalar::Long(5))
         );
     }
 

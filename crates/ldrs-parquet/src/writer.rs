@@ -154,8 +154,10 @@ pub const ROW_NUMBER_COLUMN: &str = "_row_number";
 pub async fn read_parquet_metadata(
     store: Arc<dyn ObjectStore>,
     path: &object_store::path::Path,
+    size: u64,
 ) -> Result<Arc<ParquetMetaData>, anyhow::Error> {
-    let reader = ParquetObjectReader::new(store, path.clone());
+    // Passing the file size makes the reader use bounded range requests instead of a suffix range,
+    let reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
     let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
     Ok(builder.metadata().clone())
 }
@@ -165,6 +167,7 @@ pub async fn stream_projected_parquet(
     path: &object_store::path::Path,
     columns: &[String],
     row_groups: Option<Vec<usize>>,
+    size: u64,
 ) -> Result<
     parquet::arrow::async_reader::ParquetRecordBatchStream<ParquetObjectReader>,
     anyhow::Error,
@@ -174,7 +177,7 @@ pub async fn stream_projected_parquet(
     );
     let options = ArrowReaderOptions::new().with_virtual_columns(vec![row_number_field])?;
 
-    let reader = ParquetObjectReader::new(store, path.clone());
+    let reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
     let mut builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
 
     let mask = parquet::arrow::ProjectionMask::columns(

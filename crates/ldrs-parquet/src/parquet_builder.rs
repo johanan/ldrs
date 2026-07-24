@@ -20,7 +20,9 @@ pub async fn builder_from_url(
         .await
         .with_context(|| "Could not find file in store")?;
 
-    let reader = ParquetObjectReader::new(store, meta.location).with_runtime(handle);
+    let reader = ParquetObjectReader::new(store, meta.location)
+        .with_file_size(meta.size)
+        .with_runtime(handle);
 
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await
