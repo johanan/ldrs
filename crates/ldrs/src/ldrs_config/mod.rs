@@ -9,7 +9,7 @@ use deadpool_postgres::Pool;
 use futures::future::join_all;
 use ldrs_arrow::ColumnType;
 use ldrs_core::execute::{build_pools, run_task};
-use ldrs_core::phase::PhaseOutput;
+use ldrs_core::phase::{DeltaCommit, DestinationOutcome, PhaseOutput};
 use ldrs_core::plan::{
     ArrowDest, DeltaDest, DeltaMode, DestSpec, PgDest, PqDest, SourceSpec, Task,
 };
@@ -338,6 +338,39 @@ pub async fn execute_task(
         None => return Ok(None),
     };
     debug!("finalize phase output: {:?}", phase);
+    for outcome in &phase.destinations {
+        match outcome {
+            DestinationOutcome::Delta {
+                target,
+                result: Ok(commit),
+                ..
+            } => match commit {
+                DeltaCommit::Overwrite => info!(dest = %target, "delta overwrite committed"),
+                DeltaCommit::Merge {
+                    skipped: true,
+                    skipped_version,
+                    ..
+                } => info!(
+                    dest = %target,
+                    committed_version = skipped_version,
+                    "delta merge skipped: source is not newer than the committed version"
+                ),
+                DeltaCommit::Merge {
+                    matched_rows,
+                    inserted_rows,
+                    files_written,
+                    ..
+                } => info!(
+                    dest = %target,
+                    matched = matched_rows,
+                    inserted = inserted_rows,
+                    files_written,
+                    "delta merge committed"
+                ),
+            },
+            _ => {}
+        }
+    }
     let finalize_failures = run_finalize(&finalize_items, &phase, ldrs_env, &context).await;
     let load_failures: Vec<String> = phase
         .destinations

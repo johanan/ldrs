@@ -3,9 +3,11 @@
 //! and the complete child environment are handed in. The child-env policy (which `LDRS_*` vars to
 //! strip or keep) belongs to the shell.
 
+use std::ffi::OsString;
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::thread;
 
 use anyhow::Context;
 use arrow::ipc::reader::StreamReader;
@@ -17,12 +19,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace};
 
 /// A resolved external source: the binary, its args, an optional stdin script, and the complete
-/// child environment.
+/// child environment. Variable names are UTF-8; values are not required to be.
 pub struct Spawned {
     pub binary: PathBuf,
     pub args: Vec<String>,
     pub stdin: Option<String>,
-    pub env: Vec<(String, String)>,
+    pub env: Vec<(String, OsString)>,
 }
 
 /// The pumped output of a spawned source: the batch stream, the schema (sent once the stream
@@ -36,11 +38,24 @@ pub struct SpawnedStream {
 /// Spawn the process and pump its stdout Arrow IPC stream into a bounded channel. Settlement:
 /// a truncated stream reads without error, so the child's exit status (and whether the stream
 /// opened at all) is the integrity signal, reported through `command_handle`.
+///
+/// All three pipes are serviced concurrently. Each holds a fixed-size OS buffer, so a child that
+/// fills stderr, or one still being fed stdin while its stdout backs up, blocks and never exits.
+/// stdout stays on this thread (`StreamReader` is a blocking reader); stdin and stderr get one
+/// thread each, joined before the task ends.
 pub fn spawn_arrow_source(spec: Spawned) -> SpawnedStream {
     let (tx, rx) = mpsc::channel(16);
     let (schema_tx, schema_rx) = oneshot::channel();
 
     let command_handle = task::spawn_blocking(move || {
+        // Names only. `Command`'s own Debug renders the environment with values
+        let env_keys: Vec<&str> = spec.env.iter().map(|(key, _)| key.as_str()).collect();
+        debug!(
+            "Running {:?} {:?} with child env keys: {:?}",
+            spec.binary, spec.args, env_keys
+        );
+        drop(env_keys);
+
         let mut cmd = Command::new(&spec.binary);
         cmd.args(&spec.args)
             .env_clear()
@@ -50,64 +65,103 @@ pub fn spawn_arrow_source(spec: Spawned) -> SpawnedStream {
         if spec.stdin.is_some() {
             cmd.stdin(Stdio::piped());
         }
-        debug!("Running command: {:?}", cmd);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn {:?}", spec.binary))?;
 
-        if let Some(script) = &spec.stdin {
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("Failed to capture stdin"))?
-                .write_all(script.as_bytes())
-                .with_context(|| "Failed to write stdin script")?;
-            // The stdin handle drops here, closing the pipe so the child sees EOF.
-        }
+        let stdin_writer = match spec.stdin {
+            Some(script) => {
+                let mut handle = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to capture stdin"))?;
+                Some(thread::spawn(move || -> Result<(), anyhow::Error> {
+                    let written = handle.write_all(script.as_bytes());
+                    // Dropping the handle closes the pipe so the child sees EOF.
+                    drop(handle);
+                    written.map_err(anyhow::Error::from)
+                }))
+            }
+            None => None,
+        };
+
+        let mut stderr_handle = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
+        let stderr_drain = thread::spawn(move || -> Result<String, anyhow::Error> {
+            let mut buf = String::new();
+            stderr_handle.read_to_string(&mut buf)?;
+            Ok(buf)
+        });
 
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
-
-        let buf_reader = BufReader::new(stdout);
-        let stream_reader = StreamReader::try_new(buf_reader, None).ok();
+        let mut stream_reader = StreamReader::try_new(BufReader::new(stdout), None).ok();
         let stream_opened = stream_reader.is_some();
 
-        if let Some(mut stream_reader) = stream_reader {
-            let schema = stream_reader.schema();
-            if schema_tx.send(schema).is_err() {
-                return Err(anyhow::anyhow!("Failed to send schema: receiver dropped"));
-            }
-            while let Some(batch_result) = stream_reader.next() {
-                trace!("Processing batch");
-                if tx
-                    .blocking_send(batch_result.map_err(anyhow::Error::from))
-                    .is_err()
-                {
-                    return Err(anyhow::anyhow!("Failed to send batch"));
+        let stream_result: Result<(), anyhow::Error> = match stream_reader.as_mut() {
+            None => Ok(()),
+            Some(reader) => match schema_tx.send(reader.schema()) {
+                Err(_) => Err(anyhow::anyhow!("Failed to send schema: receiver dropped")),
+                Ok(()) => {
+                    let mut forwarded = Ok(());
+                    for batch_result in reader {
+                        trace!("Processing batch");
+                        if tx
+                            .blocking_send(batch_result.map_err(anyhow::Error::from))
+                            .is_err()
+                        {
+                            forwarded = Err(anyhow::anyhow!("Failed to send batch"));
+                            break;
+                        }
+                    }
+                    forwarded
                 }
-            }
+            },
+        };
+        // Close our end of stdout before waiting on the child.
+        drop(stream_reader);
+
+        // Abandoning the stream leaves the child writing into a pipe nobody drains, so `wait`
+        // would never return.
+        if stream_result.is_err() {
+            let _ = child.kill();
         }
 
         let status = child.wait()?;
-        match (status.success(), stream_opened) {
-            (true, true) => Ok(()),
-            (true, false) => Err(anyhow::anyhow!(
-                "Command succeeded but failed to open Arrow stream"
+        let stderr_output = stderr_drain
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr drain panicked"))
+            .flatten()?;
+        let stdin_result = match stdin_writer {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("stdin writer panicked"))
+                .flatten(),
+            None => Ok(()),
+        };
+
+        // The child's verdict outranks our plumbing: a script that fails early closes the stdin
+        // pipe, so a broken-pipe write is a symptom of that failure rather than the cause.
+        match (status.success(), stream_opened, stream_result) {
+            (false, _, _) => Err(anyhow::anyhow!(
+                "Spawned command failed with status: {}. Stderr: {}",
+                status,
+                stderr_output
             )),
-            (false, _) => {
-                let mut stderr_output = String::new();
-                stderr.read_to_string(&mut stderr_output)?;
-                Err(anyhow::anyhow!(
-                    "Spawned command failed with status: {}. Stderr: {}",
-                    status,
-                    stderr_output
-                ))
+            (true, _, Err(e)) => Err(e),
+            (true, false, Ok(())) => Err(anyhow::anyhow!(
+                "Command succeeded but failed to open Arrow stream. Stderr: {}",
+                stderr_output
+            )),
+            (true, true, Ok(())) => {
+                if !stderr_output.trim().is_empty() {
+                    debug!("child stderr: {}", stderr_output);
+                }
+                stdin_result.with_context(|| "Failed to write stdin script")
             }
         }
     });

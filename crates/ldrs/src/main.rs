@@ -294,9 +294,13 @@ fn main() -> Result<(), anyhow::Error> {
     drop(main_rt);
     drop(rt);
 
+    // The timing line is the last thing an operator watching the log sees, so it has to carry the verdict
     let end = std::time::Instant::now();
     if is_data_command {
-        info!("Time to load: {:?}", end - start);
+        match &command_exec {
+            Ok(()) => info!("Time to load: {:?}", end - start),
+            Err(e) => error!("Failed after {:?}: {:#}", end - start, e),
+        }
     }
     command_exec
 }

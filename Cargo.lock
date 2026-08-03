@@ -1927,10 +1927,12 @@ dependencies = [
  "parquet",
  "schemars",
  "serde",
+ "test-log",
  "tokio",
  "tokio-stream",
  "tracing",
  "url",
+ "which",
 ]
 
 [[package]]
