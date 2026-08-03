@@ -231,65 +231,89 @@ fn main() -> Result<(), anyhow::Error> {
                     println!("{}", serde_json::to_string_pretty(&output)?);
                     Ok(())
                 }
-            },
-            Destination::Sf { command } => match command {
-                SnowflakeCommands::Ingest {
-                    file_url,
-                    pattern,
-                    lua_args,
-                } => match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
-                    Ok(sf_url) => {
-                        let (pattern, url, modules) =
-                            modules_from_args(lua_args, file_url.as_str(), pattern.as_str())?;
-
-                        let (_, file_path, scheme) = build_store(&url)?;
-                        let url_data: UrlData = url.clone().into();
-                        let storage_data = StorageData::from_parts(&url, &file_path, scheme);
-
-                        let file_path_str = file_path.to_string();
-                        let extracted = pattern.parse_path(&file_path_str)?;
-                        let segments_value = path_pattern::extracted_segments_to_value(&extracted);
-
-                        let context = serde_json::json!({});
-
-                        let mut loader = LuaFunctionLoader::new().unwrap();
-                        let process_result = loader.call_process::<SnowflakeResult>(
-                            &modules,
-                            &url_data,
-                            &storage_data,
-                            &segments_value,
-                            None,
-                            &context,
-                        )?;
-                        let conn = ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
-                            &sf_url, None, None,
-                        )?;
-
-                        if matches!(process_result.strategy, SnowflakeStrategy::Ingest) {
-                            Err(anyhow::anyhow!("Ingest is not implemented"))?
+                Destination::Schema { command } => match command {
+                    None => {
+                        // bare `ldrs schema` list the subcommands
+                        let mut cmd = Cli::command();
+                        if let Some(sub) = cmd.find_subcommand_mut("schema") {
+                            sub.print_help()?;
+                            println!();
                         }
-
-                        let pre_sql = conn.exec(&process_result.pre_sql)?;
-                        debug!("Pre SQL {:?} executed successfully", pre_sql);
-                        let _sql = match process_result.strategy {
-                            SnowflakeStrategy::Sql(sql) => {
-                                let sql_result = conn.exec(&sql)?;
-                                debug!("SQL {:?} executed successfully", sql_result);
-                                Ok(())
-                            }
-                            SnowflakeStrategy::Ingest => {
-                                Err(anyhow::anyhow!("Ingest is not implemented"))
-                            }
-                        }?;
-                        let post_sql = conn.exec(&process_result.post_sql)?;
-                        debug!("Post SQL {:?} executed successfully", post_sql);
                         Ok(())
                     }
-                    Err(e) => Err(e),
+                    Some(cmd) => {
+                        let output = cli_schema::build(&cmd);
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                        Ok(())
+                    }
                 },
-            },
-        }
-    });
+                Destination::Sf { command } => match command {
+                    SnowflakeCommands::Ingest {
+                        file_url,
+                        pattern,
+                        lua_args,
+                    } => match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
+                        Ok(sf_url) => {
+                            let (pattern, url, modules) =
+                                modules_from_args(lua_args, file_url.as_str(), pattern.as_str())?;
+
+                            let (_, file_path, scheme) = build_store(&url)?;
+                            let url_data: UrlData = url.clone().into();
+                            let storage_data = StorageData::from_parts(&url, &file_path, scheme);
+
+                            let file_path_str = file_path.to_string();
+                            let extracted = pattern.parse_path(&file_path_str)?;
+                            let segments_value =
+                                path_pattern::extracted_segments_to_value(&extracted);
+
+                            let context = serde_json::json!({});
+
+                            let mut loader = LuaFunctionLoader::new().unwrap();
+                            let process_result = loader.call_process::<SnowflakeResult>(
+                                &modules,
+                                &url_data,
+                                &storage_data,
+                                &segments_value,
+                                None,
+                                &context,
+                            )?;
+                            let conn =
+                                ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
+                                    &sf_url,
+                                    None,
+                                    None,
+                                    ldrs::ldrs_snowflake::resolve_inherited_sf_env(
+                                        &get_all_ldrs_env_vars(),
+                                    ),
+                                )?;
+
+                            if matches!(process_result.strategy, SnowflakeStrategy::Ingest) {
+                                Err(anyhow::anyhow!("Ingest is not implemented"))?
+                            }
+
+                            let ambient = ambient_env();
+
+                            let pre_sql = conn.exec(&process_result.pre_sql, ambient.clone())?;
+                            debug!("Pre SQL {:?} executed successfully", pre_sql);
+                            let _sql = match process_result.strategy {
+                                SnowflakeStrategy::Sql(sql) => {
+                                    let sql_result = conn.exec(&sql, ambient.clone())?;
+                                    debug!("SQL {:?} executed successfully", sql_result);
+                                    Ok(())
+                                }
+                                SnowflakeStrategy::Ingest => {
+                                    Err(anyhow::anyhow!("Ingest is not implemented"))
+                                }
+                            }?;
+                            let post_sql = conn.exec(&process_result.post_sql, ambient)?;
+                            debug!("Post SQL {:?} executed successfully", post_sql);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    },
+                },
+            }
+        });
 
     drop(main_rt);
     drop(rt);

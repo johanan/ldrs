@@ -20,6 +20,7 @@ use ldrs_storage::join_into_url;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use crate::ldrs_env::{ambient_env, starts_with_ignore_ascii_case};
 use crate::{
     delta::{DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
     finalize::{call_finalize, run_sf, FinalizeItem, SfCommand},
@@ -280,24 +281,34 @@ async fn run_finalize(
     ldrs_env: &[(String, String)],
     context: &LdrsExecutionContext<'_>,
 ) -> Vec<String> {
-    let runs = items.iter().map(|item| async move {
-        match item {
-            FinalizeItem::Sf(sf) => {
-                // `target` defaults to the source name; it is both the rendered identity the Lua
-                // builds on and the connection-lookup key.
-                let target = sf.target.as_deref().unwrap_or(&phase.name);
-                let resolved = context
-                    .render_template(target)
-                    .map_err(|e| format!("finalize target render failed: {e:#}"))?;
-                let dest = get_dest_url(ldrs_env, &resolved, "SF").map_err(|e| format!("{e:#}"))?;
-                let (pem_key, pem_file) = resolve_conn_creds(ldrs_env, &dest.0);
-                let conn = SnowflakeConnection::create_connection(&dest.1, pem_key, pem_file)
+    let ambient = ambient_env();
+    let runs = items.iter().map(|item| {
+        let ambient = ambient.clone();
+        async move {
+            match item {
+                FinalizeItem::Sf(sf) => {
+                    // `target` defaults to the source name; it is both the rendered identity the Lua
+                    // builds on and the connection-lookup key.
+                    let target = sf.target.as_deref().unwrap_or(&phase.name);
+                    let resolved = context
+                        .render_template(target)
+                        .map_err(|e| format!("finalize target render failed: {e:#}"))?;
+                    let dest =
+                        get_dest_url(ldrs_env, &resolved, "SF").map_err(|e| format!("{e:#}"))?;
+                    let (pem_key, pem_file) = resolve_conn_creds(ldrs_env, &dest.0);
+                    let conn = SnowflakeConnection::create_connection(
+                        &dest.1,
+                        pem_key,
+                        pem_file,
+                        resolve_inherited_sf_env(ldrs_env),
+                    )
                     .map_err(|e| format!("{e:#}"))?;
-                let commands = call_finalize::<SfCommand>(&sf.lua, phase, context)
-                    .map_err(|e| format!("{e:#}"))?;
-                tokio::task::spawn_blocking(move || run_sf(&conn, commands))
-                    .await
-                    .map_err(|e| format!("finalize task panicked: {e}"))?
+                    let commands = call_finalize::<SfCommand>(&sf.lua, phase, context)
+                        .map_err(|e| format!("{e:#}"))?;
+                    tokio::task::spawn_blocking(move || run_sf(&conn, commands, ambient))
+                        .await
+                        .map_err(|e| format!("finalize task panicked: {e}"))?
+                }
             }
         }
     });
@@ -436,8 +447,13 @@ fn resolve_source(
             debug!("Snowflake Params: {:?}", sf_params);
             let rendered_sql = context.render_template(&sf_sql)?;
             let (pem_key, pem_file) = resolve_conn_creds(ldrs_env, &sf_src.0);
-            let conn = SnowflakeConnection::create_connection(&sf_src.1, pem_key, pem_file)?;
-            let spawned = sf_spawned(&conn, &rendered_sql, sf_params);
+            let conn = SnowflakeConnection::create_connection(
+                &sf_src.1,
+                pem_key,
+                pem_file,
+                resolve_inherited_sf_env(ldrs_env),
+            )?;
+            let spawned = sf_spawned(&conn, &rendered_sql, sf_params, ambient_env());
             Ok(SourceSpec::Spawned(spawned))
         }
     }

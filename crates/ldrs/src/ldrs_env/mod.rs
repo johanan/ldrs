@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+
 use handlebars::handlebars_helper;
 use heck::ToShoutySnakeCase;
 use ldrs_arrow::ColumnType;
@@ -9,10 +11,59 @@ pub fn shouty(s: &str) -> String {
     s.to_shouty_snake_case()
 }
 
+/// checks for scheme. Needs to ignore case as the RFC is case
+pub fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(prefix))
+}
+
 pub fn get_all_ldrs_env_vars() -> Vec<(String, String)> {
     std::env::vars()
         .filter(|(key, _)| key.starts_with("LDRS_"))
         .collect()
+}
+
+/// The process environment, with names narrowed to UTF-8. Values may hold arbitrary bytes; a name
+/// that is not UTF-8 is dropped, since nothing ldrs or a child reads by name could match it.
+pub fn ambient_env() -> Vec<(String, OsString)> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| match key.into_string() {
+            Ok(key) => Some((key, value)),
+            Err(key) => {
+                debug!("Skipping non-UTF-8 environment variable name {key:?}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Warn for every managed key already present in the ambient environment, where ldrs is about to
+/// override a value the child would otherwise have inherited.
+pub fn warn_on_collisions(ambient: &[(String, OsString)], managed: &[(String, OsString)]) {
+    for (key, _) in managed {
+        if ambient.iter().any(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            warn!(
+                "{key} is set in the environment; ldrs is overriding it with the value it resolved"
+            );
+        }
+    }
+}
+
+pub fn strip_ldrs(env_var: &(String, OsString)) -> bool {
+    !env_var.0.starts_with("LDRS_")
+}
+
+/// The environment for a spawned child: everything ambient except ldrs's own namespace, then the
+/// managed set on top. Managed is whatever ldrs resolved for this child
+pub fn child_env(
+    ambient: Vec<(String, OsString)>,
+    managed: Vec<(String, OsString)>,
+) -> Vec<(String, OsString)> {
+    let mut env: Vec<(String, OsString)> = ambient.into_iter().filter(strip_ldrs).collect();
+    warn_on_collisions(&env, &managed);
+    env.extend(managed);
+    env
 }
 
 /// Collects environment variables by prefix.
@@ -146,7 +197,10 @@ pub fn get_env_values_by_keys<'a>(
         .collect::<Vec<_>>()
 }
 
+// Whole seconds, so runs inside the same second render the same value.
 handlebars_helper!(now_timestamp: | | chrono::prelude::Utc::now().timestamp() );
+// Milliseconds, for a name that has to stay distinct across runs closer together than a second.
+handlebars_helper!(now_timestamp_ms: | | chrono::prelude::Utc::now().timestamp_millis());
 // Zero-pad an integer to a fixed width: `{{ pad index 5 }}` with index 3 -> "00003".
 handlebars_helper!(pad: |value: i64, width: usize| format!("{value:0width$}"));
 // `{{ shoutySnakeCase name }}` -> SCREAMING_SNAKE_CASE (owned here, not the handlebars feature).
@@ -154,6 +208,11 @@ handlebars_helper!(shouty_snake_case: |s: str| s.to_shouty_snake_case());
 // Decompose a `schema.table` identity on the first dot; permissive (empty/whole, never error).
 handlebars_helper!(schema_of: |s: str| s.split_once('.').map(|(a, _)| a).unwrap_or(""));
 handlebars_helper!(table_of: |s: str| s.split_once('.').map(|(_, b)| b).unwrap_or(s));
+// Opt-in trailing slash for a base a template concatenates onto: `{{ ensure_trailing src_url }}f.csv`.
+handlebars_helper!(ensure_trailing: |s: str| match s.ends_with('/') {
+    true => s.to_string(),
+    false => format!("{s}/"),
+});
 
 /// The domain helpers paired with their names
 fn helper_defs() -> Vec<(
@@ -162,10 +221,12 @@ fn helper_defs() -> Vec<(
 )> {
     vec![
         ("now_timestamp", Box::new(now_timestamp)),
+        ("now_timestamp_ms", Box::new(now_timestamp_ms)),
         ("pad", Box::new(pad)),
         ("shoutySnakeCase", Box::new(shouty_snake_case)),
         ("schema_of", Box::new(schema_of)),
         ("table_of", Box::new(table_of)),
+        ("ensure_trailing", Box::new(ensure_trailing)),
     ]
 }
 
@@ -174,6 +235,23 @@ pub fn setup_handlebars(handle_bars: &mut handlebars::Handlebars) -> () {
         handle_bars.register_helper(name, def);
     }
     handle_bars.set_strict_mode(true);
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn ensure_trailing_is_idempotent() {
+        let mut hb = handlebars::Handlebars::new();
+        setup_handlebars(&mut hb);
+        let render = |base: &str| {
+            hb.render_template("{{ ensure_trailing base }}x.csv", &json!({ "base": base }))
+                .unwrap()
+        };
+        assert_eq!(render("az://lake/events"), "az://lake/events/x.csv");
+        assert_eq!(render("az://lake/events/"), "az://lake/events/x.csv");
+    }
 }
 
 /// The registered helper names, for surfacing in a render error alongside the bound variables.

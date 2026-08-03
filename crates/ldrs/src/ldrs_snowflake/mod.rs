@@ -3,9 +3,11 @@ pub mod snowflake_source;
 use anyhow::Context;
 use ldrs_arrow::ColumnType;
 use ldrs_core::spawn::Spawned;
-use std::{path::PathBuf, process::Command};
-use tracing::{debug, warn};
+use std::{ffi::OsString, path::PathBuf, process::Command};
+use tracing::debug;
 use url::Url;
+
+use crate::ldrs_env::child_env;
 
 #[derive(Clone)]
 pub struct SnowflakeConnection {
@@ -14,6 +16,7 @@ pub struct SnowflakeConnection {
     pub binary_path: PathBuf,
     pub pem_key: Option<String>,
     pub pem_file: Option<String>,
+    pub inherited_sf_env: Vec<(String, String)>,
 }
 
 impl SnowflakeConnection {
@@ -21,6 +24,7 @@ impl SnowflakeConnection {
         conn_url: &str,
         pem_key: Option<String>,
         pem_file: Option<String>,
+        inherited_sf_env: Vec<(String, String)>,
     ) -> Result<SnowflakeConnection, anyhow::Error> {
         let parsed_url = Url::parse(conn_url).with_context(|| "Failed to parse connection URL")?;
         let binary_path =
@@ -38,47 +42,59 @@ impl SnowflakeConnection {
             binary_path,
             pem_key,
             pem_file,
+            inherited_sf_env,
         });
     }
 
     /// Execute an ordered list of SQL statements via `ldrs-sf exec` in a single spawn, returning the
     /// captured stdout JSON (one result set per statement). Statements are passed pre-separated as
     /// repeated `--sql` flags; ldrs-sf runs them in order and stops at the first driver error.
-    pub fn exec(&self, statements: &[String]) -> Result<String, anyhow::Error> {
+    pub fn exec(
+        &self,
+        statements: &[String],
+        ambient: Vec<(String, OsString)>,
+    ) -> Result<String, anyhow::Error> {
         if statements.is_empty() {
             return Ok(String::new());
         }
-
-        let mut cmd = Command::new(&self.binary_path);
-        cmd.arg("exec");
-        for sql in statements {
-            cmd.arg("--sql").arg(sql);
-        }
-
         debug!("Running ldrs-sf exec: {} statement(s)", statements.len());
 
-        let parent: Vec<(String, String)> = std::env::vars().collect();
-        let managed = sf_auth_env(
-            &self.raw_conn_url,
-            self.pem_key.as_deref(),
-            self.pem_file.as_deref(),
-        )
-        .into_iter()
-        .chain(sf_param_env(&[]))
-        .collect();
-        let env = build_child_env(parent, "LDRS_SF_", managed);
-        cmd.env_clear();
-        cmd.envs(env);
-        let output = cmd
-            .output()
-            .with_context(|| "Failed to execute ldrs-sf command")?;
+        let args = std::iter::once("exec".to_string())
+            .chain(
+                statements
+                    .iter()
+                    .flat_map(|sql| ["--sql".to_string(), sql.clone()]),
+            )
+            .collect();
+        run_capture(self.spawn(args, &[], ambient))
+    }
 
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            Ok(stdout.to_string())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(anyhow::anyhow!("Command failed: {}", stderr))
+    /// First create the auth LDRS_SF_*, then bind the params as LDRS_SF_PARAM_P*.
+    pub fn env(&self, params: &[(String, Option<ColumnType>)]) -> Vec<(String, OsString)> {
+        self.inherited_sf_env
+            .iter()
+            .cloned()
+            .chain(sf_auth_env(
+                &self.raw_conn_url,
+                self.pem_key.as_deref(),
+                self.pem_file.as_deref(),
+            ))
+            .chain(sf_param_env(params))
+            .map(|(k, v)| (k, v.into()))
+            .collect()
+    }
+
+    pub fn spawn(
+        &self,
+        args: Vec<String>,
+        params: &[(String, Option<ColumnType>)],
+        ambient: Vec<(String, OsString)>,
+    ) -> Spawned {
+        Spawned {
+            binary: self.binary_path.clone(),
+            args,
+            stdin: None,
+            env: child_env(ambient, self.env(params)),
         }
     }
 }
@@ -97,6 +113,14 @@ fn sf_param_env(params: &[(String, Option<ColumnType>)]) -> Vec<(String, String)
                 value.clone(),
             )
         })
+        .collect()
+}
+
+/// The inherited `LDRS_SF_*`, minus params.
+pub fn resolve_inherited_sf_env(vars: &[(String, String)]) -> Vec<(String, String)> {
+    vars.iter()
+        .filter(|(key, _)| key.starts_with("LDRS_SF_") && !key.starts_with("LDRS_SF_PARAM_"))
+        .cloned()
         .collect()
 }
 
@@ -130,52 +154,32 @@ fn sf_auth_env(
     env
 }
 
-/// Build the complete child env: inherit the parent, drop its `LDRS_*` config vars (leaving
-/// `keep_prefix` warned), then overlay the
-/// managed set so ldrs's resolved values win over any inherited collision.
-fn build_child_env(
-    parent: Vec<(String, String)>,
-    keep_prefix: &str,
-    managed: Vec<(String, String)>,
-) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = parent
-        .into_iter()
-        .filter(|(k, _)| {
-            if k.starts_with(keep_prefix) {
-                warn!("inherited user-set {k} reaches the child; execution not guaranteed for env ldrs does not manage");
-                true
-            } else {
-                !k.starts_with("LDRS_")
-            }
-        })
-        .collect();
-    env.extend(managed);
-    env
+/// Run a spec to completion and return its stdout. `stdin` is ignored
+fn run_capture(spec: Spawned) -> Result<String, anyhow::Error> {
+    let mut cmd = Command::new(&spec.binary);
+    cmd.args(&spec.args).env_clear().envs(spec.env);
+    let output = cmd
+        .output()
+        .with_context(|| "Failed to execute ldrs-sf command")?;
+    match output.status.success() {
+        true => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
+        false => Err(anyhow::anyhow!(
+            "Command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )),
+    }
 }
 
-/// Build the ldrs-sf spawn spec: binary, `query --sql` args, and the resolved child env. The
-/// caller spawns it via `spawn_arrow_source`. `bind_params` are the parameter values and types, in
-/// bind order.
+/// Build the ldrs-sf spawn spec for a query. The caller spawns it via `spawn_arrow_source`.
+/// `bind_params` are the parameter values and types, in bind order.
 pub fn sf_spawned(
     conn: &SnowflakeConnection,
     sql: &str,
     bind_params: Vec<(String, Option<ColumnType>)>,
+    ambient: Vec<(String, OsString)>,
 ) -> Spawned {
-    let managed: Vec<(String, String)> = sf_auth_env(
-        &conn.raw_conn_url,
-        conn.pem_key.as_deref(),
-        conn.pem_file.as_deref(),
-    )
-    .into_iter()
-    .chain(sf_param_env(&bind_params))
-    .collect();
-    let env = build_child_env(std::env::vars().collect(), "LDRS_SF_", managed);
-    Spawned {
-        binary: conn.binary_path.clone(),
-        args: vec!["query".to_string(), "--sql".to_string(), sql.to_string()],
-        stdin: None,
-        env,
-    }
+    let args = vec!["query".to_string(), "--sql".to_string(), sql.to_string()];
+    conn.spawn(args, &bind_params, ambient)
 }
 
 #[cfg(test)]
@@ -235,20 +239,61 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_child_env_strips_config_keeps_sf_and_overlays_managed() {
-        let parent = vec![
-            ("LDRS_SRC_SF".to_string(), "url".to_string()),
-            ("LDRS_SF_PEM_KEY".to_string(), "legacy".to_string()),
-            ("PATH".to_string(), "/usr/bin".to_string()),
-        ];
-        let managed = vec![("LDRS_SF_SOURCE".to_string(), "resolved".to_string())];
-        let env = build_child_env(parent, "LDRS_SF_", managed);
+    fn connection(inherited: Vec<(String, String)>) -> SnowflakeConnection {
+        SnowflakeConnection {
+            conn_url: Url::parse("snowflake://acct").unwrap(),
+            raw_conn_url: "snowflake://acct".to_string(),
+            binary_path: PathBuf::from("ldrs-sf"),
+            pem_key: Some("RESOLVED".to_string()),
+            pem_file: None,
+            inherited_sf_env: inherited,
+        }
+    }
 
-        // config var dropped; the kept-prefix and non-LDRS vars retained; managed overlaid
-        assert!(!env.iter().any(|(k, _)| k == "LDRS_SRC_SF"));
-        assert!(env.contains(&("LDRS_SF_PEM_KEY".to_string(), "legacy".to_string())));
-        assert!(env.contains(&("PATH".to_string(), "/usr/bin".to_string())));
-        assert!(env.contains(&("LDRS_SF_SOURCE".to_string(), "resolved".to_string())));
+    /// Least specific first, so a resolved per-target credential displaces an inherited global and
+    /// never the other way round. `Command::envs` applies in order, so the last write wins.
+    #[test]
+    fn resolved_values_overlay_the_inherited_ones() {
+        let conn = connection(vec![
+            ("LDRS_SF_PEM_KEY".to_string(), "LEGACY".to_string()),
+            ("LDRS_SF_PROXY".to_string(), "corp".to_string()),
+        ]);
+        let env = conn.env(&[("v1".to_string(), None)]);
+        let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "LDRS_SF_PEM_KEY",
+                "LDRS_SF_PROXY",
+                "LDRS_SF_SOURCE",
+                "LDRS_SF_PEM_KEY",
+                "LDRS_SF_PARAM_P1",
+            ],
+            "inherited, then auth, then params"
+        );
+        let last_pem = env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "LDRS_SF_PEM_KEY")
+            .unwrap();
+        assert_eq!(last_pem.1, OsString::from("RESOLVED"));
+        assert!(env.contains(&("LDRS_SF_PROXY".to_string(), OsString::from("corp"))));
+    }
+
+    /// Params are never inherited: ldrs-sf finds binds by scanning the prefix, so a stale one would
+    /// be read as an extra bind rather than overridden.
+    #[test]
+    fn inherited_env_excludes_params() {
+        let vars = vec![
+            ("LDRS_SF_PROXY".to_string(), "corp".to_string()),
+            ("LDRS_SF_PARAM_P01".to_string(), "stale".to_string()),
+            ("LDRS_SRC_SF".to_string(), "snowflake://acct".to_string()),
+        ];
+        let inherited = resolve_inherited_sf_env(&vars);
+        assert_eq!(
+            inherited,
+            vec![("LDRS_SF_PROXY".to_string(), "corp".to_string())]
+        );
     }
 }

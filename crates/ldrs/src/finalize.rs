@@ -6,6 +6,8 @@
 //! they run concurrently and their failures are collected, not short-circuited. Within one item the
 //! command list is ordered and dependent, so execution stops at the first error.
 
+use std::ffi::OsString;
+
 use crate::ldrs_env::LdrsExecutionContext;
 use crate::ldrs_snowflake::SnowflakeConnection;
 use crate::lua_logic::UrlData;
@@ -126,12 +128,18 @@ fn call_finalize_script<T: serde::de::DeserializeOwned>(
 }
 
 /// Run an ordered command list against Snowflake via `ldrs-sf exec` (a single spawn).
-pub fn run_sf(conn: &SnowflakeConnection, commands: Vec<SfCommand>) -> Result<(), String> {
+pub fn run_sf(
+    conn: &SnowflakeConnection,
+    commands: Vec<SfCommand>,
+    ambient: Vec<(String, OsString)>,
+) -> Result<(), String> {
     let statements: Vec<String> = commands
         .into_iter()
         .map(|SfCommand::Sql(sql)| sql)
         .collect();
-    let output = conn.exec(&statements).map_err(|e| format!("{e:#}"))?;
+    let output = conn
+        .exec(&statements, ambient)
+        .map_err(|e| format!("{e:#}"))?;
     info!(phase = "finalize", "sf finalize result: {output}");
     Ok(())
 }
