@@ -473,13 +473,11 @@ tables:
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
-/// Why the role is applied with `SET LOCAL ROLE` per transaction rather than set on the connection:
-/// the pool recycles with `RecyclingMethod::Clean`, whose `SET SESSION AUTHORIZATION DEFAULT`
-/// discards a role established at connect time. It holds on a fresh connection and is gone on every
-/// reuse, so a connection-level role would silently stop applying.
+/// A startup-packet role survives `RecyclingMethod::Clean`: `SET SESSION AUTHORIZATION DEFAULT`
+/// clears `role`, then `RESET ALL` restores it to the startup value.
 #[tokio::test]
 #[test_log::test]
-async fn a_connection_level_role_does_not_survive_pool_recycling() {
+async fn a_connection_level_role_survives_pool_recycling() {
     let url = "postgres://postgres:postgres@localhost:5432/postgres\
                ?sslmode=disable&options=-c%20role%3Dtest_role";
     let pool = ldrs_postgres::build_pg_pool(url).unwrap();
@@ -498,8 +496,8 @@ async fn a_connection_level_role_does_not_survive_pool_recycling() {
     );
     assert_eq!(
         role_now(pool.get().await.unwrap()).await,
-        "postgres",
-        "the recycled connection has lost it"
+        "test_role",
+        "and RESET ALL restores it on recycle"
     );
 }
 

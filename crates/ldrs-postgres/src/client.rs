@@ -40,7 +40,8 @@ pub fn build_pg_pool(conn_url: &str) -> Result<Pool, anyhow::Error> {
 
 /// Split the `role` query parameter off a connection URL. DEPRECATED: write libpq's own
 /// `options=-c role=<role>` instead. Either way the role is applied per transaction with
-/// `SET LOCAL ROLE`, because pool recycling discards session state.
+/// `SET LOCAL ROLE`, because whether a connection-level role survives pool recycling depends on the
+/// server version.
 pub fn check_for_role(conn_str: &str) -> Result<(String, Option<String>), anyhow::Error> {
     let Ok(mut pg_url) = Url::parse(conn_str) else {
         return Ok((conn_str.to_string(), None));
