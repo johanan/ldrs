@@ -27,16 +27,18 @@ use crate::{
     ldrs_config::config::{
         parse_table, validate_configs, LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource,
     },
+    ldrs_duckdb::{duckdb_spawned, resolve_binary, resolve_db},
     ldrs_env::{
         collect_params, collect_vars_by_prefix, explain_render_error, setup_handlebars, shouty,
         LdrsExecutionContext,
     },
     ldrs_snowflake::{
-        resolve_conn_creds, sf_spawned, snowflake_source::SFSource, SnowflakeConnection,
+        resolve_conn_creds, resolve_inherited_sf_env, sf_spawned, snowflake_source::SFSource,
+        SnowflakeConnection,
     },
     postgres::{
         postgres_destination::{split_pg_plan, PgPlan},
-        resolve::resolve_command,
+        resolve::{resolve_command, role_from_url},
     },
 };
 
@@ -217,7 +219,8 @@ pub async fn execute_configs(
         .iter()
         .filter(|(k, _)| k.starts_with("LDRS_DEST"))
         .filter(|(_, v)| {
-            Url::parse(v).is_ok_and(|u| matches!(u.scheme(), "postgres" | "postgresql"))
+            starts_with_ignore_ascii_case(v, "postgres://")
+                || starts_with_ignore_ascii_case(v, "postgresql://")
         })
         .map(|(_, v)| check_for_role(v).map(|(url, _)| url))
         .collect::<Result<Vec<_>, _>>()?;
@@ -515,7 +518,9 @@ fn resolve_dest(
             ]);
             let dest_value = get_dest_url(ldrs_env, &resolved_target, "PG")?;
             let (pg_url, role) = check_for_role(dest_value.1.as_str())?;
-            let role = role.or(get_env_value(
+            // Both URL spellings rank above the env fallbacks: a role on the connection is more
+            // specific than one set for the whole run.
+            let role = role.or_else(|| role_from_url(&pg_url)).or(get_env_value(
                 ldrs_env,
                 &[
                     &format!("LDRS_PG_ROLE_{}", shouty(&resolved_target)),

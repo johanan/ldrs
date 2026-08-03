@@ -24,6 +24,7 @@ pub enum ExtractedValue<'a> {
     TimestampTzMicros(Option<DateTime<Utc>>),
     TimestampTzNanos(Option<DateTime<Utc>>),
     Jsonb(Option<&'a str>),
+    Bytea(Option<&'a [u8]>),
 }
 
 #[derive(Debug)]
@@ -37,6 +38,7 @@ enum ExtractionStrategy {
     Numeric { scale: i32 },
     Uuid,
     Jsonb,
+    Bytea,
     TimestampSeconds,
     TimestampMillis,
     TimestampMicros,
@@ -101,6 +103,7 @@ impl<'a> ColumnConverter<'a> {
             } => ExtractionStrategy::TimestampTzNanos,
             ColumnSpec::Uuid { .. } => ExtractionStrategy::Uuid,
             ColumnSpec::Jsonb { .. } => ExtractionStrategy::Jsonb,
+            ColumnSpec::Bytea { .. } => ExtractionStrategy::Bytea,
             _ => return Err(anyhow::anyhow!("Unsupported column spec: {:?}", col_spec)),
         };
 
@@ -127,6 +130,9 @@ impl<'a> ColumnConverter<'a> {
             },
             ExtractionStrategy::Text => unsafe {
                 ExtractedValue::Utf8(self.accessor.Utf8(row_idx))
+            },
+            ExtractionStrategy::Bytea => unsafe {
+                ExtractedValue::Bytea(self.accessor.Binary(row_idx))
             },
             ExtractionStrategy::Numeric { scale } => {
                 ExtractedValue::Decimal(self.accessor.as_pg_numeric(row_idx, *scale))
@@ -184,6 +190,7 @@ impl<'a> ToSql for ExtractedValue<'a> {
             ExtractedValue::Real(v) => v.to_sql(ty, out),
             ExtractedValue::Decimal(v) => v.to_sql(ty, out),
             ExtractedValue::Utf8(v) => v.to_sql(ty, out),
+            ExtractedValue::Bytea(v) => v.to_sql(ty, out),
             ExtractedValue::Jsonb(v) => match v {
                 None => Ok(postgres_types::IsNull::Yes),
                 Some(s) => {
