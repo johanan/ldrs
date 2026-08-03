@@ -6,14 +6,14 @@ use dotenvy::dotenv;
 use ldrs::cli_schema;
 use ldrs::ldrs_config::config::{find_unknown_block_keys, parse_dest, parse_src, LdrsParsedConfig};
 use ldrs::ldrs_config::{execute_configs, infer_env_type, parse_yaml_config};
-use ldrs::ldrs_env::get_all_ldrs_env_vars;
+use ldrs::ldrs_env::{ambient_env, get_all_ldrs_env_vars};
 use ldrs::lua_logic::lua_args::{modules_from_args, LuaArgs, SnowflakeResult, SnowflakeStrategy};
 use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
 use ldrs::path_pattern;
 use ldrs_storage::build_store;
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 // maintaining this so clients do not break
@@ -185,118 +185,132 @@ fn main() -> Result<(), anyhow::Error> {
         .build()
         .with_context(|| "Unable to create cloud io tokio runtime")?;
 
-    let command_exec = main_rt.block_on(async {
-        match destination {
-            Destination::Ld(args) => {
-                let config_string = fs::read_to_string(&args.config)
-                    .with_context(|| format!("Failed to read config file: {}", args.config))?;
-                let ldrs_env = get_all_ldrs_env_vars();
-                let configs = parse_yaml_config(&config_string, &ldrs_env)?;
-                execute_configs(configs, args.select, &ldrs_env, &rt.handle()).await
-            }
-            Destination::Run(args) => {
-                let ldrs_env = get_all_ldrs_env_vars();
-                let config = build_run_block(&args)?;
-                let src_default = infer_env_type("LDRS_SRC", &ldrs_env);
-                let dest_default = infer_env_type("LDRS_DEST", &ldrs_env);
-                let src = parse_src(config.clone(), &src_default)?;
-                let dest = parse_dest(config.clone(), &dest_default)?;
-                let unknown_keys = find_unknown_block_keys(&config, &src, &dest);
-
-                execute_configs(
-                    vec![LdrsParsedConfig {
-                        src,
-                        dests: vec![dest],
-                        finalize: Vec::new(),
-                        unknown_keys,
-                    }],
-                    None,
-                    &ldrs_env,
-                    &rt.handle(),
-                )
-                .await
-            }
-            Destination::Schema { command } => match command {
-                None => {
-                    // bare `ldrs schema` → list the subcommands
-                    let mut cmd = Cli::command();
-                    if let Some(sub) = cmd.find_subcommand_mut("schema") {
-                        sub.print_help()?;
-                        println!();
-                    }
-                    Ok(())
+    let command_exec =
+        main_rt.block_on(async {
+            match destination {
+                Destination::Ld(args) => {
+                    let config_string = fs::read_to_string(&args.config)
+                        .with_context(|| format!("Failed to read config file: {}", args.config))?;
+                    let ldrs_env = get_all_ldrs_env_vars();
+                    let configs = parse_yaml_config(&config_string, &ldrs_env)?;
+                    execute_configs(configs, args.select, &ldrs_env, &rt.handle()).await
                 }
-                Some(cmd) => {
-                    let output = cli_schema::build(&cmd);
-                    println!("{}", serde_json::to_string_pretty(&output)?);
-                    Ok(())
+                Destination::Run(args) => {
+                    let ldrs_env = get_all_ldrs_env_vars();
+                    let config = build_run_block(&args)?;
+                    let src_default = infer_env_type("LDRS_SRC", &ldrs_env);
+                    let dest_default = infer_env_type("LDRS_DEST", &ldrs_env);
+                    let src = parse_src(config.clone(), &src_default)?;
+                    let dest = parse_dest(config.clone(), &dest_default)?;
+                    let unknown_keys = find_unknown_block_keys(&config, &src, &dest);
+
+                    execute_configs(
+                        vec![LdrsParsedConfig {
+                            src,
+                            dests: vec![dest],
+                            finalize: Vec::new(),
+                            unknown_keys,
+                        }],
+                        None,
+                        &ldrs_env,
+                        &rt.handle(),
+                    )
+                    .await
                 }
-            },
-            Destination::Sf { command } => match command {
-                SnowflakeCommands::Ingest {
-                    file_url,
-                    pattern,
-                    lua_args,
-                } => match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
-                    Ok(sf_url) => {
-                        let (pattern, url, modules) =
-                            modules_from_args(lua_args, file_url.as_str(), pattern.as_str())?;
-
-                        let (_, file_path, scheme) = build_store(&url)?;
-                        let url_data: UrlData = url.clone().into();
-                        let storage_data = StorageData::from_parts(&url, &file_path, scheme);
-
-                        let file_path_str = file_path.to_string();
-                        let extracted = pattern.parse_path(&file_path_str)?;
-                        let segments_value = path_pattern::extracted_segments_to_value(&extracted);
-
-                        let context = serde_json::json!({});
-
-                        let mut loader = LuaFunctionLoader::new().unwrap();
-                        let process_result = loader.call_process::<SnowflakeResult>(
-                            &modules,
-                            &url_data,
-                            &storage_data,
-                            &segments_value,
-                            None,
-                            &context,
-                        )?;
-                        let conn = ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
-                            &sf_url, None, None,
-                        )?;
-
-                        if matches!(process_result.strategy, SnowflakeStrategy::Ingest) {
-                            Err(anyhow::anyhow!("Ingest is not implemented"))?
+                Destination::Schema { command } => match command {
+                    None => {
+                        // bare `ldrs schema` list the subcommands
+                        let mut cmd = Cli::command();
+                        if let Some(sub) = cmd.find_subcommand_mut("schema") {
+                            sub.print_help()?;
+                            println!();
                         }
-
-                        let pre_sql = conn.exec(&process_result.pre_sql)?;
-                        debug!("Pre SQL {:?} executed successfully", pre_sql);
-                        let _sql = match process_result.strategy {
-                            SnowflakeStrategy::Sql(sql) => {
-                                let sql_result = conn.exec(&sql)?;
-                                debug!("SQL {:?} executed successfully", sql_result);
-                                Ok(())
-                            }
-                            SnowflakeStrategy::Ingest => {
-                                Err(anyhow::anyhow!("Ingest is not implemented"))
-                            }
-                        }?;
-                        let post_sql = conn.exec(&process_result.post_sql)?;
-                        debug!("Post SQL {:?} executed successfully", post_sql);
                         Ok(())
                     }
-                    Err(e) => Err(e),
+                    Some(cmd) => {
+                        let output = cli_schema::build(&cmd);
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                        Ok(())
+                    }
                 },
-            },
-        }
-    });
+                Destination::Sf { command } => match command {
+                    SnowflakeCommands::Ingest {
+                        file_url,
+                        pattern,
+                        lua_args,
+                    } => match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
+                        Ok(sf_url) => {
+                            let (pattern, url, modules) =
+                                modules_from_args(lua_args, file_url.as_str(), pattern.as_str())?;
+
+                            let (_, file_path, scheme) = build_store(&url)?;
+                            let url_data: UrlData = url.clone().into();
+                            let storage_data = StorageData::from_parts(&url, &file_path, scheme);
+
+                            let file_path_str = file_path.to_string();
+                            let extracted = pattern.parse_path(&file_path_str)?;
+                            let segments_value =
+                                path_pattern::extracted_segments_to_value(&extracted);
+
+                            let context = serde_json::json!({});
+
+                            let mut loader = LuaFunctionLoader::new().unwrap();
+                            let process_result = loader.call_process::<SnowflakeResult>(
+                                &modules,
+                                &url_data,
+                                &storage_data,
+                                &segments_value,
+                                None,
+                                &context,
+                            )?;
+                            let conn =
+                                ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
+                                    &sf_url,
+                                    None,
+                                    None,
+                                    ldrs::ldrs_snowflake::resolve_inherited_sf_env(
+                                        &get_all_ldrs_env_vars(),
+                                    ),
+                                )?;
+
+                            if matches!(process_result.strategy, SnowflakeStrategy::Ingest) {
+                                Err(anyhow::anyhow!("Ingest is not implemented"))?
+                            }
+
+                            let ambient = ambient_env();
+
+                            let pre_sql = conn.exec(&process_result.pre_sql, ambient.clone())?;
+                            debug!("Pre SQL {:?} executed successfully", pre_sql);
+                            let _sql = match process_result.strategy {
+                                SnowflakeStrategy::Sql(sql) => {
+                                    let sql_result = conn.exec(&sql, ambient.clone())?;
+                                    debug!("SQL {:?} executed successfully", sql_result);
+                                    Ok(())
+                                }
+                                SnowflakeStrategy::Ingest => {
+                                    Err(anyhow::anyhow!("Ingest is not implemented"))
+                                }
+                            }?;
+                            let post_sql = conn.exec(&process_result.post_sql, ambient)?;
+                            debug!("Post SQL {:?} executed successfully", post_sql);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    },
+                },
+            }
+        });
 
     drop(main_rt);
     drop(rt);
 
+    // The timing line is the last thing an operator watching the log sees, so it has to carry the verdict
     let end = std::time::Instant::now();
     if is_data_command {
-        info!("Time to load: {:?}", end - start);
+        match &command_exec {
+            Ok(()) => info!("Time to load: {:?}", end - start),
+            Err(e) => error!("Failed after {:?}: {:#}", end - start, e),
+        }
     }
     command_exec
 }

@@ -10,6 +10,8 @@ permissions:
 jobs:
   build_and_test:
     runs-on: ubuntu-latest
+    # Backstop for a blocked spawned child
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,6 +29,9 @@ jobs:
           unzip -o /tmp/duckdb.zip -d "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/duckdb" --version
+        shell: bash
+      - name: Setup DuckDB extensions
+        run: scripts/setup_duckdb.sh
         shell: bash
       - name: Setup Postgres
         run: scripts/setup_test.sh

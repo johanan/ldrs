@@ -1,7 +1,7 @@
 # Makefile to mirror the CI pipeline locally
 # Builds both Go and Rust components using the same commands as release.yml
 
-.PHONY: all build build-go build-rust ci clean install-dist help
+.PHONY: all build build-go build-rust ci clean install-dist setup-duckdb help
 
 # Default target
 all: build
@@ -105,6 +105,10 @@ clean:
 	rm -rf target/distrib/
 	rm -rf target/ldrs_sf/
 
+setup-duckdb:
+	@echo "Preparing DuckDB for tests..."
+	scripts/setup_duckdb.sh
+
 # Test the builds
 test-go:
 	@echo "Testing Go components..."
@@ -127,6 +131,7 @@ help:
 	@echo "  ci               - Build for CI (uses CARGO_DIST_TARGET)"
 	@echo "  install-dist     - Install cargo-dist tool"
 	@echo "  plan             - Show what dist would build"
+	@echo "  setup-duckdb     - Install the DuckDB extensions the tests need"
 	@echo "  test             - Run tests for both Go and Rust"
 	@echo "  test-go          - Run Go tests"
 	@echo "  test-rust        - Run Rust tests"

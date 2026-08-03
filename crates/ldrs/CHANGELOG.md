@@ -2,6 +2,55 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.0] - 2026-08-03
+
+### Bug Fixes
+
+- *(spawned)* Stdin, stdout, and stderr updates
+
+Spawned tools now have better handling for all the pipes in and out of
+the process.
+
+Better error handling with each pipe.
+
+- *(env)* Simplified env resolution for spawned tools
+
+Environemnts now have a clean split. ambient is all env vars that do not
+start with LDRS_*.
+
+And managed is then the subset of those that each tool wants to put back
+into the spawned process.
+
+Cleanly injected into the function to make them testable and not have
+each function reliant on the environment.
+
+- *(pg)* Read role from url
+
+Fixes earlier url processing where the role was a non-standard param in
+the PG url.
+
+Now it uses -c role=role which is the valid way that PG will bind this.
+Also removed URL parse so that PG can be keyword or have non-standard
+URLs and still parse correctly.
+
+
+### Chore
+
+- *(duckdb)* Remaining code to make this work
+
+Required code.
+
+
+### Features
+
+- *(duckdb)* DuckDB source
+
+ldrs can spawn a duckdb binary and stream the Arrow IPC output.
+
+Many config and credential helpers make it easy to just add SQL and let
+duckdb read all the data into Arrow.
+
+
 ## [0.21.3] - 2026-07-24
 
 ### Bug Fixes

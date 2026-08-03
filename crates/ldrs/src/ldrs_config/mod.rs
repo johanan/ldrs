@@ -9,7 +9,7 @@ use deadpool_postgres::Pool;
 use futures::future::join_all;
 use ldrs_arrow::ColumnType;
 use ldrs_core::execute::{build_pools, run_task};
-use ldrs_core::phase::PhaseOutput;
+use ldrs_core::phase::{DeltaCommit, DestinationOutcome, PhaseOutput};
 use ldrs_core::plan::{
     ArrowDest, DeltaDest, DeltaMode, DestSpec, PgDest, PqDest, SourceSpec, Task,
 };
@@ -20,22 +20,25 @@ use ldrs_storage::join_into_url;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use crate::ldrs_env::{ambient_env, starts_with_ignore_ascii_case};
 use crate::{
     delta::{DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
     finalize::{call_finalize, run_sf, FinalizeItem, SfCommand},
     ldrs_config::config::{
         parse_table, validate_configs, LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource,
     },
+    ldrs_duckdb::{duckdb_spawned, resolve_binary, resolve_db},
     ldrs_env::{
         collect_params, collect_vars_by_prefix, explain_render_error, setup_handlebars, shouty,
         LdrsExecutionContext,
     },
     ldrs_snowflake::{
-        resolve_conn_creds, sf_spawned, snowflake_source::SFSource, SnowflakeConnection,
+        resolve_conn_creds, resolve_inherited_sf_env, sf_spawned, snowflake_source::SFSource,
+        SnowflakeConnection,
     },
     postgres::{
         postgres_destination::{split_pg_plan, PgPlan},
-        resolve::resolve_command,
+        resolve::{resolve_command, role_from_url},
     },
 };
 
@@ -63,10 +66,7 @@ impl<'a> ExecutionEnv<'a> {
     }
 }
 
-pub fn get_env_value<'a>(
-    vars: &'a [(String, String)],
-    keys: &[&str],
-) -> Option<&'a (String, String)> {
+pub fn get_env_value<'a, V>(vars: &'a [(String, V)], keys: &[&str]) -> Option<&'a (String, V)> {
     keys.iter()
         .find_map(|key| vars.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)))
 }
@@ -119,20 +119,21 @@ fn is_object_store_url(url: &Url) -> bool {
 }
 
 pub fn infer_env_type(env_type: &str, vars: &[(String, String)]) -> Option<String> {
-    let src = vars
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(env_type));
-    let url = src.and_then(|(_, value)| Url::parse(value).ok());
-    match url {
-        Some(u) => match u {
-            u if u.scheme().starts_with("snowflake") => Some("sf".to_string()),
-            u if u.scheme().starts_with("delta+") => Some("delta".to_string()),
-            u if is_object_store_url(&u) => Some("file".to_string()),
-            u if matches!(u.scheme(), "postgres" | "postgresql") => Some("pg".to_string()),
-            _ => None,
-        },
-        None => None,
-    }
+    vars.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(env_type))
+        .and_then(|(_, value)| match value {
+            v if starts_with_ignore_ascii_case(v, "snowflake") => Some("sf".to_string()),
+            v if starts_with_ignore_ascii_case(v, "delta+") => Some("delta".to_string()),
+            v if starts_with_ignore_ascii_case(v, "postgres://")
+                || starts_with_ignore_ascii_case(v, "postgresql://") =>
+            {
+                Some("pg".to_string())
+            }
+            _ => Url::parse(value)
+                .ok()
+                .filter(is_object_store_url)
+                .map(|_| "file".to_string()),
+        })
 }
 
 fn resolve_txn_config(
@@ -218,7 +219,8 @@ pub async fn execute_configs(
         .iter()
         .filter(|(k, _)| k.starts_with("LDRS_DEST"))
         .filter(|(_, v)| {
-            Url::parse(v).is_ok_and(|u| matches!(u.scheme(), "postgres" | "postgresql"))
+            starts_with_ignore_ascii_case(v, "postgres://")
+                || starts_with_ignore_ascii_case(v, "postgresql://")
         })
         .map(|(_, v)| check_for_role(v).map(|(url, _)| url))
         .collect::<Result<Vec<_>, _>>()?;
@@ -280,24 +282,34 @@ async fn run_finalize(
     ldrs_env: &[(String, String)],
     context: &LdrsExecutionContext<'_>,
 ) -> Vec<String> {
-    let runs = items.iter().map(|item| async move {
-        match item {
-            FinalizeItem::Sf(sf) => {
-                // `target` defaults to the source name; it is both the rendered identity the Lua
-                // builds on and the connection-lookup key.
-                let target = sf.target.as_deref().unwrap_or(&phase.name);
-                let resolved = context
-                    .render_template(target)
-                    .map_err(|e| format!("finalize target render failed: {e:#}"))?;
-                let dest = get_dest_url(ldrs_env, &resolved, "SF").map_err(|e| format!("{e:#}"))?;
-                let (pem_key, pem_file) = resolve_conn_creds(ldrs_env, &dest.0);
-                let conn = SnowflakeConnection::create_connection(&dest.1, pem_key, pem_file)
+    let ambient = ambient_env();
+    let runs = items.iter().map(|item| {
+        let ambient = ambient.clone();
+        async move {
+            match item {
+                FinalizeItem::Sf(sf) => {
+                    // `target` defaults to the source name; it is both the rendered identity the Lua
+                    // builds on and the connection-lookup key.
+                    let target = sf.target.as_deref().unwrap_or(&phase.name);
+                    let resolved = context
+                        .render_template(target)
+                        .map_err(|e| format!("finalize target render failed: {e:#}"))?;
+                    let dest =
+                        get_dest_url(ldrs_env, &resolved, "SF").map_err(|e| format!("{e:#}"))?;
+                    let (pem_key, pem_file) = resolve_conn_creds(ldrs_env, &dest.0);
+                    let conn = SnowflakeConnection::create_connection(
+                        &dest.1,
+                        pem_key,
+                        pem_file,
+                        resolve_inherited_sf_env(ldrs_env),
+                    )
                     .map_err(|e| format!("{e:#}"))?;
-                let commands = call_finalize::<SfCommand>(&sf.lua, phase, context)
-                    .map_err(|e| format!("{e:#}"))?;
-                tokio::task::spawn_blocking(move || run_sf(&conn, commands))
-                    .await
-                    .map_err(|e| format!("finalize task panicked: {e}"))?
+                    let commands = call_finalize::<SfCommand>(&sf.lua, phase, context)
+                        .map_err(|e| format!("{e:#}"))?;
+                    tokio::task::spawn_blocking(move || run_sf(&conn, commands, ambient))
+                        .await
+                        .map_err(|e| format!("finalize task panicked: {e}"))?
+                }
             }
         }
     });
@@ -338,6 +350,39 @@ pub async fn execute_task(
         None => return Ok(None),
     };
     debug!("finalize phase output: {:?}", phase);
+    for outcome in &phase.destinations {
+        match outcome {
+            DestinationOutcome::Delta {
+                target,
+                result: Ok(commit),
+                ..
+            } => match commit {
+                DeltaCommit::Overwrite => info!(dest = %target, "delta overwrite committed"),
+                DeltaCommit::Merge {
+                    skipped: true,
+                    skipped_version,
+                    ..
+                } => info!(
+                    dest = %target,
+                    committed_version = skipped_version,
+                    "delta merge skipped: source is not newer than the committed version"
+                ),
+                DeltaCommit::Merge {
+                    matched_rows,
+                    inserted_rows,
+                    files_written,
+                    ..
+                } => info!(
+                    dest = %target,
+                    matched = matched_rows,
+                    inserted = inserted_rows,
+                    files_written,
+                    "delta merge committed"
+                ),
+            },
+            _ => {}
+        }
+    }
     let finalize_failures = run_finalize(&finalize_items, &phase, ldrs_env, &context).await;
     let load_failures: Vec<String> = phase
         .destinations
@@ -391,6 +436,36 @@ fn resolve_source(
                 url: src_url.to_string(),
             })
         }
+        LdrsSource::DuckDb(duck) => {
+            let name = duck.get_name().to_string();
+            let binary = resolve_binary(ldrs_env, &name)?;
+            let db = resolve_db(ldrs_env, &name);
+            // The read location is optional: a query may generate rows or read the attached db.
+            let src_url = get_src_url(ldrs_env, &name, "DUCKDB")
+                .ok()
+                .map(|(_, url)| url.clone());
+            let ctx = match &src_url {
+                Some(url) => context.with_vars(&[("src_url", url)]),
+                None => context.with_vars(&[]),
+            };
+            let block = duck.block();
+            let sql = ctx.render_template(&block.sql)?;
+            let pre_sql = block
+                .pre_sql
+                .as_deref()
+                .map(|statements| ctx.render_template(statements))
+                .transpose()?;
+            Ok(SourceSpec::Spawned(duckdb_spawned(
+                binary,
+                db,
+                &duck,
+                &sql,
+                pre_sql.as_deref(),
+                src_url.as_deref(),
+                ambient_env(),
+                ldrs_env,
+            )?))
+        }
         LdrsSource::SF(sf) => {
             let sf_sql = match &sf {
                 SFSource::Query(sql) => sql.sql.clone(),
@@ -403,8 +478,13 @@ fn resolve_source(
             debug!("Snowflake Params: {:?}", sf_params);
             let rendered_sql = context.render_template(&sf_sql)?;
             let (pem_key, pem_file) = resolve_conn_creds(ldrs_env, &sf_src.0);
-            let conn = SnowflakeConnection::create_connection(&sf_src.1, pem_key, pem_file)?;
-            let spawned = sf_spawned(&conn, &rendered_sql, sf_params);
+            let conn = SnowflakeConnection::create_connection(
+                &sf_src.1,
+                pem_key,
+                pem_file,
+                resolve_inherited_sf_env(ldrs_env),
+            )?;
+            let spawned = sf_spawned(&conn, &rendered_sql, sf_params, ambient_env());
             Ok(SourceSpec::Spawned(spawned))
         }
     }
@@ -438,7 +518,9 @@ fn resolve_dest(
             ]);
             let dest_value = get_dest_url(ldrs_env, &resolved_target, "PG")?;
             let (pg_url, role) = check_for_role(dest_value.1.as_str())?;
-            let role = role.or(get_env_value(
+            // Both URL spellings rank above the env fallbacks: a role on the connection is more
+            // specific than one set for the whole run.
+            let role = role.or_else(|| role_from_url(&pg_url)).or(get_env_value(
                 ldrs_env,
                 &[
                     &format!("LDRS_PG_ROLE_{}", shouty(&resolved_target)),

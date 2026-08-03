@@ -2,6 +2,7 @@ use anyhow::Context;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
+use tracing::warn;
 use url::Url;
 
 pub async fn create_connection(conn_url: &str) -> Result<tokio_postgres::Client, anyhow::Error> {
@@ -37,21 +38,33 @@ pub fn build_pg_pool(conn_url: &str) -> Result<Pool, anyhow::Error> {
         .map_err(|e| anyhow::anyhow!("Could not build Postgres connection pool: {}", e))
 }
 
+/// Split the `role` query parameter off a connection URL. DEPRECATED: write libpq's own
+/// `options=-c role=<role>` instead. Either way the role is applied per transaction with
+/// `SET LOCAL ROLE`, because whether a connection-level role survives pool recycling depends on the
+/// server version.
 pub fn check_for_role(conn_str: &str) -> Result<(String, Option<String>), anyhow::Error> {
-    let mut pg_url = Url::parse(conn_str)?;
+    let Ok(mut pg_url) = Url::parse(conn_str) else {
+        return Ok((conn_str.to_string(), None));
+    };
     let role = pg_url
         .query_pairs()
         .find(|(k, _)| k == "role")
         .map(|(_, v)| v.into_owned());
 
-    {
-        let new_pairs: Vec<_> = pg_url
-            .query_pairs()
-            .filter(|(k, _)| k != "role")
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
+    let Some(role) = role else {
+        return Ok((conn_str.to_string(), None));
+    };
 
-        pg_url.query_pairs_mut().clear().extend_pairs(new_pairs);
-        Ok((pg_url.to_string(), role))
-    }
+    warn!(
+        "the `role` connection-URL parameter is deprecated and will be removed; use libpq's own \
+         `options=-c role=<role>` instead, which keeps the URL valid for other clients"
+    );
+
+    let remaining: Vec<_> = pg_url
+        .query_pairs()
+        .filter(|(k, _)| k != "role")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    pg_url.query_pairs_mut().clear().extend_pairs(remaining);
+    Ok((pg_url.to_string(), Some(role)))
 }

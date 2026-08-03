@@ -117,7 +117,7 @@ pub fn map_arrow_to_abstract(field: &FieldRef) -> Option<ColumnSpec> {
         arrow_schema::DataType::Float64 => Some(ColumnSpec::Double { name }),
         arrow_schema::DataType::Float32 => Some(ColumnSpec::Real { name }),
         arrow_schema::DataType::Boolean => Some(ColumnSpec::Boolean { name }),
-        arrow_schema::DataType::Binary => Some(ColumnSpec::Text { name }),
+        arrow_schema::DataType::Binary => Some(ColumnSpec::Bytea { name }),
         arrow_schema::DataType::Date32 => Some(ColumnSpec::Date { name }),
         arrow_schema::DataType::FixedSizeBinary(size) => {
             Some(ColumnSpec::FixedSizeBinary { name, size: *size })

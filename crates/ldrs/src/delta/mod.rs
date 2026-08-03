@@ -63,10 +63,15 @@ pub enum DeltaDestination {
 /// time against the execution context before constructing the runtime `TxnConfig`.
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum MergeTxnConfig {
+    /// Skip the merge when the source's high-water mark is not newer than the version already
+    /// committed for `app_id`, making a replay of the same data a no-op.
     SourceWatermark {
         app_id: String,
+        /// Column whose maximum is the high-water mark compared against the committed version.
         watermark_column: String,
     },
+    /// Version the transaction by wall clock (or an explicit `batch_version`) rather than by the
+    /// data, so each run commits.
     ProcessingTime {
         app_id: String,
         batch_version: Option<String>,

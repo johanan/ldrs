@@ -146,7 +146,10 @@ where
 
 /// Finish every sink after a successful stream, recording each one's outcome. Sinks finish
 /// concurrently; each commit is independent, so one failure does not stop the others.
-pub async fn finish_all(sinks: Vec<Sink>) -> Result<Vec<DestinationOutcome>, anyhow::Error> {
+pub async fn finish_all(
+    sinks: Vec<Sink>,
+    rows: u64,
+) -> Result<Vec<DestinationOutcome>, anyhow::Error> {
     let destinations: Vec<DestinationOutcome> = join_all(sinks.into_iter().map(|sink| {
         async move {
             match sink {
@@ -163,9 +166,12 @@ pub async fn finish_all(sinks: Vec<Sink>) -> Result<Vec<DestinationOutcome>, any
                     })
                 }
                 Sink::Pq(s, (columns, target, base_url)) => {
-                    let result = s
-                        .finish()
-                        .await
+                    // An empty load still writes, so a stale file cannot outlive a successful run.
+                    let written = match rows {
+                        0 => s.finish_empty().await,
+                        _ => s.finish().await,
+                    };
+                    let result = written
                         .map(|metas| {
                             metas
                                 .into_iter()

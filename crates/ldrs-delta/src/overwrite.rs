@@ -10,8 +10,8 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    build_add, build_engine, build_overwrite_commit, cleanup_source_files,
-    snapshot_table_state, version_to_log_filename, MAX_COMMIT_RETRIES,
+    build_add, build_engine, build_overwrite_commit, cleanup_source_files, snapshot_table_state,
+    version_to_log_filename, MAX_COMMIT_RETRIES,
 };
 
 /// Streaming Delta overwrite. Writes data files through an embedded [`ParquetSink`]

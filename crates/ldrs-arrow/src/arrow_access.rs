@@ -6,10 +6,10 @@ use std::borrow::Cow;
 
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal32Array, Decimal64Array,
-    FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    Int8Array, StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal32Array,
+    Decimal64Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, StringArray, StructArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -88,6 +88,7 @@ define_column_accessor!(
     (Float32, Float32Array, f32),
     (Float64, Float64Array, f64),
     (Utf8, StringArray, &'a str),
+    (Binary, BinaryArray, &'a [u8]),
     (Date32, Date32Array, i32)
 );
 

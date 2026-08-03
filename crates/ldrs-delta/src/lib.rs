@@ -311,7 +311,6 @@ fn snapshot_table_state(
     })
 }
 
-
 fn build_add(
     filename: &str,
     metadata: &parquet::file::metadata::ParquetMetaData,

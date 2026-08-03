@@ -472,3 +472,90 @@ tables:
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
+
+/// A startup-packet role survives `RecyclingMethod::Clean`: `SET SESSION AUTHORIZATION DEFAULT`
+/// clears `role`, then `RESET ALL` restores it to the startup value.
+#[tokio::test]
+#[test_log::test]
+async fn a_connection_level_role_survives_pool_recycling() {
+    let url = "postgres://postgres:postgres@localhost:5432/postgres\
+               ?sslmode=disable&options=-c%20role%3Dtest_role";
+    let pool = ldrs_postgres::build_pg_pool(url).unwrap();
+    let role_now = |client: deadpool_postgres::Object| async move {
+        let row = client
+            .query_one("SELECT current_role::text", &[])
+            .await
+            .unwrap();
+        row.get::<_, String>(0)
+    };
+
+    assert_eq!(
+        role_now(pool.get().await.unwrap()).await,
+        "test_role",
+        "a fresh connection carries the startup-packet role"
+    );
+    assert_eq!(
+        role_now(pool.get().await.unwrap()).await,
+        "test_role",
+        "and RESET ALL restores it on recycle"
+    );
+}
+
+/// The supported spelling of the role: libpq's own `options=-c role=`, read off the URL and applied
+/// with `SET LOCAL ROLE` per transaction. Ownership of the created table is what proves it applied.
+#[tokio::test]
+#[test_log::test]
+async fn a_role_in_libpq_options_owns_what_the_load_creates() {
+    let dest = "postgres://postgres:postgres@localhost:5432/postgres\
+                ?sslmode=disable&options=-c%20role%3Dtest_role";
+    let admin = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), data_url()),
+        ("LDRS_DEST".to_string(), dest.to_string()),
+    ];
+    let config = "
+dest: pg.drop_replace
+src: file
+
+tables:
+  - name: public_test_role.users
+    filename: public.users/public.users.snappy.parquet
+";
+
+    let client = create_connection(admin).await.unwrap();
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_role CASCADE")
+        .await;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    execute_configs(
+        parse_yaml_config(config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+        &rt.handle(),
+    )
+    .await
+    .unwrap();
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+
+    let owner: String = client
+        .query_one(
+            "SELECT tableowner FROM pg_tables WHERE schemaname = 'public_test_role' AND tablename = 'users'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        owner, "test_role",
+        "the load ran as the role from `options`"
+    );
+
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_role CASCADE")
+        .await;
+}

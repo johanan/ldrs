@@ -25,3 +25,8 @@ tokio = { workspace = true, features = ["sync"] }
 tokio-stream = "0.1.18"
 tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["time"] }
+test-log.workspace = true
+which = "8.0.2"
