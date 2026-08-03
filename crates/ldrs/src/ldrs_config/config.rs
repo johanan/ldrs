@@ -3,6 +3,7 @@ use crate::{
     file_source::FileSource,
     finalize::{FinalizeItem, SfFinalize},
     ldrs_config::field_validation::{extract_props, find_unknown_keys, UnknownKey},
+    ldrs_duckdb::duckdb_source::{DuckDbBlock, DuckDbSource},
     ldrs_snowflake::snowflake_source::{
         from_serde_yaml as from_sf_serde_yaml, SFQuery, SFSource, SFTable,
     },
@@ -59,6 +60,7 @@ pub struct LdrsConfig {
 pub enum LdrsSource {
     File(FileSource),
     SF(SFSource),
+    DuckDb(DuckDbSource),
 }
 
 impl LdrsSource {
@@ -66,6 +68,7 @@ impl LdrsSource {
         match self {
             LdrsSource::File(fs) => &fs.name,
             LdrsSource::SF(sf) => sf.get_name(),
+            LdrsSource::DuckDb(duck) => duck.get_name(),
         }
     }
 }
@@ -124,6 +127,7 @@ pub fn source_known_fields(src: &LdrsSource) -> Vec<String> {
         LdrsSource::File(_) => extract_props::<FileSource>(),
         LdrsSource::SF(SFSource::Query(_)) => extract_props::<SFQuery>(),
         LdrsSource::SF(SFSource::Table(_)) => extract_props::<SFTable>(),
+        LdrsSource::DuckDb(_) => extract_props::<DuckDbBlock>(),
     }
 }
 
@@ -200,6 +204,26 @@ pub fn parse_src(value: Value, src_default: &Option<String>) -> Result<LdrsSourc
                 .or_else(|_| from_sf_serde_yaml(&src_value, Some(&src)))?;
             Ok(LdrsSource::SF(parsed))
         }
+        "duckdb" => {
+            let tag = match src.as_str() {
+                "duckdb" => "duckdb.query",
+                explicit => explicit,
+            };
+            let mut tagged = src_value;
+            if let Value::Mapping(ref mut map) = tagged {
+                map.insert(
+                    Value::String("src".to_string()),
+                    Value::String(tag.to_string()),
+                );
+            }
+            let parsed: DuckDbSource = serde_yaml::from_value(tagged)
+                .with_context(|| format!("failed to parse duckdb source: {}", src))?;
+            Ok(LdrsSource::DuckDb(parsed))
+        }
+        // A `postgres://` URL infers `pg`, which only exists as a destination.
+        "pg" => Err(anyhow::Error::msg(
+            "postgres is a destination kind; to read from Postgres declare `src: duckdb.query` and address the table as `pg.<schema>.<table>` (see `ldrs schema duckdb`)",
+        )),
         _ => Err(anyhow::Error::msg(
             "unsupported src type (see `ldrs schema` for valid kinds)",
         )),

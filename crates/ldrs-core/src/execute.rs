@@ -55,7 +55,7 @@ pub async fn run_task(
                         abort_all(sinks).await;
                         return Err(src_err);
                     }
-                    let destinations = finish_all(sinks).await?;
+                    let destinations = finish_all(sinks, rows).await?;
                     Ok(Some(PhaseOutput {
                         name: task.name,
                         source_files: src.source_files,

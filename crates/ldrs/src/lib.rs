@@ -3,6 +3,7 @@ pub mod delta;
 pub mod file_source;
 pub mod finalize;
 pub mod ldrs_config;
+pub mod ldrs_duckdb;
 pub mod ldrs_env;
 pub mod ldrs_schema;
 pub mod ldrs_snowflake;

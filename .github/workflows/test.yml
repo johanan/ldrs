@@ -30,6 +30,9 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/duckdb" --version
         shell: bash
+      - name: Setup DuckDB extensions
+        run: scripts/setup_duckdb.sh
+        shell: bash
       - name: Setup Postgres
         run: scripts/setup_test.sh
         shell: bash

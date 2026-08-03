@@ -6,14 +6,14 @@ use dotenvy::dotenv;
 use ldrs::cli_schema;
 use ldrs::ldrs_config::config::{find_unknown_block_keys, parse_dest, parse_src, LdrsParsedConfig};
 use ldrs::ldrs_config::{execute_configs, infer_env_type, parse_yaml_config};
-use ldrs::ldrs_env::get_all_ldrs_env_vars;
+use ldrs::ldrs_env::{ambient_env, get_all_ldrs_env_vars};
 use ldrs::lua_logic::lua_args::{modules_from_args, LuaArgs, SnowflakeResult, SnowflakeStrategy};
 use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
 use ldrs::path_pattern;
 use ldrs_storage::build_store;
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 // maintaining this so clients do not break
@@ -185,51 +185,37 @@ fn main() -> Result<(), anyhow::Error> {
         .build()
         .with_context(|| "Unable to create cloud io tokio runtime")?;
 
-    let command_exec = main_rt.block_on(async {
-        match destination {
-            Destination::Ld(args) => {
-                let config_string = fs::read_to_string(&args.config)
-                    .with_context(|| format!("Failed to read config file: {}", args.config))?;
-                let ldrs_env = get_all_ldrs_env_vars();
-                let configs = parse_yaml_config(&config_string, &ldrs_env)?;
-                execute_configs(configs, args.select, &ldrs_env, &rt.handle()).await
-            }
-            Destination::Run(args) => {
-                let ldrs_env = get_all_ldrs_env_vars();
-                let config = build_run_block(&args)?;
-                let src_default = infer_env_type("LDRS_SRC", &ldrs_env);
-                let dest_default = infer_env_type("LDRS_DEST", &ldrs_env);
-                let src = parse_src(config.clone(), &src_default)?;
-                let dest = parse_dest(config.clone(), &dest_default)?;
-                let unknown_keys = find_unknown_block_keys(&config, &src, &dest);
-
-                execute_configs(
-                    vec![LdrsParsedConfig {
-                        src,
-                        dests: vec![dest],
-                        finalize: Vec::new(),
-                        unknown_keys,
-                    }],
-                    None,
-                    &ldrs_env,
-                    &rt.handle(),
-                )
-                .await
-            }
-            Destination::Schema { command } => match command {
-                None => {
-                    // bare `ldrs schema` → list the subcommands
-                    let mut cmd = Cli::command();
-                    if let Some(sub) = cmd.find_subcommand_mut("schema") {
-                        sub.print_help()?;
-                        println!();
-                    }
-                    Ok(())
+    let command_exec =
+        main_rt.block_on(async {
+            match destination {
+                Destination::Ld(args) => {
+                    let config_string = fs::read_to_string(&args.config)
+                        .with_context(|| format!("Failed to read config file: {}", args.config))?;
+                    let ldrs_env = get_all_ldrs_env_vars();
+                    let configs = parse_yaml_config(&config_string, &ldrs_env)?;
+                    execute_configs(configs, args.select, &ldrs_env, &rt.handle()).await
                 }
-                Some(cmd) => {
-                    let output = cli_schema::build(&cmd);
-                    println!("{}", serde_json::to_string_pretty(&output)?);
-                    Ok(())
+                Destination::Run(args) => {
+                    let ldrs_env = get_all_ldrs_env_vars();
+                    let config = build_run_block(&args)?;
+                    let src_default = infer_env_type("LDRS_SRC", &ldrs_env);
+                    let dest_default = infer_env_type("LDRS_DEST", &ldrs_env);
+                    let src = parse_src(config.clone(), &src_default)?;
+                    let dest = parse_dest(config.clone(), &dest_default)?;
+                    let unknown_keys = find_unknown_block_keys(&config, &src, &dest);
+
+                    execute_configs(
+                        vec![LdrsParsedConfig {
+                            src,
+                            dests: vec![dest],
+                            finalize: Vec::new(),
+                            unknown_keys,
+                        }],
+                        None,
+                        &ldrs_env,
+                        &rt.handle(),
+                    )
+                    .await
                 }
                 Destination::Schema { command } => match command {
                     None => {

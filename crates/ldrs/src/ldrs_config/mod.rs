@@ -64,10 +64,7 @@ impl<'a> ExecutionEnv<'a> {
     }
 }
 
-pub fn get_env_value<'a>(
-    vars: &'a [(String, String)],
-    keys: &[&str],
-) -> Option<&'a (String, String)> {
+pub fn get_env_value<'a, V>(vars: &'a [(String, V)], keys: &[&str]) -> Option<&'a (String, V)> {
     keys.iter()
         .find_map(|key| vars.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)))
 }
@@ -120,20 +117,21 @@ fn is_object_store_url(url: &Url) -> bool {
 }
 
 pub fn infer_env_type(env_type: &str, vars: &[(String, String)]) -> Option<String> {
-    let src = vars
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(env_type));
-    let url = src.and_then(|(_, value)| Url::parse(value).ok());
-    match url {
-        Some(u) => match u {
-            u if u.scheme().starts_with("snowflake") => Some("sf".to_string()),
-            u if u.scheme().starts_with("delta+") => Some("delta".to_string()),
-            u if is_object_store_url(&u) => Some("file".to_string()),
-            u if matches!(u.scheme(), "postgres" | "postgresql") => Some("pg".to_string()),
-            _ => None,
-        },
-        None => None,
-    }
+    vars.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(env_type))
+        .and_then(|(_, value)| match value {
+            v if starts_with_ignore_ascii_case(v, "snowflake") => Some("sf".to_string()),
+            v if starts_with_ignore_ascii_case(v, "delta+") => Some("delta".to_string()),
+            v if starts_with_ignore_ascii_case(v, "postgres://")
+                || starts_with_ignore_ascii_case(v, "postgresql://") =>
+            {
+                Some("pg".to_string())
+            }
+            _ => Url::parse(value)
+                .ok()
+                .filter(is_object_store_url)
+                .map(|_| "file".to_string()),
+        })
 }
 
 fn resolve_txn_config(
@@ -434,6 +432,36 @@ fn resolve_source(
             Ok(SourceSpec::File {
                 url: src_url.to_string(),
             })
+        }
+        LdrsSource::DuckDb(duck) => {
+            let name = duck.get_name().to_string();
+            let binary = resolve_binary(ldrs_env, &name)?;
+            let db = resolve_db(ldrs_env, &name);
+            // The read location is optional: a query may generate rows or read the attached db.
+            let src_url = get_src_url(ldrs_env, &name, "DUCKDB")
+                .ok()
+                .map(|(_, url)| url.clone());
+            let ctx = match &src_url {
+                Some(url) => context.with_vars(&[("src_url", url)]),
+                None => context.with_vars(&[]),
+            };
+            let block = duck.block();
+            let sql = ctx.render_template(&block.sql)?;
+            let pre_sql = block
+                .pre_sql
+                .as_deref()
+                .map(|statements| ctx.render_template(statements))
+                .transpose()?;
+            Ok(SourceSpec::Spawned(duckdb_spawned(
+                binary,
+                db,
+                &duck,
+                &sql,
+                pre_sql.as_deref(),
+                src_url.as_deref(),
+                ambient_env(),
+                ldrs_env,
+            )?))
         }
         LdrsSource::SF(sf) => {
             let sf_sql = match &sf {

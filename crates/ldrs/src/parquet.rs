@@ -35,7 +35,9 @@ impl TryFrom<&Value> for ParquetDestination {
                     "Missing name for kind pq (see `ldrs schema pq` for required fields)"
                 )
             })?;
-        let target = value.get("target").and_then(|v| String::deserialize(v).ok());
+        let target = value
+            .get("target")
+            .and_then(|v| String::deserialize(v).ok());
         let filename = value
             .get("pq.filename")
             .or(value.get("filename"))
