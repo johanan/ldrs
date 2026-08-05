@@ -38,7 +38,8 @@ pub async fn run_task(
     let cleanup_handle = src.cleanup_handle;
     match src.schema {
         Some(schema) => {
-            let built = build_sinks(task.dests, &src.source_cols, &schema, pg_pools).await?;
+            let built =
+                build_sinks(task.dests, &src.source_cols, &schema, pg_pools, cloud_io_rt).await?;
             let (mut sinks, per_dest): (Vec<Sink>, Vec<Option<BatchTransform>>) =
                 built.into_iter().unzip();
             let transforms = if shared {
@@ -90,10 +91,11 @@ pub async fn build_sinks(
     source_cols: &[ColumnSpec],
     schema: &SchemaRef,
     pg_pools: &HashMap<String, Pool>,
+    cloud_io: &tokio::runtime::Handle,
 ) -> Result<Vec<(Sink, Option<BatchTransform>)>, anyhow::Error> {
     let mut built = Vec::with_capacity(dests.len());
     for dest in dests {
-        match build_sink(dest, source_cols, schema, pg_pools).await {
+        match build_sink(dest, source_cols, schema, pg_pools, cloud_io).await {
             Ok(pair) => built.push(pair),
             Err(e) => {
                 abort_all(built.into_iter().map(|(sink, _)| sink).collect()).await;
@@ -111,6 +113,7 @@ async fn build_sink(
     source_cols: &[ColumnSpec],
     schema: &SchemaRef,
     pg_pools: &HashMap<String, Pool>,
+    cloud_io: &tokio::runtime::Handle,
 ) -> Result<(Sink, Option<BatchTransform>), anyhow::Error> {
     match dest {
         DestSpec::Pg(pg) => {
@@ -153,11 +156,17 @@ async fn build_sink(
                     max_rows,
                     max_bytes,
                 } => Sink::DeltaOverwrite(
-                    DeltaOverwriteSink::new(&delta.table_path, out_schema, max_rows, max_bytes)?,
+                    DeltaOverwriteSink::new(
+                        &delta.table_path,
+                        out_schema,
+                        max_rows,
+                        max_bytes,
+                        cloud_io,
+                    )?,
                     (target_cols, delta.target, delta.table_path),
                 ),
                 DeltaMode::Merge(merge_config) => Sink::DeltaMerge(
-                    DeltaMergeSink::new(&delta.table_path, out_schema, merge_config)?,
+                    DeltaMergeSink::new(&delta.table_path, out_schema, merge_config, cloud_io)?,
                     (target_cols, delta.target, delta.table_path),
                 ),
             };

@@ -273,7 +273,7 @@ async fn test_delta_stats_json_from_numbers_parquet() {
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_overwrite_delta() {
     let source_path = fixture_url("public.users/public.users.snappy.parquet");
@@ -298,7 +298,7 @@ async fn test_overwrite_delta() {
         .unwrap()
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
 
-    overwrite_delta(&table_url, schema.clone(), stream, None, None)
+    overwrite_delta(&table_url, schema.clone(), stream, None, None, rt.handle())
         .await
         .unwrap();
 
@@ -362,7 +362,7 @@ async fn test_overwrite_delta() {
         .unwrap()
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
 
-    overwrite_delta(&table_url, schema, stream2, None, None)
+    overwrite_delta(&table_url, schema, stream2, None, None, rt.handle())
         .await
         .unwrap();
 
@@ -403,7 +403,7 @@ async fn test_overwrite_delta() {
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_delta_overwrite_with_config() {
     let config = r#"
@@ -512,7 +512,7 @@ tables:
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_delta_merge_with_config() {
     // Same config run twice:
@@ -632,6 +632,110 @@ tables:
             .is_some()
     });
     assert!(has_dv_add, "second merge should produce an add with a DV");
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+// The overwrite path reaches the checkpoint interval through its own snapshot (the one on
+// `TableState`). Once the commits the checkpoint replaces are gone, the table's `protocol`
+// and `metaData` live only in the checkpoint parquet — and every overwrite re-reads them to
+// build its commit, so the next one cannot succeed without resolving the checkpoint.
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_overwrite_writes_checkpoint_past_interval() {
+    let source_path = fixture_url("public.users/public.users.snappy.parquet");
+    let table_path = fixture("delta_writes/users_checkpoint/")
+        .display()
+        .to_string();
+    let table_url = fixture_url("delta_writes/users_checkpoint/");
+    let _ = std::fs::remove_dir_all(&table_path);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // v0 creates the table, then eleven overwrites commit v1..=v11. The eleventh builds its
+    // snapshot at v10 with no checkpoint behind it, so it checkpoints v10 before committing.
+    for _ in 0..11 {
+        let builder = builder_from_string(source_path.clone(), rt.handle().clone())
+            .await
+            .unwrap();
+        let schema = builder.schema().clone();
+        let stream = builder
+            .with_batch_size(1024)
+            .build()
+            .unwrap()
+            .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
+        overwrite_delta(&table_url, schema, stream, None, None, rt.handle())
+            .await
+            .unwrap();
+    }
+
+    let checkpoint = format!(
+        "{}/_delta_log/00000000000000000010.checkpoint.parquet",
+        table_path
+    );
+    assert!(
+        std::path::Path::new(&checkpoint).exists(),
+        "a gap of 10 versions should have written a checkpoint for v10"
+    );
+    let hint = format!("{}/_delta_log/_last_checkpoint", table_path);
+    let hint_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hint).unwrap()).unwrap();
+    assert_eq!(hint_json["version"], 10);
+
+    // The table id as committed at v11, before that commit history goes away.
+    let v11 = std::fs::read_to_string(format!(
+        "{}/_delta_log/00000000000000000011.json",
+        table_path
+    ))
+    .unwrap();
+    let table_id = v11
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|v| v.get("metaData").map(|m| m["id"].clone()))
+        .expect("v11 should carry metaData");
+
+    for v in 0..=10 {
+        std::fs::remove_file(format!("{}/_delta_log/{:020}.json", table_path, v)).unwrap();
+    }
+
+    let builder = builder_from_string(source_path, rt.handle().clone())
+        .await
+        .unwrap();
+    let schema = builder.schema().clone();
+    let stream = builder
+        .with_batch_size(1024)
+        .build()
+        .unwrap()
+        .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
+    overwrite_delta(&table_url, schema, stream, None, None, rt.handle())
+        .await
+        .unwrap();
+
+    let v12 = std::fs::read_to_string(format!(
+        "{}/_delta_log/00000000000000000012.json",
+        table_path
+    ))
+    .unwrap();
+    let actions: Vec<serde_json::Value> = v12
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let metadata = actions
+        .iter()
+        .find_map(|v| v.get("metaData"))
+        .expect("v12 should carry metaData");
+    assert_eq!(
+        metadata["id"], table_id,
+        "the table id can only have come from the checkpoint"
+    );
+    assert!(
+        actions.iter().any(|v| v.get("remove").is_some()),
+        "the overwrite should tombstone the file it replaces"
+    );
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }

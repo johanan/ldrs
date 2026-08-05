@@ -16,6 +16,8 @@ use ldrs_parquet::{
 use ldrs_storage::base_or_relative_path;
 use object_store::ObjectStore;
 use parquet::file::metadata::ParquetMetaData;
+use tokio::runtime::Handle;
+use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -23,8 +25,8 @@ use std::collections::HashMap;
 
 use crate::{
     build_add, build_commit_jsonl, build_engine, build_metadata, cleanup_source_files,
-    ensure_table, merge_protocol, version_to_log_filename, DeltaAction, DeltaCommitInfo,
-    DeltaRemove, DeltaTxn, MERGE_MAX_RETRIES,
+    ensure_table, merge_protocol, should_checkpoint, version_to_log_filename, write_checkpoint,
+    DeltaAction, DeltaCommitInfo, DeltaRemove, DeltaTxn, CHECKPOINT_INTERVAL, MERGE_MAX_RETRIES,
 };
 
 use super::dv::{build_dv_file, build_dv_inline, serialize_dv};
@@ -32,11 +34,11 @@ use super::stats::{
     delta_stats_to_json, key_bounds_as_scalars, max_stat_as_i64, parquet_metadata_to_delta_stats,
     select_row_groups_by_scalars,
 };
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{Expression as Expr, Predicate as Pred};
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::Snapshot;
+use delta_kernel::{engine::arrow_data::ArrowEngineData, Engine};
 use object_store::{PutMode, PutOptions, PutPayload};
 use roaring::RoaringTreemap;
 
@@ -183,12 +185,13 @@ pub async fn merge_delta<S>(
     schema: SchemaRef,
     stream: S,
     merge_config: MergeConfig,
+    cloud_io: &Handle,
 ) -> Result<MergeStats, anyhow::Error>
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
     ensure_table(table_path, &schema).await?;
-    let mut sink = DeltaMergeSink::new(table_path, schema, merge_config)?;
+    let mut sink = DeltaMergeSink::new(table_path, schema, merge_config, cloud_io)?;
     let mut stream = std::pin::pin!(stream);
     while let Some(batch) = stream.next().await {
         sink.write_batch(&batch?).await?;
@@ -203,6 +206,7 @@ pub struct DeltaMergeSink {
     inner: ParquetSink,
     // shared with `inner`: one object-store client for both the data writes and the commit
     store: Arc<dyn ObjectStore>,
+    engine: Arc<dyn Engine>,
     base_path: object_store::path::Path,
     url: Url,
     schema: SchemaRef,
@@ -214,6 +218,7 @@ impl DeltaMergeSink {
         table_path: &str,
         schema: SchemaRef,
         merge_config: MergeConfig,
+        cloud_io: &Handle,
     ) -> Result<Self, anyhow::Error> {
         let url = base_or_relative_path(table_path)?;
         let bloom_columns: Vec<Vec<String>> = merge_config
@@ -232,10 +237,12 @@ impl DeltaMergeSink {
             Some(props),
         )?;
         let store = inner.store();
+        let engine = build_engine(store.clone(), cloud_io);
         let base_path = inner.base_path().clone();
         Ok(Self {
             inner,
             store,
+            engine,
             base_path,
             url,
             schema,
@@ -261,6 +268,7 @@ impl DeltaMergeSink {
         }
         match commit_merge(
             &self.store,
+            &self.engine,
             &self.base_path,
             &self.url,
             &self.schema,
@@ -293,6 +301,7 @@ impl DeltaMergeSink {
 /// what to clean up.
 async fn commit_merge(
     store: &Arc<dyn ObjectStore>,
+    engine: &Arc<dyn Engine>,
     base_path: &object_store::path::Path,
     url: &Url,
     schema: &SchemaRef,
@@ -311,8 +320,6 @@ async fn commit_merge(
         schema,
     )
     .await?;
-
-    let engine = build_engine(store.clone());
 
     // get the app_id and batch_version from either
     // watermark column (read written parquets and get max)
@@ -500,6 +507,17 @@ async fn commit_merge(
             .await
         {
             Ok(_) => {
+                let version = snapshot.version();
+                if should_checkpoint(
+                    version,
+                    snapshot.log_segment().checkpoint_version,
+                    CHECKPOINT_INTERVAL,
+                ) {
+                    match write_checkpoint(engine.clone(), snapshot).await {
+                        Ok((r, _)) => info!(version, result = ?r, "checkpoint"),
+                        Err(e) => warn!(version, error = %e, "failed to create checkpoint"),
+                    }
+                }
                 let source_rows: usize = source_files
                     .iter()
                     .map(|(_, m, _)| m.file_metadata().num_rows() as usize)

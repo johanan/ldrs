@@ -5,12 +5,15 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{DataType as DeltaDataType, StructField, StructType};
-use delta_kernel::{Engine, Snapshot, Version};
+use delta_kernel::snapshot::CheckpointWriteResult;
+use delta_kernel::{Engine, Snapshot, SnapshotRef, Version};
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use futures::{Stream, StreamExt};
 use ldrs_storage::{base_or_relative_path, build_store};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::Serialize;
+use tokio::runtime::Handle;
 use uuid::Uuid;
 
 mod dv;
@@ -21,6 +24,8 @@ mod stats;
 pub use merge::*;
 pub use overwrite::*;
 pub use stats::*;
+
+const CHECKPOINT_INTERVAL: u64 = 10;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +118,23 @@ enum DeltaAction<'a> {
     Add(&'a DeltaAdd),
     Remove(&'a DeltaRemove),
     Txn(&'a DeltaTxn),
+}
+
+fn should_checkpoint(version: Version, last_checkpoint: Option<Version>, interval: u64) -> bool {
+    version.saturating_sub(last_checkpoint.unwrap_or(0)) >= interval
+}
+
+async fn write_checkpoint(
+    engine: Arc<dyn Engine>,
+    snapshot: SnapshotRef,
+) -> Result<(CheckpointWriteResult, Arc<Snapshot>), anyhow::Error> {
+    let res = tokio::task::spawn_blocking(move || snapshot.checkpoint(engine.as_ref(), None)).await;
+    // flatten the Result to a single anyhow Result
+    match res {
+        Ok(Ok(t)) => Ok(t),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Checkpoint failed: {}", e)),
+        Err(e) => Err(anyhow::anyhow!("Checkpoint task failed: {}", e)),
+    }
 }
 
 fn arrow_schema_to_delta_struct(schema: &SchemaRef) -> Result<StructType, anyhow::Error> {
@@ -262,8 +284,12 @@ pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), an
     }
 }
 
-fn build_engine(store: Arc<dyn ObjectStore>) -> Arc<dyn Engine> {
-    Arc::new(DefaultEngineBuilder::new(store).build())
+fn build_engine(store: Arc<dyn ObjectStore>, cloud_io: &Handle) -> Arc<dyn Engine> {
+    Arc::new(
+        DefaultEngineBuilder::new(store)
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(cloud_io.clone())))
+            .build(),
+    )
 }
 
 struct TableState {
@@ -271,6 +297,7 @@ struct TableState {
     active_files: Vec<ScanFile>,
     table_id: String,
     created_time: Option<i64>,
+    snapshot: SnapshotRef,
     has_deletion_vectors: bool,
 }
 
@@ -306,6 +333,7 @@ fn snapshot_table_state(
         version,
         active_files,
         table_id,
+        snapshot,
         created_time,
         has_deletion_vectors,
     })
@@ -397,15 +425,44 @@ pub async fn overwrite_delta<S>(
     stream: S,
     max_rows: Option<usize>,
     max_bytes: Option<usize>,
+    cloud_io: &Handle,
 ) -> Result<(), anyhow::Error>
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
     ensure_table(table_path, &schema).await?;
-    let mut sink = DeltaOverwriteSink::new(table_path, schema, max_rows, max_bytes)?;
+    let mut sink = DeltaOverwriteSink::new(table_path, schema, max_rows, max_bytes, cloud_io)?;
     let mut stream = std::pin::pin!(stream);
     while let Some(batch) = stream.next().await {
         sink.write_batch(&batch?).await?;
     }
     sink.finish().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_checkpoint_waits_for_the_first_interval() {
+        assert!(!should_checkpoint(0, None, 10));
+        assert!(!should_checkpoint(9, None, 10));
+        assert!(should_checkpoint(10, None, 10));
+    }
+
+    #[test]
+    fn should_checkpoint_measures_the_gap_from_the_last_one() {
+        assert!(!should_checkpoint(15, Some(10), 10));
+        assert!(should_checkpoint(20, Some(10), 10));
+    }
+
+    #[test]
+    fn should_checkpoint_catches_up_after_skipped_versions() {
+        assert!(should_checkpoint(25, Some(10), 10));
+    }
+
+    #[test]
+    fn should_checkpoint_saturates_when_the_checkpoint_leads() {
+        assert!(!should_checkpoint(5, Some(10), 10));
+    }
 }
