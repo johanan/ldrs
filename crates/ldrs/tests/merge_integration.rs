@@ -1310,3 +1310,96 @@ async fn test_merge_recovers_existing_sidecar_dv() {
     // Interop: both merges were pure updates logical table is still ids 1..=2000.
     verify_duckdb_count(&table_path, 2000);
 }
+
+// A checkpoint lands once the log grows CHECKPOINT_INTERVAL (10) versions past the last one.
+// What matters after that is that the table still resolves through the checkpoint parquet
+// instead of the JSON commits it stands in for — for our reads and for DuckDB's.
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_merge_writes_checkpoint_past_interval() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path = test_table_path("checkpoint_interval");
+    cleanup_table(&table_path);
+
+    let schema = test_schema();
+    let table_url = format!("file://{}/", table_path);
+
+    let config = || MergeConfig {
+        merge_keys: vec!["id".to_string()],
+        allow_null_keys: false,
+        max_rows: None,
+        max_bytes: None,
+        txn_config: TxnConfig::None,
+    };
+
+    // v0 creates the table, v1 seeds ids 1..=100.
+    let target_stream = stream::iter(vec![Ok(make_target_batch(1..101))]);
+    overwrite_delta(&table_url, schema.clone(), target_stream, None, None, &rt)
+        .await
+        .unwrap();
+
+    // Ten merges of disjoint ids commit v2..=v11. The tenth builds its snapshot at v10 with
+    // no checkpoint behind it — a gap of exactly 10 — so it checkpoints v10 before committing.
+    for i in 0..10i64 {
+        let start = 101 + i * 10;
+        let source_stream = stream::iter(vec![Ok(make_source_batch(start..start + 10))]);
+        let stats = merge_delta(&table_url, schema.clone(), source_stream, config(), &rt)
+            .await
+            .unwrap();
+        assert_eq!(stats.inserted_rows, 10, "merge {i} should insert 10 rows");
+    }
+
+    assert_eq!(latest_version(&table_path), 11);
+
+    let checkpoint = format!(
+        "{}/_delta_log/00000000000000000010.checkpoint.parquet",
+        table_path
+    );
+    assert!(
+        std::path::Path::new(&checkpoint).exists(),
+        "a gap of 10 versions should have written a checkpoint for v10"
+    );
+    let hint = format!("{}/_delta_log/_last_checkpoint", table_path);
+    assert!(
+        std::path::Path::new(&hint).exists(),
+        "the checkpoint hint should name the checkpoint for readers"
+    );
+    let hint_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hint).unwrap()).unwrap();
+    assert_eq!(hint_json["version"], 10);
+
+    // Delete every commit the checkpoint stands in for, which is what log retention will
+    // eventually do. Now the only record of the seeded rows is the checkpoint parquet, so
+    // what follows cannot pass by replaying JSON.
+    for v in 0..=10 {
+        std::fs::remove_file(format!("{}/_delta_log/{:020}.json", table_path, v)).unwrap();
+    }
+
+    // One more merge, overlapping the seeded ids. Matching them at all means the file list
+    // was resolved out of the checkpoint.
+    let source_stream = stream::iter(vec![Ok(make_source_batch(1..11))]);
+    let stats = merge_delta(&table_url, schema.clone(), source_stream, config(), &rt)
+        .await
+        .unwrap();
+    assert_eq!(
+        stats.matched_rows, 10,
+        "the seeded rows are only reachable through the checkpoint"
+    );
+    assert_eq!(stats.inserted_rows, 0, "overlapping ids are all updates");
+
+    // The gap is measured from the checkpoint that exists, so v11 — one past it — must not
+    // produce another. A `version % interval` trigger would also pass here; a version that
+    // never read `checkpoint_version` would not.
+    let next = format!(
+        "{}/_delta_log/00000000000000000011.checkpoint.parquet",
+        table_path
+    );
+    assert!(
+        !std::path::Path::new(&next).exists(),
+        "one version past a checkpoint is not a new interval"
+    );
+
+    // 100 seeded + 100 inserted; the last merge only updated rows. An external reader has to
+    // make sense of the checkpoint too — this is the half our own read path cannot vouch for.
+    verify_duckdb_count(&table_path, 200);
+}

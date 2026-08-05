@@ -13,8 +13,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    build_add, build_engine, build_overwrite_commit, cleanup_source_files, snapshot_table_state,
-    version_to_log_filename, MAX_COMMIT_RETRIES,
+    build_add, build_engine, build_overwrite_commit, cleanup_source_files, should_checkpoint,
+    snapshot_table_state, version_to_log_filename, write_checkpoint, CHECKPOINT_INTERVAL,
+    MAX_COMMIT_RETRIES,
 };
 
 /// Streaming Delta overwrite. Writes data files through an embedded [`ParquetSink`]
@@ -134,7 +135,20 @@ async fn commit_overwrite(
             )
             .await
         {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                let version = table_state.snapshot.version();
+                if should_checkpoint(
+                    version,
+                    table_state.snapshot.log_segment().checkpoint_version,
+                    CHECKPOINT_INTERVAL,
+                ) {
+                    match write_checkpoint(engine.clone(), table_state.snapshot).await {
+                        Ok((r, _)) => info!(version, result = ?r, "checkpoint"),
+                        Err(e) => warn!(version, error = %e, "failed to create checkpoint"),
+                    }
+                }
+                return Ok(());
+            }
             Err(object_store::Error::AlreadyExists { .. }) => continue,
             Err(e) => return Err(e.into()),
         }

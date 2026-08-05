@@ -25,8 +25,8 @@ use std::collections::HashMap;
 
 use crate::{
     build_add, build_commit_jsonl, build_engine, build_metadata, cleanup_source_files,
-    ensure_table, merge_protocol, version_to_log_filename, DeltaAction, DeltaCommitInfo,
-    DeltaRemove, DeltaTxn, MERGE_MAX_RETRIES,
+    ensure_table, merge_protocol, should_checkpoint, version_to_log_filename, write_checkpoint,
+    DeltaAction, DeltaCommitInfo, DeltaRemove, DeltaTxn, CHECKPOINT_INTERVAL, MERGE_MAX_RETRIES,
 };
 
 use super::dv::{build_dv_file, build_dv_inline, serialize_dv};
@@ -34,11 +34,11 @@ use super::stats::{
     delta_stats_to_json, key_bounds_as_scalars, max_stat_as_i64, parquet_metadata_to_delta_stats,
     select_row_groups_by_scalars,
 };
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{Expression as Expr, Predicate as Pred};
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::Snapshot;
+use delta_kernel::{engine::arrow_data::ArrowEngineData, Engine};
 use object_store::{PutMode, PutOptions, PutPayload};
 use roaring::RoaringTreemap;
 
@@ -507,6 +507,17 @@ async fn commit_merge(
             .await
         {
             Ok(_) => {
+                let version = snapshot.version();
+                if should_checkpoint(
+                    version,
+                    snapshot.log_segment().checkpoint_version,
+                    CHECKPOINT_INTERVAL,
+                ) {
+                    match write_checkpoint(engine.clone(), snapshot).await {
+                        Ok((r, _)) => info!(version, result = ?r, "checkpoint"),
+                        Err(e) => warn!(version, error = %e, "failed to create checkpoint"),
+                    }
+                }
                 let source_rows: usize = source_files
                     .iter()
                     .map(|(_, m, _)| m.file_metadata().num_rows() as usize)
