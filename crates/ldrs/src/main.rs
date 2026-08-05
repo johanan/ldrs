@@ -157,7 +157,8 @@ fn main() -> Result<(), anyhow::Error> {
     fmt::Subscriber::builder()
         .with_writer(io::stderr)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,delta_kernel=warn")),
         )
         .init();
     let cli = Cli::parse();

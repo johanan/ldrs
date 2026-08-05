@@ -144,9 +144,10 @@ fn latest_version(table_path: &str) -> u64 {
 
 // A deletion vector larger than the 1024-byte inline threshold is stored as a file
 // (`storageType: "u"`).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_file_based_dv_round_trip() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("file_based_dv");
     cleanup_table(&table_path);
 
@@ -162,6 +163,7 @@ async fn test_merge_file_based_dv_round_trip() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &rt,
     )
     .await
     .unwrap();
@@ -183,6 +185,7 @@ async fn test_merge_file_based_dv_round_trip() {
         schema.clone(),
         stream::iter(vec![Ok(source1)]),
         config(),
+        &rt,
     )
     .await
     .unwrap();
@@ -208,6 +211,7 @@ async fn test_merge_file_based_dv_round_trip() {
         schema.clone(),
         stream::iter(vec![Ok(source2)]),
         config(),
+        &rt,
     )
     .await
     .expect("merge 2 must read the existing file-based DV, not fail on a dropped path segment");
@@ -228,9 +232,10 @@ async fn test_merge_file_based_dv_round_trip() {
     verify_duckdb_count(&table_path, 2000);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_basic_int_key() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("basic_int_key");
     cleanup_table(&table_path);
 
@@ -240,7 +245,7 @@ async fn test_merge_basic_int_key() {
     // Write target: ids 1..=1000 via overwrite
     let target = make_target_batch(1..1001);
     let target_stream = stream::iter(vec![Ok(target)]);
-    overwrite_delta(&table_url, schema.clone(), target_stream, None, None)
+    overwrite_delta(&table_url, schema.clone(), target_stream, None, None, &rt)
         .await
         .unwrap();
 
@@ -256,7 +261,7 @@ async fn test_merge_basic_int_key() {
         txn_config: TxnConfig::None,
     };
 
-    let stats = merge_delta(&table_url, schema.clone(), source_stream, config)
+    let stats = merge_delta(&table_url, schema.clone(), source_stream, config, &rt)
         .await
         .unwrap();
 
@@ -340,9 +345,10 @@ async fn test_merge_basic_int_key() {
     verify_duckdb_count(&table_path, 1500);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_empty_table() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("empty_table");
     cleanup_table(&table_path);
 
@@ -360,7 +366,7 @@ async fn test_merge_empty_table() {
         txn_config: TxnConfig::None,
     };
 
-    let stats = merge_delta(&table_url, schema.clone(), source_stream, config)
+    let stats = merge_delta(&table_url, schema.clone(), source_stream, config, &rt)
         .await
         .unwrap();
 
@@ -405,9 +411,10 @@ async fn test_merge_empty_table() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_all_matches() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("all_matches");
     cleanup_table(&table_path);
 
@@ -417,7 +424,7 @@ async fn test_merge_all_matches() {
     // Target: ids 1..=1000
     let target = make_target_batch(1..1001);
     let target_stream = stream::iter(vec![Ok(target)]);
-    overwrite_delta(&table_url, schema.clone(), target_stream, None, None)
+    overwrite_delta(&table_url, schema.clone(), target_stream, None, None, &rt)
         .await
         .unwrap();
 
@@ -432,7 +439,7 @@ async fn test_merge_all_matches() {
         txn_config: TxnConfig::None,
     };
 
-    let stats = merge_delta(&table_url, schema.clone(), source_stream, config)
+    let stats = merge_delta(&table_url, schema.clone(), source_stream, config, &rt)
         .await
         .unwrap();
 
@@ -476,9 +483,10 @@ async fn test_merge_all_matches() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_with_existing_dvs() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("existing_dvs");
     cleanup_table(&table_path);
 
@@ -493,6 +501,7 @@ async fn test_merge_with_existing_dvs() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &rt,
     )
     .await
     .unwrap();
@@ -512,6 +521,7 @@ async fn test_merge_with_existing_dvs() {
         schema.clone(),
         stream::iter(vec![Ok(first_source)]),
         config.clone(),
+        &rt,
     )
     .await
     .unwrap();
@@ -526,6 +536,7 @@ async fn test_merge_with_existing_dvs() {
         schema.clone(),
         stream::iter(vec![Ok(second_source)]),
         config.clone(),
+        &rt,
     )
     .await
     .unwrap();
@@ -567,9 +578,10 @@ async fn test_merge_with_existing_dvs() {
     verify_duckdb_count(&table_path, 1000);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_string_key() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("string_key");
     cleanup_table(&table_path);
 
@@ -584,6 +596,7 @@ async fn test_merge_string_key() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &rt,
     )
     .await
     .unwrap();
@@ -604,6 +617,7 @@ async fn test_merge_string_key() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
+        &rt,
     )
     .await
     .unwrap();
@@ -632,9 +646,10 @@ async fn test_merge_string_key() {
     assert_eq!(total_dv_cardinality, 500, "500 string keys should match");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_timestamp_key() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("timestamp_key");
     cleanup_table(&table_path);
 
@@ -653,6 +668,7 @@ async fn test_merge_timestamp_key() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &rt,
     )
     .await
     .unwrap();
@@ -671,6 +687,7 @@ async fn test_merge_timestamp_key() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
+        &rt,
     )
     .await
     .unwrap();
@@ -696,9 +713,10 @@ async fn test_merge_timestamp_key() {
     assert_eq!(total_dv_cardinality, 500, "500 timestamp keys should match");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_composite_key() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("composite_key");
     cleanup_table(&table_path);
 
@@ -713,6 +731,7 @@ async fn test_merge_composite_key() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &rt,
     )
     .await
     .unwrap();
@@ -733,6 +752,7 @@ async fn test_merge_composite_key() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
+        &rt,
     )
     .await
     .unwrap();
@@ -758,9 +778,10 @@ async fn test_merge_composite_key() {
     assert_eq!(total_dv_cardinality, 500, "500 composite keys should match");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_txn_watermark_skip() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("txn_watermark");
     cleanup_table(&table_path);
 
@@ -775,6 +796,7 @@ async fn test_merge_txn_watermark_skip() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &rt,
     )
     .await
     .unwrap();
@@ -797,6 +819,7 @@ async fn test_merge_txn_watermark_skip() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config.clone(),
+        &rt,
     )
     .await
     .unwrap();
@@ -816,6 +839,7 @@ async fn test_merge_txn_watermark_skip() {
         schema.clone(),
         stream::iter(vec![Ok(same_source)]),
         config.clone(),
+        &rt,
     )
     .await
     .unwrap();
@@ -837,9 +861,10 @@ async fn test_merge_txn_watermark_skip() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_txn_processing_time_skip() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("txn_processing_time");
     cleanup_table(&table_path);
 
@@ -854,6 +879,7 @@ async fn test_merge_txn_processing_time_skip() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &rt,
     )
     .await
     .unwrap();
@@ -878,6 +904,7 @@ async fn test_merge_txn_processing_time_skip() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config.clone(),
+        &rt,
     )
     .await
     .unwrap();
@@ -900,6 +927,7 @@ async fn test_merge_txn_processing_time_skip() {
         schema.clone(),
         stream::iter(vec![Ok(same_source)]),
         config.clone(),
+        &rt,
     )
     .await
     .unwrap();
@@ -920,6 +948,7 @@ async fn test_merge_txn_processing_time_skip() {
         schema.clone(),
         stream::iter(vec![Ok(different_source)]),
         newer_config,
+        &rt,
     )
     .await
     .unwrap();
@@ -941,9 +970,10 @@ fn list_parquets(table_path: &str) -> std::collections::HashSet<std::ffi::OsStri
         .collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_null_keys_rejected_and_cleaned_up() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("null_keys_cleanup");
     cleanup_table(&table_path);
 
@@ -958,6 +988,7 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &rt,
     )
     .await
     .unwrap();
@@ -1000,6 +1031,7 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
+        &rt,
     )
     .await;
 
@@ -1020,9 +1052,10 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_small_change_uses_inline_dv() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("inline_dv");
     cleanup_table(&table_path);
 
@@ -1037,6 +1070,7 @@ async fn test_merge_small_change_uses_inline_dv() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &rt,
     )
     .await
     .unwrap();
@@ -1056,6 +1090,7 @@ async fn test_merge_small_change_uses_inline_dv() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
+        &rt,
     )
     .await
     .unwrap();
@@ -1122,6 +1157,7 @@ async fn test_merge_small_change_uses_inline_dv() {
         schema.clone(),
         stream::iter(vec![Ok(second_source)]),
         second_config,
+        &rt,
     )
     .await
     .unwrap();
@@ -1151,9 +1187,10 @@ async fn test_merge_small_change_uses_inline_dv() {
 // deletes enough scattered rows to spill the DV past the inline threshold into a `.bin` file, then
 // the second merge touches the same file and must tombstone it with that exact sidecar descriptor
 // (storageType "u", offset present).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_merge_recovers_existing_sidecar_dv() {
+    let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("sidecar_dv");
     cleanup_table(&table_path);
 
@@ -1168,6 +1205,7 @@ async fn test_merge_recovers_existing_sidecar_dv() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &rt,
     )
     .await
     .unwrap();
@@ -1190,6 +1228,7 @@ async fn test_merge_recovers_existing_sidecar_dv() {
         schema.clone(),
         stream::iter(vec![Ok(first_source)]),
         config.clone(),
+        &rt,
     )
     .await
     .unwrap();
@@ -1221,6 +1260,7 @@ async fn test_merge_recovers_existing_sidecar_dv() {
         schema.clone(),
         stream::iter(vec![Ok(second_source)]),
         config.clone(),
+        &rt,
     )
     .await
     .unwrap();

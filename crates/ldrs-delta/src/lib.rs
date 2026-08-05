@@ -11,6 +11,7 @@ use futures::{Stream, StreamExt};
 use ldrs_storage::{base_or_relative_path, build_store};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::Serialize;
+use tokio::runtime::Handle;
 use uuid::Uuid;
 
 mod dv;
@@ -262,8 +263,12 @@ pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), an
     }
 }
 
-fn build_engine(store: Arc<dyn ObjectStore>) -> Arc<dyn Engine> {
-    Arc::new(DefaultEngineBuilder::new(store).build())
+fn build_engine(store: Arc<dyn ObjectStore>, cloud_io: &Handle) -> Arc<dyn Engine> {
+    Arc::new(
+        DefaultEngineBuilder::new(store)
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(cloud_io.clone())))
+            .build(),
+    )
 }
 
 struct TableState {
@@ -397,12 +402,13 @@ pub async fn overwrite_delta<S>(
     stream: S,
     max_rows: Option<usize>,
     max_bytes: Option<usize>,
+    cloud_io: &Handle,
 ) -> Result<(), anyhow::Error>
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
     ensure_table(table_path, &schema).await?;
-    let mut sink = DeltaOverwriteSink::new(table_path, schema, max_rows, max_bytes)?;
+    let mut sink = DeltaOverwriteSink::new(table_path, schema, max_rows, max_bytes, cloud_io)?;
     let mut stream = std::pin::pin!(stream);
     while let Some(batch) = stream.next().await {
         sink.write_batch(&batch?).await?;

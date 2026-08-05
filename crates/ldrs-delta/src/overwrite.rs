@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use delta_kernel::Engine;
 use ldrs_parquet::{default_writer_props, FileNamer, ParquetSink};
 use ldrs_storage::base_or_relative_path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use parquet::file::metadata::ParquetMetaData;
+use tokio::runtime::Handle;
+use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -20,6 +23,7 @@ pub struct DeltaOverwriteSink {
     inner: ParquetSink,
     // shared with `inner`: one object-store client for both the data writes and the commit
     store: Arc<dyn ObjectStore>,
+    engine: Arc<dyn Engine>,
     base_path: object_store::path::Path,
     url: Url,
     schema: SchemaRef,
@@ -31,6 +35,7 @@ impl DeltaOverwriteSink {
         schema: SchemaRef,
         max_rows: Option<usize>,
         max_bytes: Option<usize>,
+        cloud_io: &Handle,
     ) -> Result<Self, anyhow::Error> {
         let url = base_or_relative_path(table_path)?;
         let namer: FileNamer = Box::new(|_| Ok(format!("{}.parquet", Uuid::new_v4())));
@@ -43,10 +48,12 @@ impl DeltaOverwriteSink {
             Some(default_writer_props()),
         )?;
         let store = inner.store();
+        let engine = build_engine(store.clone(), cloud_io);
         let base_path = inner.base_path().clone();
         Ok(Self {
             inner,
             store,
+            engine,
             base_path,
             url,
             schema,
@@ -69,6 +76,7 @@ impl DeltaOverwriteSink {
         let files = self.inner.finish().await?;
         match commit_overwrite(
             &self.store,
+            &self.engine,
             &self.base_path,
             &self.url,
             &self.schema,
@@ -95,6 +103,7 @@ impl DeltaOverwriteSink {
 /// landed; on any failure the caller decides what to clean up.
 async fn commit_overwrite(
     store: &Arc<dyn ObjectStore>,
+    engine: &Arc<dyn Engine>,
     base_path: &object_store::path::Path,
     url: &Url,
     schema: &SchemaRef,
@@ -105,8 +114,6 @@ async fn commit_overwrite(
         .iter()
         .map(|(filename, metadata, size)| build_add(filename, metadata, *size, now, schema))
         .collect::<Result<Vec<_>, _>>()?;
-
-    let engine = build_engine(store.clone());
 
     for _attempt in 0..MAX_COMMIT_RETRIES {
         let table_state = snapshot_table_state(engine.as_ref(), url)?;

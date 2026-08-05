@@ -16,6 +16,8 @@ use ldrs_parquet::{
 use ldrs_storage::base_or_relative_path;
 use object_store::ObjectStore;
 use parquet::file::metadata::ParquetMetaData;
+use tokio::runtime::Handle;
+use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -183,12 +185,13 @@ pub async fn merge_delta<S>(
     schema: SchemaRef,
     stream: S,
     merge_config: MergeConfig,
+    cloud_io: &Handle,
 ) -> Result<MergeStats, anyhow::Error>
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
     ensure_table(table_path, &schema).await?;
-    let mut sink = DeltaMergeSink::new(table_path, schema, merge_config)?;
+    let mut sink = DeltaMergeSink::new(table_path, schema, merge_config, cloud_io)?;
     let mut stream = std::pin::pin!(stream);
     while let Some(batch) = stream.next().await {
         sink.write_batch(&batch?).await?;
@@ -203,6 +206,7 @@ pub struct DeltaMergeSink {
     inner: ParquetSink,
     // shared with `inner`: one object-store client for both the data writes and the commit
     store: Arc<dyn ObjectStore>,
+    engine: Arc<dyn Engine>,
     base_path: object_store::path::Path,
     url: Url,
     schema: SchemaRef,
@@ -214,6 +218,7 @@ impl DeltaMergeSink {
         table_path: &str,
         schema: SchemaRef,
         merge_config: MergeConfig,
+        cloud_io: &Handle,
     ) -> Result<Self, anyhow::Error> {
         let url = base_or_relative_path(table_path)?;
         let bloom_columns: Vec<Vec<String>> = merge_config
@@ -232,10 +237,12 @@ impl DeltaMergeSink {
             Some(props),
         )?;
         let store = inner.store();
+        let engine = build_engine(store.clone(), cloud_io);
         let base_path = inner.base_path().clone();
         Ok(Self {
             inner,
             store,
+            engine,
             base_path,
             url,
             schema,
@@ -261,6 +268,7 @@ impl DeltaMergeSink {
         }
         match commit_merge(
             &self.store,
+            &self.engine,
             &self.base_path,
             &self.url,
             &self.schema,
@@ -293,6 +301,7 @@ impl DeltaMergeSink {
 /// what to clean up.
 async fn commit_merge(
     store: &Arc<dyn ObjectStore>,
+    engine: &Arc<dyn Engine>,
     base_path: &object_store::path::Path,
     url: &Url,
     schema: &SchemaRef,
@@ -311,8 +320,6 @@ async fn commit_merge(
         schema,
     )
     .await?;
-
-    let engine = build_engine(store.clone());
 
     // get the app_id and batch_version from either
     // watermark column (read written parquets and get max)

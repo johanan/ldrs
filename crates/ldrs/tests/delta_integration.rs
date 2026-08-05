@@ -273,7 +273,7 @@ async fn test_delta_stats_json_from_numbers_parquet() {
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_overwrite_delta() {
     let source_path = fixture_url("public.users/public.users.snappy.parquet");
@@ -298,7 +298,7 @@ async fn test_overwrite_delta() {
         .unwrap()
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
 
-    overwrite_delta(&table_url, schema.clone(), stream, None, None)
+    overwrite_delta(&table_url, schema.clone(), stream, None, None, rt.handle())
         .await
         .unwrap();
 
@@ -362,7 +362,7 @@ async fn test_overwrite_delta() {
         .unwrap()
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
 
-    overwrite_delta(&table_url, schema, stream2, None, None)
+    overwrite_delta(&table_url, schema, stream2, None, None, rt.handle())
         .await
         .unwrap();
 
@@ -403,7 +403,7 @@ async fn test_overwrite_delta() {
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_delta_overwrite_with_config() {
     let config = r#"
@@ -512,7 +512,7 @@ tables:
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_delta_merge_with_config() {
     // Same config run twice:
