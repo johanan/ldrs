@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.1] - 2026-08-05
+
+### Refactor
+
+- *(delta)* Cloud io runtime to delta
+
+Delta kernel engine was using its own runtime. ldrs now explicitly
+passes down the runtime used for object_store io.
+
+- *(delta)* Checkpoint writes
+
+Delta writing will now add a checkpoint every 10 versions. This is not
+on the tenth version, but rather if there are ever more than 10 or more
+versions since the last checkpoint it will write one.
+
+
 ## [0.22.0] - 2026-08-03
 
 ### Bug Fixes
