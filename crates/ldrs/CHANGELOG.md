@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.2] - 2026-08-13
+
+### Bug Fixes
+
+- *(delta)* Added vacuum
+
+ldrs will now run vacuum on delta tables. You can target all the tables
+in a YAML load or give an object_store URL.
+
+
 ## [0.22.1] - 2026-08-05
 
 ### Refactor
