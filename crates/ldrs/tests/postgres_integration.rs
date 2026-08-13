@@ -94,7 +94,7 @@ async fn test_postgres_file_drop() {
             parse_yaml_config(&config, &ldrs_env).unwrap(),
             None,
             &ldrs_env,
-            &rt.handle(),
+            rt.handle(),
         )
         .await;
         assert_eq!(ex.is_ok(), true);
@@ -147,7 +147,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await;
     assert!(ex.is_err());
@@ -201,7 +201,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
@@ -328,7 +328,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
@@ -398,7 +398,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await;
     assert!(ex.is_err(), "load should fail on the invalid post_sql");
@@ -455,7 +455,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
@@ -536,7 +536,7 @@ tables:
         parse_yaml_config(config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await
     .unwrap();

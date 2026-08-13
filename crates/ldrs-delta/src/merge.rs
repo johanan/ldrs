@@ -336,6 +336,8 @@ async fn commit_merge(
         let metadata = snapshot.table_configuration().metadata();
         let table_id = metadata.id().to_string();
         let created_time = metadata.created_time();
+        let configuration = metadata.configuration().clone();
+        let partition_columns = metadata.partition_columns().to_vec();
         let has_deletion_vectors = snapshot
             .table_properties()
             .enable_deletion_vectors
@@ -399,11 +401,14 @@ async fn commit_merge(
             None
         };
         let metadata_action = if needs_dv_upgrade {
+            let mut configuration = configuration.clone();
+            configuration.insert("delta.enableDeletionVectors".into(), "true".into());
             Some(build_metadata(
                 schema,
                 Some(&table_id),
                 created_time,
-                HashMap::from([("delta.enableDeletionVectors".into(), "true".into())]),
+                configuration,
+                partition_columns,
             )?)
         } else {
             None
@@ -764,8 +769,7 @@ fn find_candidate_target_files(
 }
 
 /// Read the as-stored `deletionVector` descriptors off one scan-output batch, keyed by file path.
-/// Uses the engine scan for a full output of possible files.
-fn read_existing_dvs(
+pub(crate) fn read_existing_dvs(
     scan_files: &FilteredEngineData,
 ) -> Result<HashMap<String, super::dv::DeletionVectorDescriptor>, anyhow::Error> {
     let batch = scan_files
@@ -778,32 +782,32 @@ fn read_existing_dvs(
 
     let paths = batch
         .column_by_name("path")
-        .expect("scan row schema has `path`")
-        .as_string::<i32>();
+        .map(|c| c.as_string::<i32>())
+        .ok_or_else(|| anyhow::anyhow!("scan row schema has no path column"))?;
     let dv = batch
         .column_by_name("deletionVector")
-        .expect("scan row schema has `deletionVector`")
-        .as_struct();
+        .map(|c| c.as_struct())
+        .ok_or_else(|| anyhow::anyhow!("scan row schema has no deletionVector column"))?;
     let storage_type = dv
         .column_by_name("storageType")
-        .expect("deletionVector has `storageType`")
-        .as_string::<i32>();
+        .map(|c| c.as_string::<i32>())
+        .ok_or_else(|| anyhow::anyhow!("deletionVector has no storageType column"))?;
     let path_or_inline = dv
         .column_by_name("pathOrInlineDv")
-        .expect("deletionVector has `pathOrInlineDv`")
-        .as_string::<i32>();
+        .map(|c| c.as_string::<i32>())
+        .ok_or_else(|| anyhow::anyhow!("deletionVector has no pathOrInlineDv column"))?;
     let offset = dv
         .column_by_name("offset")
-        .expect("deletionVector has `offset`")
-        .as_primitive::<Int32Type>();
+        .map(|c| c.as_primitive::<Int32Type>())
+        .ok_or_else(|| anyhow::anyhow!("deletionVector has no offset column"))?;
     let size_in_bytes = dv
         .column_by_name("sizeInBytes")
-        .expect("deletionVector has `sizeInBytes`")
-        .as_primitive::<Int32Type>();
+        .map(|c| c.as_primitive::<Int32Type>())
+        .ok_or_else(|| anyhow::anyhow!("deletionVector has no sizeInBytes column"))?;
     let cardinality = dv
         .column_by_name("cardinality")
-        .expect("deletionVector has `cardinality`")
-        .as_primitive::<Int64Type>();
+        .map(|c| c.as_primitive::<Int64Type>())
+        .ok_or_else(|| anyhow::anyhow!("deletionVector has no cardinality column"))?;
 
     let mut out = HashMap::new();
     for row in 0..batch.num_rows() {

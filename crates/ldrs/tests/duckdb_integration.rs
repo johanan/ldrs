@@ -33,7 +33,7 @@ async fn run(config: &str, ldrs_env: &[(String, String)]) -> Result<(), anyhow::
         parse_yaml_config(config, ldrs_env).unwrap(),
         None,
         ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await;
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
