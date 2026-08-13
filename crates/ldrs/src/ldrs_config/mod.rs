@@ -1,7 +1,7 @@
 pub mod config;
 pub mod field_validation;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal};
 
 use anyhow::Context;
@@ -24,8 +24,12 @@ use crate::ldrs_env::{ambient_env, starts_with_ignore_ascii_case};
 use crate::{
     delta::{DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
     finalize::{call_finalize, run_sf, FinalizeItem, SfCommand},
-    ldrs_config::config::{
-        parse_table, validate_configs, LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource,
+    ldrs_config::{
+        config::{
+            parse_table, validate_configs, LdrsConfig, LdrsDestination, LdrsParsedConfig,
+            LdrsSource,
+        },
+        field_validation::UnknownKey,
     },
     ldrs_duckdb::{duckdb_spawned, resolve_binary, resolve_db},
     ldrs_env::{
@@ -189,23 +193,98 @@ pub fn parse_yaml_config(
         .collect::<Result<Vec<_>, anyhow::Error>>()
 }
 
+/// Keep only the tasks named by `--select`, matched on the source name.
+fn select_tasks(
+    tasks: Vec<LdrsParsedConfig>,
+    select: Option<Vec<String>>,
+) -> Vec<LdrsParsedConfig> {
+    match select {
+        Some(names) => tasks
+            .into_iter()
+            .filter(|t| names.iter().any(|s| s.eq_ignore_ascii_case(t.src.name())))
+            .collect(),
+        None => tasks,
+    }
+}
+
+fn warn_unknown_keys(task_name: &str, unknown_keys: &[UnknownKey]) {
+    for UnknownKey { key, suggestions } in unknown_keys {
+        match suggestions.as_slice() {
+            [] => warn!("table '{task_name}': '{key}' is not a known field (see 'ldrs schema')"),
+            [one] => warn!(
+                "table '{task_name}': '{key}' is not a known field (did you mean '{one}'? see 'ldrs schema')"
+            ),
+            many => {
+                let joined = many
+                    .iter()
+                    .map(|s| format!("'{s}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                warn!(
+                    "table '{task_name}': '{key}' is not a known field (did you mean one of {joined}? see 'ldrs schema')"
+                )
+            }
+        }
+    }
+}
+
+fn delta_target_name(dest: &DeltaDestination) -> &str {
+    match dest {
+        DeltaDestination::Overwrite(c) => c.target.as_deref().unwrap_or(&c.name),
+        DeltaDestination::Merge(m) => m.common.target.as_deref().unwrap_or(&m.common.name),
+    }
+}
+
+fn delta_table_path(
+    resolved_target: &str,
+    ldrs_env: &[(String, String)],
+) -> Result<String, anyhow::Error> {
+    let dest_value = get_dest_url(ldrs_env, resolved_target, "DELTA")?;
+    Ok(join_into_url(crate::delta::storage_url(&dest_value.1), resolved_target)?.to_string())
+}
+
+/// Resolve the delta destinations a config names into their table paths, paired with the table
+/// they came from.
+pub fn resolve_delta_targets(
+    tasks: Vec<LdrsParsedConfig>,
+    select: Option<Vec<String>>,
+    ldrs_env: &[(String, String)],
+) -> Result<Vec<(String, String)>, anyhow::Error> {
+    let exec_env = ExecutionEnv::create(ldrs_env);
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+
+    for task in select_tasks(tasks, select) {
+        let name = task.src.name().to_string();
+        warn_unknown_keys(&name, &task.unknown_keys);
+        let context =
+            LdrsExecutionContext::try_new(&name, &exec_env.handlebars, &exec_env.handlebars_vars)?;
+
+        for dest in task.dests.iter().filter_map(|dest| match dest {
+            LdrsDestination::Delta(delta) => Some(delta),
+            _ => None,
+        }) {
+            let resolved_target = context.render_template(delta_target_name(dest))?;
+            let table_path = delta_table_path(&resolved_target, ldrs_env)?;
+            if seen.insert(table_path.clone()) {
+                targets.push((name.clone(), table_path));
+            }
+        }
+    }
+
+    match targets.is_empty() {
+        true => Err(anyhow::anyhow!("the config names no delta destinations")),
+        false => Ok(targets),
+    }
+}
+
 pub async fn execute_configs(
     tasks: Vec<LdrsParsedConfig>,
     select: Option<Vec<String>>,
     ldrs_env: &[(String, String)],
     cloud_io_rt: &tokio::runtime::Handle,
 ) -> Result<(), anyhow::Error> {
-    let filtered_tasks: Vec<_> = match select {
-        Some(selected_tables) => tasks
-            .into_iter()
-            .filter(|t| {
-                selected_tables
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(t.src.name()))
-            })
-            .collect(),
-        None => tasks,
-    };
+    let filtered_tasks = select_tasks(tasks, select);
     debug!("Tasks to be run {:?}", filtered_tasks);
 
     validate_configs(&filtered_tasks)?;
@@ -229,31 +308,10 @@ pub async fn execute_configs(
     for (i, task) in filtered_tasks.into_iter().enumerate() {
         let task_start = std::time::Instant::now();
         debug!("Task: {:?}", task);
-        let task_name = task.src.name();
-        for u in &task.unknown_keys {
-            match u.suggestions.as_slice() {
-                [] => warn!(
-                    "table '{}': '{}' is not a known field (see `ldrs schema`)",
-                    task_name, u.key
-                ),
-                [one] => warn!(
-                    "table '{}': '{}' is not a known field (did you mean '{}'? see `ldrs schema`)",
-                    task_name, u.key, one
-                ),
-                many => {
-                    let joined = many
-                        .iter()
-                        .map(|s| format!("'{}'", s))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    warn!(
-                        "table '{}': '{}' is not a known field (did you mean one of {}? see `ldrs schema`)",
-                        task_name, u.key, joined
-                    );
-                }
-            }
-        }
-        info!("Running task: {}/{}", i + 1, total_tasks);
+        // owned so it can still name the task in the completion line, after `task` is moved
+        let task_name = task.src.name().to_string();
+        warn_unknown_keys(&task_name, &task.unknown_keys);
+        info!(table = %task_name, "Running task: {}/{}", i + 1, total_tasks);
         let rows = execute_task(
             task,
             exec_env.ldrs_env,
@@ -266,6 +324,7 @@ pub async fn execute_configs(
         .await?;
         let task_end = std::time::Instant::now();
         info!(
+            table = %task_name,
             rows,
             elapsed_ms = (task_end - task_start).as_millis(),
             "Task completed"
@@ -571,20 +630,12 @@ fn resolve_dest(
             }))
         }
         LdrsDestination::Delta(delta_dest) => {
-            let (resolved_target, columns) = match &delta_dest {
-                DeltaDestination::Overwrite(c) => (
-                    context.render_template(c.target.as_deref().unwrap_or(&c.name))?,
-                    c.columns.clone(),
-                ),
-                DeltaDestination::Merge(m) => (
-                    context
-                        .render_template(m.common.target.as_deref().unwrap_or(&m.common.name))?,
-                    m.common.columns.clone(),
-                ),
+            let resolved_target = context.render_template(delta_target_name(&delta_dest))?;
+            let columns = match &delta_dest {
+                DeltaDestination::Overwrite(c) => c.columns.clone(),
+                DeltaDestination::Merge(m) => m.common.columns.clone(),
             };
-            let dest_value = get_dest_url(ldrs_env, &resolved_target, "DELTA")?;
-            let storage_url = dest_value.1.strip_prefix("delta+").unwrap_or(&dest_value.1);
-            let table_path = join_into_url(storage_url, &resolved_target)?.to_string();
+            let table_path = delta_table_path(&resolved_target, ldrs_env)?;
             let mode = match delta_dest {
                 DeltaDestination::Overwrite(o) => DeltaMode::Overwrite {
                     max_rows: o.max_rows,

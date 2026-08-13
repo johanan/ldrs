@@ -20,10 +20,12 @@ mod dv;
 mod merge;
 mod overwrite;
 mod stats;
+mod vacuum;
 
 pub use merge::*;
 pub use overwrite::*;
 pub use stats::*;
+pub use vacuum::*;
 
 const CHECKPOINT_INTERVAL: u64 = 10;
 
@@ -219,6 +221,7 @@ fn build_metadata(
     table_id: Option<&str>,
     created_time: Option<i64>,
     configuration: HashMap<String, String>,
+    partition_columns: Vec<String>,
 ) -> Result<DeltaMetadata, anyhow::Error> {
     let delta_schema = arrow_schema_to_delta_struct(schema)?;
     let schema_string = serde_json::to_string(&delta_schema)?;
@@ -232,7 +235,7 @@ fn build_metadata(
             options: HashMap::new(),
         },
         schema_string,
-        partition_columns: vec![],
+        partition_columns,
         created_time: created_time.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
         configuration,
     })
@@ -252,7 +255,7 @@ pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), an
     };
 
     let protocol = default_protocol();
-    let metadata = build_metadata(schema, None, None, HashMap::new())?;
+    let metadata = build_metadata(schema, None, None, HashMap::new(), Vec::new())?;
 
     let actions = vec![
         DeltaAction::CommitInfo(&commit_info),
@@ -297,6 +300,8 @@ struct TableState {
     active_files: Vec<ScanFile>,
     table_id: String,
     created_time: Option<i64>,
+    configuration: HashMap<String, String>,
+    partition_columns: Vec<String>,
     snapshot: SnapshotRef,
     has_deletion_vectors: bool,
 }
@@ -310,6 +315,8 @@ fn snapshot_table_state(
     let metadata = snapshot.table_configuration().metadata();
     let table_id = metadata.id().to_string();
     let created_time = metadata.created_time();
+    let configuration = metadata.configuration().clone();
+    let partition_columns = metadata.partition_columns().to_vec();
     // we can read the property if dvs have been added
     // this either does not exist or has a value of true or false
     let has_deletion_vectors = snapshot
@@ -335,6 +342,8 @@ fn snapshot_table_state(
         table_id,
         snapshot,
         created_time,
+        configuration,
+        partition_columns,
         has_deletion_vectors,
     })
 }
@@ -404,7 +413,8 @@ fn build_overwrite_commit(
         schema,
         Some(&table_state.table_id),
         table_state.created_time,
-        HashMap::new(),
+        table_state.configuration.clone(),
+        table_state.partition_columns.clone(),
     )?;
 
     let mut actions: Vec<DeltaAction> = vec![

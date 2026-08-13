@@ -182,7 +182,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await
     .unwrap();
@@ -234,7 +234,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await
     .unwrap();
@@ -279,7 +279,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await
     .unwrap();
@@ -481,7 +481,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await
     .unwrap();
@@ -534,7 +534,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await;
     assert!(
@@ -590,7 +590,7 @@ tables:
         parse_yaml_config(config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await
     .unwrap();
@@ -652,7 +652,7 @@ tables:
         parse_yaml_config(config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await
     .unwrap();

@@ -8,6 +8,11 @@ fn default_app_id() -> String {
     "ldrs-merge-{{ name }}".to_string()
 }
 
+/// Drop the `delta+` tag from a destination url. delta+ is only a type hint
+pub fn storage_url(url: &str) -> &str {
+    url.strip_prefix("delta+").unwrap_or(url)
+}
+
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DeltaCommon {
     pub name: String,
@@ -113,6 +118,21 @@ mod tests {
         let parsed: DeltaDestination = serde_yaml::from_value(value.clone())?;
         validate(&value, &parsed)?;
         Ok(parsed)
+    }
+
+    #[test]
+    fn storage_url_strips_only_the_kind_tag() {
+        assert_eq!(
+            storage_url("delta+s3://bucket/warehouse/"),
+            "s3://bucket/warehouse/"
+        );
+        assert_eq!(
+            storage_url("s3://bucket/warehouse/"),
+            "s3://bucket/warehouse/"
+        );
+        assert_eq!(storage_url("file:///tmp/t/"), "file:///tmp/t/");
+        // the tag is a prefix, not a substring
+        assert_eq!(storage_url("s3://bucket/delta+x/"), "s3://bucket/delta+x/");
     }
 
     #[test]

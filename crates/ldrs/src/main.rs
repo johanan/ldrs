@@ -1,3 +1,4 @@
+use std::time::Duration;
 use std::{fs, io};
 
 use anyhow::Context;
@@ -5,33 +6,73 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use dotenvy::dotenv;
 use ldrs::cli_schema;
 use ldrs::ldrs_config::config::{find_unknown_block_keys, parse_dest, parse_src, LdrsParsedConfig};
-use ldrs::ldrs_config::{execute_configs, infer_env_type, parse_yaml_config};
+use ldrs::ldrs_config::{
+    execute_configs, infer_env_type, parse_yaml_config, resolve_delta_targets,
+};
 use ldrs::ldrs_env::{ambient_env, get_all_ldrs_env_vars};
 use ldrs::lua_logic::lua_args::{modules_from_args, LuaArgs, SnowflakeResult, SnowflakeStrategy};
 use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
 use ldrs::path_pattern;
+use ldrs_delta::{vacuum, Retention};
 use ldrs_storage::build_store;
-use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
-// maintaining this so clients do not break
-#[derive(Args, Deserialize, Debug)]
-pub struct DeltaLoad {
+#[derive(Subcommand)]
+enum DeltaCommands {
+    /// Vacuum every delta destination a config names
+    Vacuum(VacuumLdArgs),
+    /// Vacuum a single delta table
+    VacuumTable(VacuumTableArgs),
+}
+
+#[derive(Args)]
+struct VacuumLdArgs {
+    #[command(flatten)]
+    config: ConfigArgs,
+    #[command(flatten)]
+    vacuum: VacuumArgs,
+}
+
+#[derive(Args)]
+struct VacuumTableArgs {
+    /// Table root object_store URL
+    #[arg(long)]
+    url: String,
+    #[command(flatten)]
+    vacuum: VacuumArgs,
+}
+
+#[derive(Args)]
+struct VacuumArgs {
+    /// Retention period for vacuuming, e.g. "7 days". If not specified, the default retention period will be used. Cannot be used with --retention-unchecked.
+    #[arg(long, value_parser = ldrs_delta::parse_retention)]
+    retention: Option<Duration>,
+    /// Retention period for vacuuming, e.g. "7 days". If specified, this will override the default retention period. Cannot be used with --retention.
+    #[arg(long, conflicts_with = "retention", value_parser = ldrs_delta::parse_retention)]
+    retention_unchecked: Option<Duration>,
     #[arg(short, long)]
-    pub delta_root: String,
-    #[arg(short, long)]
-    pub file: String,
-    #[arg(short, long)]
-    pub table_name: String,
+    /// Just report what would be deleted.
+    dry_run: bool,
+}
+
+impl VacuumArgs {
+    fn retention(&self) -> Retention {
+        match (self.retention, self.retention_unchecked) {
+            (None, None) => Retention::TableDefault,
+            (Some(d), None) => Retention::At(d),
+            (None, Some(d)) => Retention::Unchecked(d),
+            (Some(_), Some(_)) => unreachable!("clap rejects both retention flags"),
+        }
+    }
 }
 
 #[derive(Args)]
 struct ConfigArgs {
     #[arg(short, long)]
     config: String,
-    /// Run only these tables, by `name`, comma-separated (e.g. --select public.users,public.orders). Omit to run every table in the config.
+    /// Run only these tables, by 'name', comma-separated (e.g. --select public.users,public.orders). Omit to run every table in the config.
     #[arg(long, value_delimiter = ',')]
     select: Option<Vec<String>>,
 }
@@ -90,6 +131,11 @@ enum Destination {
         #[command(subcommand)]
         command: SnowflakeCommands,
     },
+    /// Delta table maintenance
+    Delta {
+        #[command(subcommand)]
+        command: DeltaCommands,
+    },
     /// Singular load from inline config and/or cli args
     Run(RunArgs),
     /// Discover available sources, destinations, and config options. Start here for one-off runs.
@@ -110,6 +156,44 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
                 Ok((k, v))
             }
         })
+}
+
+/// Vacuum each target in turn. One table's failure is collected
+async fn run_vacuum(
+    targets: Vec<(String, String)>,
+    args: &VacuumArgs,
+    cloud_io: &tokio::runtime::Handle,
+) -> Result<(), anyhow::Error> {
+    let retention = args.retention();
+    let mut failed = Vec::new();
+    for (name, table_path) in targets {
+        info!(table = %name, path = %table_path, "vacuuming");
+        match vacuum(&table_path, retention, args.dry_run, cloud_io).await {
+            Ok(outcome) => info!(
+                table = %name,
+                listed = outcome.files_listed,
+                kept = outcome.files_kept,
+                selected = outcome.files_selected,
+                deleted = outcome.files_deleted,
+                retention_secs = outcome.retention_used.as_secs(),
+                dry_run = outcome.dry_run,
+                errors = outcome.delete_errors.len(),
+                "vacuum complete"
+            ),
+            Err(e) => {
+                error!(table = %name, "vacuum failed: {e}");
+                failed.push(name);
+            }
+        }
+    }
+    match failed.is_empty() {
+        true => Ok(()),
+        false => Err(anyhow::anyhow!(
+            "vacuum failed for {} table(s): {}",
+            failed.len(),
+            failed.join(", ")
+        )),
+    }
 }
 
 fn build_run_block(args: &RunArgs) -> Result<Value, anyhow::Error> {
@@ -194,7 +278,30 @@ fn main() -> Result<(), anyhow::Error> {
                         .with_context(|| format!("Failed to read config file: {}", args.config))?;
                     let ldrs_env = get_all_ldrs_env_vars();
                     let configs = parse_yaml_config(&config_string, &ldrs_env)?;
-                    execute_configs(configs, args.select, &ldrs_env, &rt.handle()).await
+                    execute_configs(configs, args.select, &ldrs_env, rt.handle()).await
+                }
+                Destination::Delta {
+                    command: DeltaCommands::Vacuum(args),
+                } => {
+                    let config_string =
+                        fs::read_to_string(&args.config.config).with_context(|| {
+                            format!("Failed to read config file: {}", args.config.config)
+                        })?;
+                    let ldrs_env = get_all_ldrs_env_vars();
+                    let configs = parse_yaml_config(&config_string, &ldrs_env)?;
+                    let targets = resolve_delta_targets(configs, args.config.select, &ldrs_env)?;
+                    run_vacuum(targets, &args.vacuum, rt.handle()).await
+                }
+                Destination::Delta {
+                    command: DeltaCommands::VacuumTable(args),
+                } => {
+                    let table_path = ldrs::delta::storage_url(&args.url).to_string();
+                    run_vacuum(
+                        vec![(args.url.clone(), table_path)],
+                        &args.vacuum,
+                        rt.handle(),
+                    )
+                    .await
                 }
                 Destination::Run(args) => {
                     let ldrs_env = get_all_ldrs_env_vars();
@@ -214,7 +321,7 @@ fn main() -> Result<(), anyhow::Error> {
                         }],
                         None,
                         &ldrs_env,
-                        &rt.handle(),
+                        rt.handle(),
                     )
                     .await
                 }
@@ -309,7 +416,7 @@ fn main() -> Result<(), anyhow::Error> {
     let end = std::time::Instant::now();
     if is_data_command {
         match &command_exec {
-            Ok(()) => info!("Time to load: {:?}", end - start),
+            Ok(()) => info!("Execution time: {:?}", end - start),
             Err(e) => error!("Failed after {:?}: {:#}", end - start, e),
         }
     }

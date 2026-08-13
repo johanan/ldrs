@@ -1,7 +1,9 @@
 use delta_kernel::expressions::Scalar;
 use futures::TryStreamExt;
-use ldrs::ldrs_config::{execute_configs, parse_yaml_config};
-use ldrs_delta::{delta_stats_to_json, overwrite_delta, parquet_metadata_to_delta_stats};
+use ldrs::ldrs_config::{execute_configs, parse_yaml_config, resolve_delta_targets};
+use ldrs_delta::{
+    delta_stats_to_json, overwrite_delta, parquet_metadata_to_delta_stats, vacuum, Retention,
+};
 use ldrs_parquet::builder_from_string;
 use ldrs_test_fixtures::{data_url, fixture, fixture_url};
 
@@ -453,7 +455,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await
     .unwrap();
@@ -555,7 +557,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await
     .unwrap();
@@ -596,7 +598,7 @@ tables:
         parse_yaml_config(&config, &ldrs_env).unwrap(),
         None,
         &ldrs_env,
-        &rt.handle(),
+        rt.handle(),
     )
     .await
     .unwrap();
@@ -738,4 +740,436 @@ async fn test_overwrite_writes_checkpoint_past_interval() {
     );
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+/// The path of the single `add` in a commit.
+fn added_path(log_json: &str) -> String {
+    std::fs::read_to_string(log_json)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|v| {
+            v.get("add")
+                .map(|a| a["path"].as_str().unwrap().to_string())
+        })
+        .expect("commit should carry an add")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_vacuum_deletes_orphans_and_keeps_referenced_files() {
+    let source_path = fixture_url("public.users/public.users.snappy.parquet");
+    let table_path = fixture("delta_writes/users_vacuum/").display().to_string();
+    let table_url = fixture_url("delta_writes/users_vacuum/");
+    let _ = std::fs::remove_dir_all(&table_path);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // v0 creates the table, v1 adds a file, v2 tombstones it and adds another
+    for _ in 0..2 {
+        let builder = builder_from_string(source_path.clone(), rt.handle().clone())
+            .await
+            .unwrap();
+        let schema = builder.schema().clone();
+        let stream = builder
+            .with_batch_size(1024)
+            .build()
+            .unwrap()
+            .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
+        overwrite_delta(&table_url, schema, stream, None, None, rt.handle())
+            .await
+            .unwrap();
+    }
+
+    let orphan = added_path(&format!(
+        "{}_delta_log/00000000000000000001.json",
+        table_path
+    ));
+    let live = added_path(&format!(
+        "{}_delta_log/00000000000000000002.json",
+        table_path
+    ));
+    assert_ne!(orphan, live);
+
+    // The files were written seconds ago, so the seven-day default puts both inside the window.
+    let protected = vacuum(&table_url, Retention::TableDefault, false, rt.handle())
+        .await
+        .unwrap();
+    assert_eq!(
+        protected.files_selected, 0,
+        "retention protects an orphan that is younger than the cutoff"
+    );
+    assert!(
+        std::path::Path::new(&format!("{}{}", table_path, orphan)).exists(),
+        "the orphan survives its retention window"
+    );
+
+    // A zero window puts the cutoff at now, so the same orphan is past it.
+    let dry = vacuum(
+        &table_url,
+        Retention::Unchecked(std::time::Duration::ZERO),
+        true,
+        rt.handle(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dry.files_selected, 1, "the orphan is now past the cutoff");
+    assert_eq!(dry.files_deleted, 0, "a dry run deletes nothing");
+    assert!(
+        std::path::Path::new(&format!("{}{}", table_path, orphan)).exists(),
+        "a dry run leaves the orphan in place"
+    );
+
+    let report = vacuum(
+        &table_url,
+        Retention::Unchecked(std::time::Duration::ZERO),
+        false,
+        rt.handle(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        report.files_deleted, 1,
+        "only the tombstoned file is deleted"
+    );
+    assert!(report.delete_errors.is_empty());
+    assert!(
+        !std::path::Path::new(&format!("{}{}", table_path, orphan)).exists(),
+        "the tombstoned file should be gone"
+    );
+    assert!(
+        std::path::Path::new(&format!("{}{}", table_path, live)).exists(),
+        "the file the snapshot references must survive"
+    );
+    assert!(
+        std::path::Path::new(&format!(
+            "{}_delta_log/00000000000000000002.json",
+            table_path
+        ))
+        .exists(),
+        "the log is skipped, not swept"
+    );
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_vacuum_refuses_retention_under_the_table_floor() {
+    let source_path = fixture_url("public.users/public.users.snappy.parquet");
+    let table_path = fixture("delta_writes/users_vacuum_floor/")
+        .display()
+        .to_string();
+    let table_url = fixture_url("delta_writes/users_vacuum_floor/");
+    let _ = std::fs::remove_dir_all(&table_path);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let builder = builder_from_string(source_path, rt.handle().clone())
+        .await
+        .unwrap();
+    let schema = builder.schema().clone();
+    let stream = builder
+        .with_batch_size(1024)
+        .build()
+        .unwrap()
+        .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
+    overwrite_delta(&table_url, schema, stream, None, None, rt.handle())
+        .await
+        .unwrap();
+
+    let err = vacuum(
+        &table_url,
+        Retention::At(std::time::Duration::from_secs(60)),
+        false,
+        rt.handle(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("shorter than the table's"),
+        "got: {err}"
+    );
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_overwrite_preserves_table_properties() {
+    // The merge turns on deletion vectors in `metaData.configuration`; the overwrite that follows
+    // rewrites `metaData`, and has to carry that configuration forward rather than replace it.
+    let merge_config = r#"
+src: file
+dest: delta.merge
+src_defaults:
+  filename: "{{ name }}/{{ name }}.snappy.parquet"
+
+tables:
+  - name: public.numbers
+    delta.merge_keys: [bigint_value]
+"#;
+    let overwrite_config = r#"
+src: file
+dest: delta.overwrite
+src_defaults:
+  filename: "{{ name }}/{{ name }}.snappy.parquet"
+
+tables:
+  - name: public.numbers
+"#;
+
+    let dest_url = fixture_url("delta_writes/config_delta_properties_root/");
+    let delta_root = fixture("delta_writes/config_delta_properties_root/")
+        .display()
+        .to_string();
+    let table_path = format!("{}/public.numbers/", delta_root);
+    let _ = std::fs::remove_dir_all(&table_path);
+
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), data_url()),
+        ("LDRS_DEST".to_string(), dest_url),
+    ];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    for config in [merge_config, overwrite_config] {
+        execute_configs(
+            parse_yaml_config(config, &ldrs_env).unwrap(),
+            None,
+            &ldrs_env,
+            rt.handle(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let configuration_at = |version: u64| -> serde_json::Value {
+        std::fs::read_to_string(format!("{}_delta_log/{:020}.json", table_path, version))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find_map(|v| v.get("metaData").map(|m| m["configuration"].clone()))
+            .expect("commit should carry metaData")
+    };
+
+    assert_eq!(
+        configuration_at(1)["delta.enableDeletionVectors"],
+        "true",
+        "the merge should have enabled deletion vectors at v1"
+    );
+    assert_eq!(
+        configuration_at(2)["delta.enableDeletionVectors"],
+        "true",
+        "the overwrite at v2 must not drop the property the merge set"
+    );
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_overwrite_preserves_partition_columns() {
+    // ldrs never writes a partitioned table, so the partitioning is introduced by hand: v0 comes
+    // from an overwrite, v1 restates its metaData with `partitionColumns`, and the overwrite at v2
+    // has to carry that forward.
+    let config = r#"
+src: file
+dest: delta.overwrite
+src_defaults:
+  filename: "{{ name }}/{{ name }}.snappy.parquet"
+
+tables:
+  - name: public.numbers
+"#;
+
+    let dest_url = fixture_url("delta_writes/config_delta_partitions_root/");
+    let delta_root = fixture("delta_writes/config_delta_partitions_root/")
+        .display()
+        .to_string();
+    let table_path = format!("{}/public.numbers/", delta_root);
+    let _ = std::fs::remove_dir_all(&table_path);
+
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), data_url()),
+        ("LDRS_DEST".to_string(), dest_url),
+    ];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let run = async || {
+        execute_configs(
+            parse_yaml_config(config, &ldrs_env).unwrap(),
+            None,
+            &ldrs_env,
+            rt.handle(),
+        )
+        .await
+        .unwrap();
+    };
+
+    let commit_path = |version: u64| format!("{}_delta_log/{:020}.json", table_path, version);
+    let metadata_at = |version: u64| -> serde_json::Value {
+        std::fs::read_to_string(commit_path(version))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find_map(|v| v.get("metaData").cloned())
+            .expect("commit should carry metaData")
+    };
+
+    run().await;
+    assert_eq!(
+        metadata_at(0)["partitionColumns"],
+        serde_json::json!([]),
+        "ldrs creates unpartitioned tables"
+    );
+
+    let mut partitioned = metadata_at(0);
+    partitioned["partitionColumns"] = serde_json::json!(["bigint_value"]);
+    std::fs::write(
+        commit_path(1),
+        format!("{}\n", serde_json::json!({ "metaData": partitioned })),
+    )
+    .unwrap();
+
+    run().await;
+    assert_eq!(
+        metadata_at(2)["partitionColumns"],
+        serde_json::json!(["bigint_value"]),
+        "the overwrite at v2 must not drop the partitioning named at v1"
+    );
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+#[test]
+fn test_resolve_delta_targets_picks_delta_destinations_only() {
+    // A pq destination sits alongside the delta one; resolving it would need its own env, so the
+    // filter has to happen before resolution rather than after.
+    let config = r#"
+version: 2
+src: file
+src_defaults:
+  filename: "{{ name }}/{{ name }}.snappy.parquet"
+
+tables:
+  - name: public.numbers
+    destinations:
+      - dest: delta.overwrite
+      - dest: pq
+        filename: "out.parquet"
+  - name: public.users
+    destinations:
+      - dest: delta.overwrite
+"#;
+
+    let dest_url = fixture_url("delta_writes/resolve_targets_root/");
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), data_url()),
+        ("LDRS_DEST_DELTA".to_string(), dest_url.clone()),
+    ];
+
+    let targets = resolve_delta_targets(
+        parse_yaml_config(config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+    )
+    .unwrap();
+
+    let names: Vec<&str> = targets.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["public.numbers", "public.users"]);
+    assert!(
+        targets
+            .iter()
+            .all(|(_, path)| path.starts_with(dest_url.trim_end_matches('/'))),
+        "every target resolves under the delta root: {targets:?}"
+    );
+
+    let selected = resolve_delta_targets(
+        parse_yaml_config(config, &ldrs_env).unwrap(),
+        Some(vec!["public.users".to_string()]),
+        &ldrs_env,
+    )
+    .unwrap();
+    assert_eq!(selected.len(), 1, "--select narrows to one table");
+    assert_eq!(selected[0].0, "public.users");
+}
+
+#[test]
+fn test_resolve_delta_targets_errors_without_a_delta_destination() {
+    let config = r#"
+src: file
+dest: pq
+src_defaults:
+  filename: "{{ name }}/{{ name }}.snappy.parquet"
+
+tables:
+  - name: public.numbers
+    filename: "out.parquet"
+"#;
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), data_url()),
+        ("LDRS_DEST".to_string(), fixture_url("delta_writes/unused/")),
+    ];
+
+    let err = resolve_delta_targets(
+        parse_yaml_config(config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("no delta destinations"), "{err}");
+}
+
+#[test]
+fn test_resolve_delta_targets_ignores_load_only_fields() {
+    // batch_version renders against env the orchestrator sets during a load. Vacuum runs out of
+    // band without it, and never reads the field, so resolution must not touch it.
+    let config = r#"
+src: file
+dest: delta.merge
+src_defaults:
+  filename: "{{ name }}/{{ name }}.snappy.parquet"
+
+tables:
+  - name: public.numbers
+    delta.merge_keys: [bigint_value]
+    delta.txn_mode: processing_time
+    delta.batch_version: "{{ run_id }}"
+"#;
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), data_url()),
+        (
+            "LDRS_DEST".to_string(),
+            fixture_url("delta_writes/load_only_fields_root/"),
+        ),
+    ];
+
+    let targets = resolve_delta_targets(
+        parse_yaml_config(config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+    )
+    .unwrap();
+    assert_eq!(targets.len(), 1);
+    assert!(targets[0].1.ends_with("public.numbers"), "{targets:?}");
 }
