@@ -417,7 +417,9 @@ fn read_cdc_paths(
 }
 
 fn decode_log_path(path: &str) -> Result<String, anyhow::Error> {
-    let _ = url::Url::parse(path).with_context(|| "cannot vacuum a table that references the absolute path {path}; its files are outside the table root")?;
+    if url::Url::parse(path).is_ok() {
+        anyhow::bail!("cannot vacuum a table that references the absolute path {path}. Its files are outside the table root");
+    }
     Ok(String::from(Path::from_url_path(path)?))
 }
 
