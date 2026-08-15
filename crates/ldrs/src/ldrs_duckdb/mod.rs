@@ -127,38 +127,85 @@ fn ambient_option(ambient: &[(String, OsString)], name: &str, keys: &[&str]) -> 
         .map(|value| format!("{name} '{value}'"))
 }
 
+/// Truthy per object_store's bool parsing, which is where these variables come from.
+fn is_truthy(value: &OsString) -> bool {
+    matches!(
+        value.to_str().map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "on" | "yes" | "y")
+    )
+}
+
+/// duckdb spells an endpoint as three options where object_store has one URL: the scheme moves
+/// into `USE_SSL`, the rest into `ENDPOINT`, and a custom endpoint flips `URL_STYLE` to path.
+fn s3_endpoint_options(ambient: &[(String, OsString)]) -> Vec<String> {
+    let mut options = Vec::new();
+    let endpoint = get_env_value(
+        ambient,
+        &["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL", "AWS_ENDPOINT"],
+    )
+    .and_then(|(_, value)| value.to_str());
+
+    if let Some(value) = endpoint {
+        let (scheme, host) = match value.split_once("://") {
+            Some((scheme, host)) => (Some(scheme), host),
+            None => (None, value),
+        };
+        options.push(format!("ENDPOINT '{}'", host.trim_end_matches('/')));
+        if scheme.is_some_and(|scheme| scheme.eq_ignore_ascii_case("http")) {
+            options.push("USE_SSL false".to_string());
+        }
+    }
+
+    match get_env_value(ambient, &["AWS_VIRTUAL_HOSTED_STYLE_REQUEST"]) {
+        Some((_, value)) if is_truthy(value) => options.push("URL_STYLE 'vhost'".to_string()),
+        Some(_) => options.push("URL_STYLE 'path'".to_string()),
+        None if endpoint.is_some() => options.push("URL_STYLE 'path'".to_string()),
+        None => {}
+    }
+
+    options
+}
+
 /// `CREATE SECRET` for the read location's scheme, or `None` for local and plain HTTP. Credentials
-/// are never emitted: `credential_chain` walks the same provider chain object_store uses. Only
-/// addressing keys are forwarded, read from the variables object_store reads them from.
+/// are never emitted: `credential_chain` walks the same provider chain object_store uses, and a
+/// truthy skip-signature variable selects the anonymous `config` provider instead. Only addressing
+/// keys are forwarded, read from the variables object_store reads them from.
 fn secret_statement(url: &str, ambient: &[(String, OsString)]) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
     let (scheme, _) = ObjectStoreScheme::parse(&parsed).ok()?;
-    let mut options = vec!["PROVIDER credential_chain".to_string()];
 
-    let secret_type = match scheme {
+    let (secret_type, skip_signature_key, addressing) = match scheme {
         ObjectStoreScheme::MicrosoftAzure => {
             let short_form = matches!(parsed.scheme(), "az" | "azure");
-            options.extend(
-                short_form
-                    .then(|| {
-                        ambient_option(ambient, "ACCOUNT_NAME", &["AZURE_STORAGE_ACCOUNT_NAME"])
-                    })
-                    .flatten(),
-            );
-            "azure"
+            let addressing = short_form
+                .then(|| ambient_option(ambient, "ACCOUNT_NAME", &["AZURE_STORAGE_ACCOUNT_NAME"]))
+                .flatten()
+                .into_iter()
+                .collect();
+            ("azure", "AZURE_SKIP_SIGNATURE", addressing)
         }
         ObjectStoreScheme::AmazonS3 => {
-            options.extend(ambient_option(
+            let mut addressing = s3_endpoint_options(ambient);
+            addressing.extend(ambient_option(
                 ambient,
-                "ENDPOINT",
-                &["AWS_ENDPOINT_URL", "AWS_ENDPOINT"],
+                "REGION",
+                &["AWS_REGION", "AWS_DEFAULT_REGION"],
             ));
-            options.extend(ambient_option(ambient, "REGION", &["AWS_REGION"]));
-            "s3"
+            ("s3", "AWS_SKIP_SIGNATURE", addressing)
         }
-        ObjectStoreScheme::GoogleCloudStorage => "gcs",
+        ObjectStoreScheme::GoogleCloudStorage => ("gcs", "GOOGLE_SKIP_SIGNATURE", Vec::new()),
         _ => return None,
     };
+
+    let anonymous =
+        get_env_value(ambient, &[skip_signature_key]).is_some_and(|(_, value)| is_truthy(value));
+    let provider = match anonymous {
+        true => "PROVIDER config",
+        false => "PROVIDER credential_chain",
+    };
+
+    let mut options = vec![provider.to_string()];
+    options.extend(addressing);
 
     Some(format!(
         "CREATE SECRET ldrs_src (TYPE {secret_type}, {}, SCOPE '{url}');",
@@ -314,17 +361,107 @@ mod tests {
     }
 
     #[test]
-    fn s3_forwards_endpoint_and_region() {
+    fn s3_splits_endpoint_into_host_ssl_and_path_style() {
         let ambient = env_pairs(&[
             ("AWS_ENDPOINT_URL", "http://minio:9000"),
             ("AWS_REGION", "us-east-1"),
         ]);
         let secret = secret_statement("s3://bucket/", &ambient).unwrap();
+        assert!(secret.contains("ENDPOINT 'minio:9000'"), "got: {secret}");
+        assert!(secret.contains("USE_SSL false"), "got: {secret}");
+        assert!(secret.contains("URL_STYLE 'path'"), "got: {secret}");
+        assert!(secret.contains("REGION 'us-east-1'"), "got: {secret}");
+    }
+
+    #[test]
+    fn s3_https_endpoint_keeps_ssl_default() {
+        let ambient = env_pairs(&[("AWS_ENDPOINT_URL", "https://minio.example.com/")]);
+        let secret = secret_statement("s3://bucket/", &ambient).unwrap();
         assert!(
-            secret.contains("ENDPOINT 'http://minio:9000'"),
+            secret.contains("ENDPOINT 'minio.example.com'"),
+            "got: {secret}"
+        );
+        assert!(!secret.contains("USE_SSL"), "got: {secret}");
+        assert!(secret.contains("URL_STYLE 'path'"), "got: {secret}");
+    }
+
+    #[test]
+    fn s3_service_endpoint_wins_over_generic() {
+        let ambient = env_pairs(&[
+            ("AWS_ENDPOINT", "http://generic:1"),
+            ("AWS_ENDPOINT_URL_S3", "http://service:9000"),
+        ]);
+        let secret = secret_statement("s3://bucket/", &ambient).unwrap();
+        assert!(secret.contains("ENDPOINT 'service:9000'"), "got: {secret}");
+    }
+
+    #[test]
+    fn s3_url_style_follows_the_explicit_variable() {
+        let vhost = env_pairs(&[
+            ("AWS_ENDPOINT_URL", "https://minio.example.com"),
+            ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "true"),
+        ]);
+        let secret = secret_statement("s3://bucket/", &vhost).unwrap();
+        assert!(secret.contains("URL_STYLE 'vhost'"), "got: {secret}");
+
+        let path = env_pairs(&[("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "false")]);
+        let secret = secret_statement("s3://bucket/", &path).unwrap();
+        assert!(secret.contains("URL_STYLE 'path'"), "got: {secret}");
+    }
+
+    #[test]
+    fn s3_without_endpoint_emits_no_style_or_ssl() {
+        let secret = secret_statement("s3://bucket/", &[]).unwrap();
+        assert!(!secret.contains("ENDPOINT"), "got: {secret}");
+        assert!(!secret.contains("USE_SSL"), "got: {secret}");
+        assert!(!secret.contains("URL_STYLE"), "got: {secret}");
+    }
+
+    #[test]
+    fn s3_region_falls_back_to_default_region() {
+        let fallback = env_pairs(&[("AWS_DEFAULT_REGION", "eu-west-1")]);
+        let secret = secret_statement("s3://bucket/", &fallback).unwrap();
+        assert!(secret.contains("REGION 'eu-west-1'"), "got: {secret}");
+
+        let both = env_pairs(&[
+            ("AWS_DEFAULT_REGION", "eu-west-1"),
+            ("AWS_REGION", "us-east-2"),
+        ]);
+        let secret = secret_statement("s3://bucket/", &both).unwrap();
+        assert!(secret.contains("REGION 'us-east-2'"), "got: {secret}");
+    }
+
+    #[test]
+    fn skip_signature_selects_the_anonymous_config_provider() {
+        let ambient = env_pairs(&[("AWS_SKIP_SIGNATURE", "true"), ("AWS_REGION", "us-east-1")]);
+        let secret = secret_statement("s3://bucket/", &ambient).unwrap();
+        assert!(
+            secret.starts_with("CREATE SECRET ldrs_src (TYPE s3, PROVIDER config"),
             "got: {secret}"
         );
         assert!(secret.contains("REGION 'us-east-1'"), "got: {secret}");
+
+        let azure = env_pairs(&[
+            ("AZURE_SKIP_SIGNATURE", "1"),
+            ("AZURE_STORAGE_ACCOUNT_NAME", "mylake"),
+        ]);
+        let secret = secret_statement("az://lake/", &azure).unwrap();
+        assert!(secret.contains("PROVIDER config"), "got: {secret}");
+        assert!(secret.contains("ACCOUNT_NAME 'mylake'"), "got: {secret}");
+
+        let gcs = env_pairs(&[("GOOGLE_SKIP_SIGNATURE", "yes")]);
+        let secret = secret_statement("gs://bucket/", &gcs).unwrap();
+        assert!(secret.contains("PROVIDER config"), "got: {secret}");
+    }
+
+    #[test]
+    fn falsy_skip_signature_keeps_the_credential_chain() {
+        let ambient = env_pairs(&[("AWS_SKIP_SIGNATURE", "false")]);
+        let secret = secret_statement("s3://bucket/", &ambient).unwrap();
+        assert!(
+            secret.contains("PROVIDER credential_chain"),
+            "got: {secret}"
+        );
     }
 
     #[test]

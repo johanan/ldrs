@@ -1,6 +1,6 @@
 [package]
 name = "ldrs"
-version = "0.22.2"
+version = "0.22.3"
 edition.workspace = true
 repository.workspace = true
 authors.workspace = true

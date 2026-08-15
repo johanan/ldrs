@@ -1,9 +1,9 @@
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use ldrs_storage::{base_or_relative_path, build_store};
+use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
-use parquet::arrow::async_writer::ParquetObjectWriter;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
@@ -25,7 +25,7 @@ pub struct ParquetSink {
     max_bytes: Option<usize>,
     namer: FileNamer,
     // running state the split-writer loop locals
-    writer: Option<AsyncArrowWriter<ParquetObjectWriter>>,
+    writer: Option<AsyncArrowWriter<BufWriter>>,
     results: Vec<(String, ParquetMetaData, u64)>,
     file_index: usize,
     current_rows: usize,
@@ -96,7 +96,7 @@ impl ParquetSink {
         if self.writer.is_none() {
             self.current_filename = (self.namer)(self.file_index)?;
             let file_path = join_relative(&self.base_path, &self.current_filename);
-            let parq_writer = ParquetObjectWriter::new(self.store.clone(), file_path);
+            let parq_writer = BufWriter::new(self.store.clone(), file_path);
             self.writer = Some(AsyncArrowWriter::try_new(
                 parq_writer,
                 self.schema.clone(),
@@ -157,7 +157,7 @@ impl ParquetSink {
         );
         let filename = (self.namer)(0)?;
         let file_path = join_relative(&self.base_path, &filename);
-        let parq_writer = ParquetObjectWriter::new(self.store, file_path);
+        let parq_writer = BufWriter::new(self.store, file_path);
         let mut writer = AsyncArrowWriter::try_new(parq_writer, self.schema, Some(self.props))?;
         let metadata = writer.finish().await?;
         let size = writer.bytes_written() as u64;

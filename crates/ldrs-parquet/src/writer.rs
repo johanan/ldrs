@@ -4,16 +4,19 @@ use futures::stream::StreamExt;
 use futures::Stream;
 use ldrs_arrow::{transform_batch, ArrowColumnTransformStrategy};
 use ldrs_storage::{base_or_relative_path, build_store};
+use object_store::buffered::BufWriter;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
-use parquet::arrow::async_reader::ParquetObjectReader;
-use parquet::arrow::async_writer::ParquetObjectWriter;
+use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
 use std::pin::pin;
 use std::sync::Arc;
+use tokio::runtime::Handle;
+
+use crate::store_reader::{SpawnedStoreReader, StoreReader};
 
 use parquet::arrow::RowNumber;
 pub fn default_writer_props() -> WriterProperties {
@@ -53,7 +56,7 @@ where
 
     let url = base_or_relative_path(file_path)?;
     let (store, path, _) = build_store(&url)?;
-    let parq_writer = ParquetObjectWriter::new(store, path);
+    let parq_writer = BufWriter::new(store, path);
     let props = writer_props.unwrap_or(default_writer_props());
 
     let mut writer = AsyncArrowWriter::try_new(parq_writer, schema.clone(), Some(props))?;
@@ -99,7 +102,7 @@ where
     let mut results: Vec<(String, ParquetMetaData)> = Vec::new();
     let mut file_index: usize = 0;
     let mut current_rows: usize = 0;
-    let mut writer: Option<AsyncArrowWriter<ParquetObjectWriter>> = None;
+    let mut writer: Option<AsyncArrowWriter<BufWriter>> = None;
     let mut current_filename = String::new();
 
     let mut pinned_stream = pin!(stream);
@@ -115,7 +118,7 @@ where
             None => {
                 current_filename = name_file(file_index);
                 let file_path = base_path.clone().join(current_filename.as_str());
-                let parq_writer = ParquetObjectWriter::new(store.clone(), file_path);
+                let parq_writer = BufWriter::new(store.clone(), file_path);
                 writer = Some(AsyncArrowWriter::try_new(
                     parq_writer,
                     schema.clone(),
@@ -155,11 +158,10 @@ pub async fn read_parquet_metadata(
     store: Arc<dyn ObjectStore>,
     path: &object_store::path::Path,
     size: u64,
+    handle: Handle,
 ) -> Result<Arc<ParquetMetaData>, anyhow::Error> {
-    // Passing the file size makes the reader use bounded range requests instead of a suffix range,
-    let reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
-    let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-    Ok(builder.metadata().clone())
+    let mut reader = StoreReader::spawned(store, path.clone(), size, handle);
+    Ok(reader.get_metadata(None).await?)
 }
 
 pub async fn stream_projected_parquet(
@@ -168,16 +170,15 @@ pub async fn stream_projected_parquet(
     columns: &[String],
     row_groups: Option<Vec<usize>>,
     size: u64,
-) -> Result<
-    parquet::arrow::async_reader::ParquetRecordBatchStream<ParquetObjectReader>,
-    anyhow::Error,
-> {
+    handle: Handle,
+) -> Result<parquet::arrow::async_reader::ParquetRecordBatchStream<SpawnedStoreReader>, anyhow::Error>
+{
     let row_number_field = Arc::new(
         Field::new(ROW_NUMBER_COLUMN, DataType::Int64, false).with_extension_type(RowNumber),
     );
     let options = ArrowReaderOptions::new().with_virtual_columns(vec![row_number_field])?;
 
-    let reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
+    let reader = StoreReader::spawned(store, path.clone(), size, handle);
     let mut builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
 
     let mask = parquet::arrow::ProjectionMask::columns(

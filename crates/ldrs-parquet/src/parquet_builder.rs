@@ -1,18 +1,16 @@
 use anyhow::{Context, Error};
 use ldrs_storage::{base_or_relative_path, build_store};
 use object_store::ObjectStoreExt;
-use parquet::arrow::{
-    arrow_reader::ArrowReaderBuilder,
-    async_reader::{AsyncReader, ParquetObjectReader},
-    ParquetRecordBatchStreamBuilder,
-};
+use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use tokio::runtime::Handle;
 use url::Url;
 
+use crate::store_reader::{SpawnedStoreReader, StoreReader};
+
 pub async fn builder_from_url(
     url: Url,
-    handle: tokio::runtime::Handle,
-) -> Result<ArrowReaderBuilder<AsyncReader<ParquetObjectReader>>, anyhow::Error> {
+    handle: Handle,
+) -> Result<ParquetRecordBatchStreamBuilder<SpawnedStoreReader>, anyhow::Error> {
     let (store, path, _) = build_store(&url)?;
 
     let meta = store
@@ -20,9 +18,7 @@ pub async fn builder_from_url(
         .await
         .with_context(|| "Could not find file in store")?;
 
-    let reader = ParquetObjectReader::new(store, meta.location)
-        .with_file_size(meta.size)
-        .with_runtime(handle);
+    let reader = StoreReader::spawned(store, meta.location, meta.size, handle);
 
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await
@@ -34,7 +30,7 @@ pub async fn builder_from_url(
 pub async fn builder_from_string(
     path: String,
     handle: Handle,
-) -> Result<ParquetRecordBatchStreamBuilder<ParquetObjectReader>, Error> {
+) -> Result<ParquetRecordBatchStreamBuilder<SpawnedStoreReader>, Error> {
     let path_parsed = base_or_relative_path(&path)?;
     builder_from_url(path_parsed, handle).await
 }

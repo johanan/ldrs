@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.3] - 2026-08-15
+
+### Bug Fixes
+
+- *(duckdb)* Fixed s3 credentials
+
+Used object_store and mapped these over to the correct duckdb
+credentials.
+
+
+### Dependencies
+
+- *(deps)* Bump delta-kernel to 0.26 and parquet to 59
+
+Upgrading core dependencies to stay on the leading edge.
+
+
+### Refactor
+
+- *(parquet)* Replace deprecated reader and writer
+
+Parquet 59 introduced a new type SpawnedReader. This makes the handle
+usage more clear.
+
+The writer we used also is deprecated and it was replaced with BufWriter
+
+
 ## [0.22.2] - 2026-08-13
 
 ### Bug Fixes

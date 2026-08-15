@@ -525,11 +525,14 @@ mod tests {
                 Some("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12"),
                 None,
             ])),
-            Arc::new(FixedSizeBinaryArray::from(vec![
-                Some(bytes1.as_slice()),
-                Some(bytes2.as_slice()),
-                None,
-            ])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from(vec![
+                    Some(bytes1.as_slice()),
+                    Some(bytes2.as_slice()),
+                    None,
+                ])
+                .unwrap(),
+            ),
         );
     }
 
@@ -543,11 +546,14 @@ mod tests {
             ColumnType::Uuid,
             ColumnType::Text,
             DataType::FixedSizeBinary(16),
-            Arc::new(FixedSizeBinaryArray::from(vec![
-                Some(bytes1.as_slice()),
-                Some(bytes2.as_slice()),
-                None,
-            ])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from(vec![
+                    Some(bytes1.as_slice()),
+                    Some(bytes2.as_slice()),
+                    None,
+                ])
+                .unwrap(),
+            ),
             Arc::new(StringArray::from(vec![
                 Some("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
                 Some("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12"),

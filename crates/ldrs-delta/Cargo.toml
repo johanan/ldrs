@@ -17,7 +17,7 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
 crc = "3.4"
-delta_kernel = { workspace = true, features = ["internal-api", "arrow-58"] }
+delta_kernel = { workspace = true, features = ["internal-api", "arrow-59"] }
 delta_kernel_default_engine = { workspace = true }
 futures.workspace = true
 object_store.workspace = true

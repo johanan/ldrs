@@ -12,6 +12,7 @@ ldrs-storage = { path = "../ldrs-storage" }
 
 anyhow.workspace = true
 arrow.workspace = true
+bytes.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 futures = "0.3.32"

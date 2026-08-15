@@ -3,11 +3,13 @@ set -euo pipefail
 
 INCLUDE='crates/**'
 CHANGELOG='crates/ldrs/CHANGELOG.md'
+TAG_PATTERN='ldrs-v[0-9].*'
 
-NEXT=$(git-cliff --include-path "$INCLUDE" --unreleased --bumped-version)
+NEXT=$(git-cliff --tag-pattern "$TAG_PATTERN" --include-path "$INCLUDE" --unreleased --bumped-version)
 echo "Next version: $NEXT"
 
-git-cliff --include-path "$INCLUDE" \
+git-cliff --tag-pattern "$TAG_PATTERN" \
+          --include-path "$INCLUDE" \
           --bump \
           --unreleased \
           --prepend "$CHANGELOG"

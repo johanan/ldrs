@@ -37,6 +37,8 @@ jobs:
         run: scripts/setup_test.sh
         shell: bash
       - run: cargo test
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v3"
       - name: Shutdown Postgres
         run: scripts/shutdown_test.sh
         shell: bash
