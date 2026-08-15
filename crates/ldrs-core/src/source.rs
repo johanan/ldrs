@@ -8,8 +8,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use futures::Stream;
 use ldrs_arrow::ColumnSpec;
-use ldrs_parquet::{builder_from_url, columnspec_from_parquet, get_fields};
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
+use ldrs_parquet::{builder_from_url, columnspec_from_parquet, get_fields, SpawnedStoreReader};
+use parquet::arrow::async_reader::ParquetRecordBatchStream;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use url::Url;
@@ -20,7 +20,7 @@ use crate::spawn::{resolve_schema, spawn_arrow_source};
 /// The source stream shapes the executor drives: a parquet file stream, or a pumped receiver
 /// (spawned process today; FFI / stdin later).
 pub enum StreamType {
-    Parquet(ParquetRecordBatchStream<ParquetObjectReader>),
+    Parquet(ParquetRecordBatchStream<SpawnedStoreReader>),
     Receiver(ReceiverStream<Result<RecordBatch, anyhow::Error>>),
 }
 

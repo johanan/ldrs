@@ -106,6 +106,7 @@ impl MergeStats {
 
 pub(crate) async fn build_key_set(
     store: Arc<dyn ObjectStore>,
+    cloud_io: &Handle,
     base_path: &object_store::path::Path,
     source_files: &[(String, ParquetMetaData, u64)],
     merge_keys: &[String],
@@ -128,8 +129,15 @@ pub(crate) async fn build_key_set(
 
     for (filename, _, size) in source_files {
         let path = base_path.clone().join(filename.as_str());
-        let mut stream =
-            stream_projected_parquet(store.clone(), &path, merge_keys, None, *size).await?;
+        let mut stream = stream_projected_parquet(
+            store.clone(),
+            &path,
+            merge_keys,
+            None,
+            *size,
+            cloud_io.clone(),
+        )
+        .await?;
 
         while let Some(batch) = stream.next().await {
             let batch = batch?;
@@ -207,6 +215,7 @@ pub struct DeltaMergeSink {
     // shared with `inner`: one object-store client for both the data writes and the commit
     store: Arc<dyn ObjectStore>,
     engine: Arc<dyn Engine>,
+    cloud_io: Handle,
     base_path: object_store::path::Path,
     url: Url,
     schema: SchemaRef,
@@ -243,6 +252,7 @@ impl DeltaMergeSink {
             inner,
             store,
             engine,
+            cloud_io: cloud_io.clone(),
             base_path,
             url,
             schema,
@@ -269,6 +279,7 @@ impl DeltaMergeSink {
         match commit_merge(
             &self.store,
             &self.engine,
+            &self.cloud_io,
             &self.base_path,
             &self.url,
             &self.schema,
@@ -302,6 +313,7 @@ impl DeltaMergeSink {
 async fn commit_merge(
     store: &Arc<dyn ObjectStore>,
     engine: &Arc<dyn Engine>,
+    cloud_io: &Handle,
     base_path: &object_store::path::Path,
     url: &Url,
     schema: &SchemaRef,
@@ -314,6 +326,7 @@ async fn commit_merge(
 
     let (key_set, converter) = build_key_set(
         store.clone(),
+        cloud_io,
         base_path,
         source_files,
         &merge_config.merge_keys,
@@ -364,6 +377,7 @@ async fn commit_merge(
         let file_probes = narrow_to_eligible_row_groups(
             &candidate_files,
             store,
+            cloud_io,
             base_path,
             schema,
             source_files,
@@ -374,6 +388,7 @@ async fn commit_merge(
         let (file_matches, matched_rows) = probe_targets_for_matches(
             &file_probes,
             store,
+            cloud_io,
             base_path,
             engine.as_ref(),
             snapshot.table_root(),
@@ -567,6 +582,7 @@ struct FileMatch {
 async fn probe_targets_for_matches(
     probes: &[FileProbe],
     store: &Arc<dyn ObjectStore>,
+    cloud_io: &Handle,
     base_path: &object_store::path::Path,
     engine: &dyn delta_kernel::Engine,
     table_url: &url::Url,
@@ -599,6 +615,7 @@ async fn probe_targets_for_matches(
             merge_keys,
             Some(probe.eligible_row_groups.clone()),
             probe.scan_file.size as u64,
+            cloud_io.clone(),
         )
         .await?;
 
@@ -648,6 +665,7 @@ async fn probe_targets_for_matches(
 async fn narrow_to_eligible_row_groups(
     candidates: &[ScanFile],
     store: &Arc<dyn ObjectStore>,
+    cloud_io: &Handle,
     base_path: &object_store::path::Path,
     schema: &SchemaRef,
     source_files: &[(String, ParquetMetaData, u64)],
@@ -657,7 +675,13 @@ async fn narrow_to_eligible_row_groups(
 
     for candidate in candidates {
         let path = base_path.clone().join(candidate.path.as_str());
-        let metadata = read_parquet_metadata(store.clone(), &path, candidate.size as u64).await?;
+        let metadata = read_parquet_metadata(
+            store.clone(),
+            &path,
+            candidate.size as u64,
+            cloud_io.clone(),
+        )
+        .await?;
 
         let mut eligible_rgs: Vec<usize> = (0..metadata.num_row_groups()).collect();
 
