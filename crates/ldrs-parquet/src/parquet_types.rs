@@ -1,5 +1,5 @@
 use ldrs_arrow::{ColumnSpec, TimeUnit};
-use parquet::basic::LogicalType;
+use parquet::basic::{DecimalType, LogicalType, TimestampType};
 use parquet::schema::types::Type::{GroupType, PrimitiveType};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -64,14 +64,14 @@ impl From<&parquet::basic::LogicalType> for ParquetLogicalType {
 
         match logical_type {
             LogicalType::String => ParquetLogicalType::String,
-            LogicalType::Decimal { scale, precision } => ParquetLogicalType::Decimal {
+            LogicalType::Decimal(DecimalType { scale, precision }) => ParquetLogicalType::Decimal {
                 precision: *precision,
                 scale: *scale,
             },
-            LogicalType::Timestamp {
+            LogicalType::Timestamp(TimestampType {
                 is_adjusted_to_u_t_c,
                 unit,
-            } => ParquetLogicalType::Timestamp {
+            }) => ParquetLogicalType::Timestamp {
                 unit: time_unit_from(unit),
                 is_utc: *is_adjusted_to_u_t_c,
             },
@@ -159,27 +159,29 @@ pub fn columnspec_from_parquet(field: &Arc<parquet::schema::types::Type>) -> Opt
             match basic_info {
                 bi if bi.logical_type_ref().is_some() => match bi.logical_type_ref().unwrap() {
                     LogicalType::String => Some(ColumnSpec::Text { name }),
-                    LogicalType::Timestamp {
+                    LogicalType::Timestamp(TimestampType {
                         is_adjusted_to_u_t_c: true,
                         unit,
-                    } => Some(ColumnSpec::TimestampTz {
+                    }) => Some(ColumnSpec::TimestampTz {
                         name,
                         time_unit: time_unit_from(unit),
                     }),
-                    LogicalType::Timestamp {
+                    LogicalType::Timestamp(TimestampType {
                         is_adjusted_to_u_t_c: false,
                         unit,
-                    } => Some(ColumnSpec::Timestamp {
+                    }) => Some(ColumnSpec::Timestamp {
                         name,
                         time_unit: time_unit_from(unit),
                     }),
                     LogicalType::Uuid => Some(ColumnSpec::Uuid { name }),
                     LogicalType::Json => Some(ColumnSpec::Jsonb { name }),
-                    LogicalType::Decimal { scale, precision } => Some(ColumnSpec::Numeric {
-                        name,
-                        precision: *precision,
-                        scale: *scale,
-                    }),
+                    LogicalType::Decimal(DecimalType { scale, precision }) => {
+                        Some(ColumnSpec::Numeric {
+                            name,
+                            precision: *precision,
+                            scale: *scale,
+                        })
+                    }
                     _ => None,
                 },
                 _ => match field.get_physical_type() {

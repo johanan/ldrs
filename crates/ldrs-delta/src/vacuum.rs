@@ -301,7 +301,7 @@ fn files_are_enumerable(feature: &TableFeature) -> bool {
         | ChangeDataFeed
         | V2Checkpoint => true,
         // Iceberg metadata sits outside `_delta_log` and is not named by any add action.
-        IcebergCompatV1 | IcebergCompatV2 | IcebergCompatV3 => false,
+        IcebergCompatV1 | IcebergCompatV2 | IcebergCompatV3 | AdaptiveMetadataPreview => false,
         // Commits can live outside `_delta_log`, so a snapshot read from the store may be stale
         // and a committed file could look unreferenced.
         CatalogManaged | CatalogOwnedPreview => false,
