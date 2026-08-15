@@ -4,7 +4,7 @@ set -euo pipefail
 CHANGELOG='crates/ldrs/CHANGELOG.md'
 
 VERSION=$(cargo pkgid -p ldrs | sed 's/.*[#@]//')
-TAG="v$VERSION"
+TAG="ldrs-v$VERSION"
 
 if git rev-parse "$TAG" >/dev/null 2>&1; then
   echo "Tag $TAG already exists at $(git rev-parse --short "$TAG")"

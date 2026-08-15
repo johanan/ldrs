@@ -16,6 +16,11 @@ install-path = "~/.local/bin"
 # Whether to install an updater program
 install-updater = false
 github-build-setup = "../build-setup.yml"
+# Create the GitHub Release in the announce phase so publish jobs gate it
+github-release = "announce"
+# Custom publish jobs; they run after host and before announce, and a failure
+# stops the release from being created
+publish-jobs = ["./smoke-test"]
 
 [dist.github-custom-runners]
 global = "ubuntu-22.04"
