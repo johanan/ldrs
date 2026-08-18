@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.4] - 2026-08-18
+
+### Bug Fixes
+
+- *(cli)* Added --log-format
+
+ldrs can now output as text or json when logging.
+
+Also have summary logs for parquet and postgres.
+
+- *(lua)* Require Lua modules
+
+ldrs can load lua as modules and have them loaded for lua scripts. Just
+give the process a list of lua files.
+
+This also includes all the ldrs functions, which are now loaded as:
+`local ldrs = require "ldrs"`
+
+- *(cli)* --report for JSONL run report
+
+This parameter take a local file and it will add the phase output after
+each task run. This also inspecting after a successful run and a
+failure.
+
+Always JSONL, schema is in ldrs schema finalize
+
+
+### Dependencies
+
+- *(deps)* Docs and delta
+
+Upgraded Astro to 7.2.0
+
+Upgraded delta-kernel to 0.27.1
+
+
 ## [0.22.3] - 2026-08-15
 
 ### Bug Fixes
