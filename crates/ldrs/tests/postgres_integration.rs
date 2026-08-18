@@ -95,6 +95,7 @@ async fn test_postgres_file_drop() {
             None,
             &ldrs_env,
             rt.handle(),
+            None,
         )
         .await;
         assert_eq!(ex.is_ok(), true);
@@ -148,6 +149,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await;
     assert!(ex.is_err());
@@ -202,6 +204,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
@@ -329,6 +332,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
@@ -399,6 +403,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await;
     assert!(ex.is_err(), "load should fail on the invalid post_sql");
@@ -456,6 +461,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
@@ -537,6 +543,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await
     .unwrap();

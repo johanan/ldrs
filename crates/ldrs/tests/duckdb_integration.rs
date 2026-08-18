@@ -34,6 +34,7 @@ async fn run(config: &str, ldrs_env: &[(String, String)]) -> Result<(), anyhow::
         None,
         ldrs_env,
         rt.handle(),
+        None,
     )
     .await;
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
