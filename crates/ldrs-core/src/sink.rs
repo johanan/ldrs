@@ -175,10 +175,11 @@ pub async fn finish_all(
                         .map(|metas| {
                             metas
                                 .into_iter()
-                                .map(|(name, md, _size)| FileWritten {
+                                .map(|(name, md, size)| FileWritten {
                                     full_url: qualify_file(&base_url, &name),
                                     path: name,
                                     rows: md.file_metadata().num_rows().max(0) as u64,
+                                    size_bytes: size,
                                 })
                                 .collect()
                         })

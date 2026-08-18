@@ -19,7 +19,7 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 bytes.workspace = true
 chrono.workspace = true
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
 deadpool-postgres.workspace = true
 dotenvy = "0.15.7"
 futures.workspace = true
@@ -43,7 +43,8 @@ tokio.workspace = true
 tokio-postgres.workspace = true
 tokio-stream = "0.1.18"
 tracing.workspace = true
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+strum = { version = "0.28", features = ["derive"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url.workspace = true
 uuid.workspace = true
 nom = { version = "8.0.0" }

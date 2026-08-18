@@ -229,23 +229,38 @@ const BANNER: &str = r#"
 ░░░░░  ░░░░░░░░ ░░░░░     ░░░░░░
 "#;
 
+#[derive(Clone, ValueEnum)]
+enum LogFormat {
+    /// Human-readable lines (default)
+    Text,
+    /// One JSON object per line
+    Json,
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None, before_help = BANNER)]
 struct Cli {
+    /// Log output format on stderr
+    #[arg(long, global = true, env = "LDRS_LOG_FORMAT", default_value = "text")]
+    log_format: LogFormat,
+
     #[command(subcommand)]
     destination: Option<Destination>,
 }
 
 fn main() -> Result<(), anyhow::Error> {
     let _ = dotenv();
-    fmt::Subscriber::builder()
+    let cli = Cli::parse();
+    let builder = fmt::Subscriber::builder()
         .with_writer(io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info,delta_kernel=warn")),
-        )
-        .init();
-    let cli = Cli::parse();
+        );
+    match cli.log_format {
+        LogFormat::Json => builder.json().init(),
+        LogFormat::Text => builder.init(),
+    }
 
     let Some(destination) = cli.destination else {
         Cli::command().print_help()?;
