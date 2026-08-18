@@ -24,12 +24,23 @@ pub struct SfFinalize {
     #[serde(default)]
     pub target: Option<String>,
     pub lua: String,
+    /// Lua module files loadable via `require` in this item's handler
+    #[serde(default)]
+    pub lua_modules: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Deserialize, JsonSchema)]
 #[serde(tag = "run", rename_all = "lowercase")]
 pub enum FinalizeItem {
     Sf(SfFinalize),
+}
+
+impl FinalizeItem {
+    pub fn lua_modules(&self) -> &[String] {
+        match self {
+            FinalizeItem::Sf(sf) => &sf.lua_modules,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,9 +58,25 @@ fn finalize_lua() -> Result<Lua, mlua::Error> {
     )
 }
 
-/// `outputs_of(phase, kind)` returns the destinations of a given kind as a list (empty when none match).
+/// A `require` for any modules declared in the config
 const FINALIZE_PRELUDE: &str = r#"
-function outputs_of(phase, kind)
+local loaded = {}
+function require(name)
+    if loaded[name] ~= nil then return loaded[name] end
+    local src = __ldrs_sources[name]
+        or error("module '" .. name .. "' not declared in lua_modules")
+    local ret = load(src, "@" .. name)()
+    if ret == nil then ret = true end
+    loaded[name] = ret
+    return ret
+end
+function __ldrs_seed(api)
+    loaded.ldrs = api
+end
+"#;
+
+const OUTPUTS_OF_SRC: &str = r#"
+return function(phase, kind)
     local out = {}
     for _, d in ipairs(phase.destinations) do
         if d.kind == kind then
@@ -60,14 +87,74 @@ function outputs_of(phase, kind)
 end
 "#;
 
+/// Reserved module name: `require "ldrs"` always resolves to the host api table.
+pub const LDRS_MODULE: &str = "ldrs";
+
+/// The `ldrs` module's surface. Each variant's doc comment is the schema doc line
+/// (`EnumMessage`), its name derives from the variant (`IntoStaticStr`, snake_case), and
+/// iteration (`EnumIter`) drives both the api table build and the schema docs
+#[derive(Clone, Copy, strum::EnumIter, strum::EnumMessage, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum LdrsApi {
+    /// outputs_of(phase, kind): the destinations of a kind, as a list (empty when none match)
+    OutputsOf,
+    /// render(template): render a config/identity template
+    Render,
+    /// parse_path(pattern, path): named segments extracted from a path
+    ParsePath,
+    /// parse_url(url): a URL decomposed into scheme/host/path
+    ParseUrl,
+}
+
+impl LdrsApi {
+    pub fn name(self) -> &'static str {
+        self.into()
+    }
+
+    pub fn doc(self) -> &'static str {
+        strum::EnumMessage::get_documentation(&self)
+            .unwrap_or_default()
+            .trim()
+    }
+}
+
+/// Read the declared module files into `(stem, source)` pairs: the run-level list first,
+/// then the item's list, an item stem replacing a run-level one.
+pub fn build_sources(
+    run_modules: &[String],
+    item_modules: &[String],
+) -> Result<Vec<(String, String)>, anyhow::Error> {
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for path in run_modules.iter().chain(item_modules) {
+        let stem = module_stem(path)?;
+        let src = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read lua module {path}: {e}"))?;
+        match sources.iter_mut().find(|(s, _)| *s == stem) {
+            Some(entry) => entry.1 = src,
+            None => sources.push((stem, src)),
+        }
+    }
+    Ok(sources)
+}
+
+/// A module's `require` name: its file stem.
+pub fn module_stem(path: &str) -> Result<String, anyhow::Error> {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("lua module path '{path}' has no file stem"))
+}
+
 pub fn call_finalize<T: serde::de::DeserializeOwned>(
     lua_path: &str,
     phase: &PhaseOutput,
     context: &LdrsExecutionContext<'_>,
+    sources: &[(String, String)],
 ) -> Result<Vec<T>, anyhow::Error> {
     let script = std::fs::read_to_string(lua_path)
         .map_err(|e| anyhow::anyhow!("failed to read finalize handler {lua_path}: {e}"))?;
-    call_finalize_script(&script, lua_path, phase, context)
+    call_finalize_script(&script, lua_path, phase, context, sources)
 }
 
 /// The Lua half, decoupled from the file read so it can be tested with an inline script.
@@ -76,49 +163,67 @@ fn call_finalize_script<T: serde::de::DeserializeOwned>(
     source: &str,
     phase: &PhaseOutput,
     context: &LdrsExecutionContext<'_>,
+    sources: &[(String, String)],
 ) -> Result<Vec<T>, anyhow::Error> {
     let lua =
         finalize_lua().map_err(|e| anyhow::anyhow!("failed to initialize finalize lua: {e}"))?;
     lua.load(FINALIZE_PRELUDE)
         .exec()
         .map_err(|e| anyhow::anyhow!("failed to load finalize prelude: {e}"))?;
-    lua.load(script)
-        .exec()
-        .map_err(|e| anyhow::anyhow!("lua error in {source}: {e}"))?;
-    let func: mlua::Function = lua
-        .globals()
-        .get("finalize")
-        .map_err(|_| anyhow::anyhow!("no `finalize` function defined in {source}"))?;
+    let sources_tbl = lua
+        .create_table()
+        .map_err(|e| anyhow::anyhow!("failed to build lua module sources: {e}"))?;
+    for (stem, src) in sources {
+        sources_tbl
+            .set(stem.as_str(), src.as_str())
+            .map_err(|e| anyhow::anyhow!("failed to build lua module sources: {e}"))?;
+    }
+    lua.globals()
+        .set("__ldrs_sources", sources_tbl)
+        .map_err(|e| anyhow::anyhow!("failed to build lua module sources: {e}"))?;
     let phase_value = lua
         .to_value(phase)
         .map_err(|e| anyhow::anyhow!("failed to serialize phase for {source}: {e}"))?;
 
+    // The handler script runs inside the scope so a top-level `require "ldrs"` resolves
     let ret: mlua::Value = lua
         .scope(|scope| {
-            let render = scope.create_function(|_, template: String| {
-                context
-                    .render_template(&template)
-                    .map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))
+            let api = lua.create_table()?;
+            for entry in <LdrsApi as strum::IntoEnumIterator>::iter() {
+                let f = match entry {
+                    LdrsApi::OutputsOf => lua.load(OUTPUTS_OF_SRC).eval::<mlua::Function>()?,
+                    LdrsApi::Render => scope.create_function(|_, template: String| {
+                        context
+                            .render_template(&template)
+                            .map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))
+                    })?,
+                    LdrsApi::ParsePath => {
+                        scope.create_function(|lua, (pattern, path): (String, String)| {
+                            let pat = PathPattern::new(&pattern)
+                                .map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))?;
+                            let extracted = pat
+                                .parse_path(&path)
+                                .map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))?;
+                            lua.to_value(&extracted_segments_to_value(&extracted))
+                        })?
+                    }
+                    LdrsApi::ParseUrl => scope.create_function(|lua, url: String| {
+                        let parsed = Url::parse(&url)
+                            .map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))?;
+                        lua.to_value(&UrlData::from(parsed))
+                    })?,
+                };
+                api.set(entry.name(), f)?;
+            }
+            let seed: mlua::Function = lua.globals().get("__ldrs_seed")?;
+            seed.call::<()>(api)?;
+            lua.load(script).exec()?;
+            let func: mlua::Function = lua.globals().get("finalize").map_err(|_| {
+                mlua::Error::RuntimeError("no `finalize` function defined".to_string())
             })?;
-            lua.globals().set("render", render)?;
-            let parse_path = scope.create_function(|lua, (pattern, path): (String, String)| {
-                let pat = PathPattern::new(&pattern)
-                    .map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))?;
-                let extracted = pat
-                    .parse_path(&path)
-                    .map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))?;
-                lua.to_value(&extracted_segments_to_value(&extracted))
-            })?;
-            lua.globals().set("parse_path", parse_path)?;
-            let parse_url = scope.create_function(|lua, url: String| {
-                let parsed =
-                    Url::parse(&url).map_err(|e| mlua::Error::RuntimeError(format!("{e:#}")))?;
-                lua.to_value(&UrlData::from(parsed))
-            })?;
-            lua.globals().set("parse_url", parse_url)?;
             func.call::<mlua::Value>(phase_value)
         })
-        .map_err(|e| anyhow::anyhow!("finalize() failed in {source}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("finalize in {source}: {e}"))?;
     // A handler with no relevant work can `return {}` (or nothing) — both mean an empty command list.
     if ret.is_nil() {
         return Ok(Vec::new());
@@ -198,7 +303,8 @@ mod tests {
                 return cmds
             end
         "#;
-        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        let cmds =
+            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[]).unwrap();
         assert_eq!(cmds.len(), 2);
         match &cmds[0] {
             SfCommand::Sql(sql) => assert!(sql.contains("az://curated/acme/users")),
@@ -225,7 +331,8 @@ mod tests {
                 return { "COLS " .. table.concat(cols, ", ") }
             end
         "#;
-        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        let cmds =
+            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[]).unwrap();
         match &cmds[0] {
             SfCommand::Sql(sql) => assert_eq!(sql, "COLS id, email VARCHAR(255)"),
         }
@@ -233,17 +340,19 @@ mod tests {
 
     #[test]
     fn finalize_outputs_of_filters_by_kind() {
-        // `outputs_of` returns the destinations of a kind as a list; empty (not nil) when none match.
+        // `ldrs.outputs_of` returns the destinations of a kind as a list; empty (not nil) when none match.
         let hb = test_handlebars();
         let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
         let script = r#"
+            local ldrs = require "ldrs"
             function finalize(phase)
-                local deltas = outputs_of(phase, "delta")
-                local pgs = outputs_of(phase, "pg")
+                local deltas = ldrs.outputs_of(phase, "delta")
+                local pgs = ldrs.outputs_of(phase, "pg")
                 return { #deltas .. ":" .. deltas[1].target .. ":" .. #pgs }
             end
         "#;
-        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        let cmds =
+            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[]).unwrap();
         match &cmds[0] {
             SfCommand::Sql(sql) => assert_eq!(sql, "1:public.users:0"),
         }
@@ -284,7 +393,7 @@ mod tests {
                 return { "RUN" }
             end
         "#;
-        let cmds = call_finalize_script::<SfCommand>(script, "test", &phase, &ctx).unwrap();
+        let cmds = call_finalize_script::<SfCommand>(script, "test", &phase, &ctx, &[]).unwrap();
         match &cmds[0] {
             SfCommand::Sql(sql) => assert_eq!(sql, "SKIP 42"),
         }
@@ -295,12 +404,14 @@ mod tests {
         let hb = test_handlebars();
         let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
         let script = r#"
+            local ldrs = require "ldrs"
             function finalize(phase)
-                local seg = parse_path("{env}/{schema}.{table}", "prod/public.users")
+                local seg = ldrs.parse_path("{env}/{schema}.{table}", "prod/public.users")
                 return { seg.env .. ":" .. seg.schema .. ":" .. seg.table }
             end
         "#;
-        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        let cmds =
+            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[]).unwrap();
         match &cmds[0] {
             SfCommand::Sql(sql) => assert_eq!(sql, "prod:public:users"),
         }
@@ -311,12 +422,14 @@ mod tests {
         let hb = test_handlebars();
         let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
         let script = r#"
+            local ldrs = require "ldrs"
             function finalize(phase)
-                local u = parse_url("s3://my-bucket/prod/users")
+                local u = ldrs.parse_url("s3://my-bucket/prod/users")
                 return { u.scheme .. ":" .. u.host }
             end
         "#;
-        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        let cmds =
+            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[]).unwrap();
         match &cmds[0] {
             SfCommand::Sql(sql) => assert_eq!(sql, "s3:my-bucket"),
         }
@@ -324,15 +437,17 @@ mod tests {
 
     #[test]
     fn finalize_render_reaches_task_context() {
-        // `render` is the handler's route to identity/config: `table_of "public.users"` → "users".
+        // `ldrs.render` is the handler's route to identity/config: `table_of "public.users"` → "users".
         let hb = test_handlebars();
         let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
         let script = r#"
+            local ldrs = require "ldrs"
             function finalize(phase)
-                return { "CREATE TABLE " .. render("{{ table_of name }}") }
+                return { "CREATE TABLE " .. ldrs.render("{{ table_of name }}") }
             end
         "#;
-        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        let cmds =
+            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[]).unwrap();
         match &cmds[0] {
             SfCommand::Sql(sql) => assert_eq!(sql, "CREATE TABLE users"),
         }
@@ -351,7 +466,8 @@ mod tests {
                 return cmds
             end
         "#;
-        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        let cmds =
+            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[]).unwrap();
         assert!(cmds.is_empty());
     }
 
@@ -360,7 +476,8 @@ mod tests {
         let hb = test_handlebars();
         let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
         let script = "function finalize(phase) end";
-        let cmds = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap();
+        let cmds =
+            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[]).unwrap();
         assert!(cmds.is_empty());
     }
 
@@ -373,8 +490,8 @@ mod tests {
                 return { "CREATE TABLE t", { unexpected = "shape" } }
             end
         "#;
-        let err =
-            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap_err();
+        let err = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[])
+            .unwrap_err();
         assert!(err.to_string().contains("did not return a command list"));
     }
 
@@ -383,8 +500,108 @@ mod tests {
         let hb = test_handlebars();
         let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
         let script = "function finalize(phase) return { os.getenv('HOME') } end";
-        let err =
-            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx).unwrap_err();
-        assert!(err.to_string().contains("finalize() failed"));
+        let err = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[])
+            .unwrap_err();
+        assert!(err.to_string().contains("finalize in test"));
+    }
+
+    #[test]
+    fn ldrs_api_entries_are_documented() {
+        // The doc comment is the schema doc line; a variant without one would emit "".
+        for entry in <LdrsApi as strum::IntoEnumIterator>::iter() {
+            assert!(
+                !entry.doc().is_empty(),
+                "LdrsApi::{} has no doc comment",
+                entry.name()
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_requires_a_declared_module() {
+        // A module chunk returning a table is bound to its stem, `require`-style.
+        let hb = test_handlebars();
+        let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
+        let module = r#"
+            local M = {}
+            function M.greet(name) return "hello " .. name end
+            return M
+        "#;
+        let script = r#"
+            local util = require "util"
+            function finalize(phase)
+                return { util.greet("finalize") }
+            end
+        "#;
+        let sources = vec![("util".to_string(), module.to_string())];
+        let cmds =
+            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &sources)
+                .unwrap();
+        match &cmds[0] {
+            SfCommand::Sql(sql) => assert_eq!(sql, "hello finalize"),
+        }
+    }
+
+    #[test]
+    fn finalize_module_can_require_ldrs() {
+        // Modules load lazily during the finalize call, so the host api is available to them.
+        let hb = test_handlebars();
+        let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
+        let module = r#"
+            local ldrs = require "ldrs"
+            local M = {}
+            function M.deltas(phase) return ldrs.outputs_of(phase, "delta") end
+            return M
+        "#;
+        let script = r#"
+            local util = require "util"
+            function finalize(phase)
+                return { "COUNT " .. #util.deltas(phase) }
+            end
+        "#;
+        let sources = vec![("util".to_string(), module.to_string())];
+        let cmds =
+            call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &sources)
+                .unwrap();
+        match &cmds[0] {
+            SfCommand::Sql(sql) => assert_eq!(sql, "COUNT 1"),
+        }
+    }
+
+    #[test]
+    fn finalize_undeclared_module_errors() {
+        let hb = test_handlebars();
+        let ctx = LdrsExecutionContext::try_new("public.users", &hb, &[]).unwrap();
+        let script = r#"
+            local missing = require "missing"
+            function finalize(phase) return {} end
+        "#;
+        let err = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[])
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("module 'missing' not declared in lua_modules"));
+    }
+
+    #[test]
+    fn build_sources_item_overrides_run_level_by_stem() {
+        let dir = std::env::temp_dir().join(format!("ldrs-mod-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&dir).unwrap();
+        let run = dir.join("util.lua");
+        let item_dir = dir.join("item");
+        std::fs::create_dir(&item_dir).unwrap();
+        let item = item_dir.join("util.lua");
+        std::fs::write(&run, "return { from = 'run' }").unwrap();
+        std::fs::write(&item, "return { from = 'item' }").unwrap();
+
+        let sources = build_sources(
+            &[run.to_string_lossy().into_owned()],
+            &[item.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].0, "util");
+        assert!(sources[0].1.contains("item"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

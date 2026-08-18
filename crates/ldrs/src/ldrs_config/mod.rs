@@ -340,11 +340,14 @@ async fn run_finalize(
     phase: &PhaseOutput,
     ldrs_env: &[(String, String)],
     context: &LdrsExecutionContext<'_>,
+    run_modules: &[String],
 ) -> Vec<String> {
     let ambient = ambient_env();
     let runs = items.iter().map(|item| {
         let ambient = ambient.clone();
         async move {
+            let sources =
+                build_sources(run_modules, item.lua_modules()).map_err(|e| format!("{e:#}"))?;
             match item {
                 FinalizeItem::Sf(sf) => {
                     // `target` defaults to the source name; it is both the rendered identity the Lua
@@ -363,7 +366,7 @@ async fn run_finalize(
                         resolve_inherited_sf_env(ldrs_env),
                     )
                     .map_err(|e| format!("{e:#}"))?;
-                    let commands = call_finalize::<SfCommand>(&sf.lua, phase, context)
+                    let commands = call_finalize::<SfCommand>(&sf.lua, phase, context, &sources)
                         .map_err(|e| format!("{e:#}"))?;
                     tokio::task::spawn_blocking(move || run_sf(&conn, commands, ambient))
                         .await
@@ -439,10 +442,26 @@ pub async fn execute_task(
                     "delta merge committed"
                 ),
             },
+            DestinationOutcome::Parquet {
+                target,
+                result: Ok(files),
+                ..
+            } => info!(
+                dest = %target,
+                files = files.len(),
+                size_bytes = files.iter().map(|f| f.size_bytes).sum::<u64>(),
+                "parquet write committed"
+            ),
+            DestinationOutcome::Pg {
+                target,
+                result: Ok(()),
+                ..
+            } => info!(dest = %target, "postgres load committed"),
             _ => {}
         }
     }
-    let finalize_failures = run_finalize(&finalize_items, &phase, ldrs_env, &context).await;
+    let finalize_failures =
+        run_finalize(&finalize_items, &phase, ldrs_env, &context, &lua_modules).await;
     let load_failures: Vec<String> = phase
         .destinations
         .iter()

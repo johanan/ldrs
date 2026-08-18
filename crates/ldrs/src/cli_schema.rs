@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use crate::{
     delta::DeltaDestination,
     file_source::FileSource,
-    finalize::FinalizeItem,
+    finalize::{FinalizeItem, LdrsApi},
     ldrs_config::config::{ArrowDestination, LdrsConfig},
     ldrs_duckdb::duckdb_source::DuckDbSource,
     ldrs_snowflake::snowflake_source::SFSource,
@@ -153,13 +153,18 @@ fn finalize_doc() -> Value {
     let mut g = SchemaGenerator::default();
     let block = g.subschema_for::<FinalizeItem>();
     let phase = g.subschema_for::<PhaseOutput>();
+    let ldrs_module: Vec<Value> = <LdrsApi as strum::IntoEnumIterator>::iter()
+        .map(|e| json!({ "name": e.name(), "doc": e.doc() }))
+        .collect();
     json!({
         "$defs": g.take_definitions(true),
         "kind": "finalize",
         "finalize": block,
         "phase": phase,
-        "handler": "The `lua` file must define `finalize(phase)`: called once per item with the run's output (`phase`, schema below), it returns the command list run against the item's target. Each destination carries its resolved `target`, post-cast `columns`, and (for URL-backed destinations) `full_url`; Parquet lists its written files; a Delta `result` carries the commit op (`overwrite`/`merge`, with merge stats including `skipped` for an idempotent no-op). Helpers: `outputs_of(phase, kind)` returns the destinations of a kind as a list, `render(template)` renders a config/identity template, `parse_path(pattern, path)` extracts named segments from a path, `parse_url(url)` decomposes a URL into scheme/host/path.",
-        "execution": "Every returned command runs in order, stopping at the first error; each statement's result set is info-logged under phase=\"finalize\".",
+        "ldrs_module": ldrs_module,
+        "handler": "The `lua` file must define `finalize(phase)`: called once per item with the run's output (`phase`, schema below), it returns the command list run against the item's target. Each destination carries its resolved `target`, post-cast `columns`, and (for URL-backed destinations) `full_url`; Parquet lists its written files (each with `full_url`, `path`, `rows`, `size_bytes`); a Delta `result` carries the commit op (`overwrite`/`merge`, with merge stats including `skipped` for an idempotent no-op). There is a ldrs module: `local ldrs = require \"ldrs\"` The functions are listed under `ldrs_module`.",
+        "modules": "Run-level `lua_modules:` (top of the config) and per-item `lua_modules:` list Lua files loadable via `require` by file stem; a chunk returning a table is bound module-style. The lists merge, an item's same-stem entry winning; `ldrs` is reserved for the ldrs module.",
+        "execution": "Every returned command runs in order, stopping at the first error; each statement's result set is info-logged under phase=\"finalize\". The same per-task structure (`phase` schema) is what `--report` writes as JSONL, one line per task.",
         "usage_ref": "ldrs schema usage",
     })
 }
