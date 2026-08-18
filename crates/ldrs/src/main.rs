@@ -2,7 +2,7 @@ use std::time::Duration;
 use std::{fs, io};
 
 use anyhow::Context;
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use dotenvy::dotenv;
 use ldrs::cli_schema;
 use ldrs::ldrs_config::config::{find_unknown_block_keys, parse_dest, parse_src, LdrsParsedConfig};
@@ -75,6 +75,10 @@ struct ConfigArgs {
     /// Run only these tables, by 'name', comma-separated (e.g. --select public.users,public.orders). Omit to run every table in the config.
     #[arg(long, value_delimiter = ',')]
     select: Option<Vec<String>>,
+    /// Write a JSONL run report to this path, one task outcome per line
+    /// (the `phase` schema in `ldrs schema finalize`). Written on success and failure.
+    #[arg(long)]
+    report: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -120,6 +124,11 @@ struct RunArgs {
     /// Per-kind options as key=value. Keys may be namespaced (pg.merge_keys, file.partition_cols).
     #[arg(long = "opt", value_parser = parse_kv)]
     opt: Vec<(String, String)>,
+
+    /// Write a JSONL run report to this path, one task outcome per line
+    /// (the `phase` schema in `ldrs schema finalize`). Written on success and failure.
+    #[arg(long)]
+    report: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -229,23 +238,38 @@ const BANNER: &str = r#"
 ░░░░░  ░░░░░░░░ ░░░░░     ░░░░░░
 "#;
 
+#[derive(Clone, ValueEnum)]
+enum LogFormat {
+    /// Human-readable lines (default)
+    Text,
+    /// One JSON object per line
+    Json,
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None, before_help = BANNER)]
 struct Cli {
+    /// Log output format on stderr
+    #[arg(long, global = true, env = "LDRS_LOG_FORMAT", default_value = "text")]
+    log_format: LogFormat,
+
     #[command(subcommand)]
     destination: Option<Destination>,
 }
 
 fn main() -> Result<(), anyhow::Error> {
     let _ = dotenv();
-    fmt::Subscriber::builder()
+    let cli = Cli::parse();
+    let builder = fmt::Subscriber::builder()
         .with_writer(io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info,delta_kernel=warn")),
-        )
-        .init();
-    let cli = Cli::parse();
+        );
+    match cli.log_format {
+        LogFormat::Json => builder.json().init(),
+        LogFormat::Text => builder.init(),
+    }
 
     let Some(destination) = cli.destination else {
         Cli::command().print_help()?;
@@ -278,7 +302,7 @@ fn main() -> Result<(), anyhow::Error> {
                         .with_context(|| format!("Failed to read config file: {}", args.config))?;
                     let ldrs_env = get_all_ldrs_env_vars();
                     let configs = parse_yaml_config(&config_string, &ldrs_env)?;
-                    execute_configs(configs, args.select, &ldrs_env, rt.handle()).await
+                    execute_configs(configs, args.select, &ldrs_env, rt.handle(), args.report).await
                 }
                 Destination::Delta {
                     command: DeltaCommands::Vacuum(args),
@@ -317,11 +341,13 @@ fn main() -> Result<(), anyhow::Error> {
                             src,
                             dests: vec![dest],
                             finalize: Vec::new(),
+                            lua_modules: Vec::new(),
                             unknown_keys,
                         }],
                         None,
                         &ldrs_env,
                         rt.handle(),
+                        args.report,
                     )
                     .await
                 }
@@ -435,6 +461,7 @@ mod tests {
             name: None,
             sql: None,
             opt: vec![],
+            report: None,
         }
     }
 

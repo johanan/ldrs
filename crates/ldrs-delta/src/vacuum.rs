@@ -292,6 +292,7 @@ fn files_are_enumerable(feature: &TableFeature) -> bool {
         | VariantTypePreview
         | VariantShredding
         | VariantShreddingPreview
+        | GeospatialType
         | MaterializePartitionColumns
         | AllowColumnDefaults
         | ClusteredTable

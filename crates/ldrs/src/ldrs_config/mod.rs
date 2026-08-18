@@ -2,7 +2,7 @@ pub mod config;
 pub mod field_validation;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 
 use anyhow::Context;
 use deadpool_postgres::Pool;
@@ -23,7 +23,7 @@ use url::Url;
 use crate::ldrs_env::{ambient_env, starts_with_ignore_ascii_case};
 use crate::{
     delta::{DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
-    finalize::{call_finalize, run_sf, FinalizeItem, SfCommand},
+    finalize::{build_sources, call_finalize, run_sf, FinalizeItem, SfCommand},
     ldrs_config::{
         config::{
             parse_table, validate_configs, LdrsConfig, LdrsDestination, LdrsParsedConfig,
@@ -283,11 +283,20 @@ pub async fn execute_configs(
     select: Option<Vec<String>>,
     ldrs_env: &[(String, String)],
     cloud_io_rt: &tokio::runtime::Handle,
+    report: Option<String>,
 ) -> Result<(), anyhow::Error> {
     let filtered_tasks = select_tasks(tasks, select);
     debug!("Tasks to be run {:?}", filtered_tasks);
 
     validate_configs(&filtered_tasks)?;
+
+    // Created before any task runs: an unwritable path fails here, with zero side effects,
+    // and `create` truncates a prior run's report.
+    let report_file = report
+        .as_deref()
+        .map(std::fs::File::create)
+        .transpose()
+        .with_context(|| format!("could not create report file '{}'", report.unwrap_or_default()))?;
 
     let exec_env = ExecutionEnv::create(ldrs_env);
     // One connection pool per Postgres destination URL, shared read-only across every task. Strip
@@ -320,13 +329,15 @@ pub async fn execute_configs(
             &exec_env.typed_params,
             cloud_io_rt,
             &pg_pools,
+            report_file.as_ref(),
         )
         .await?;
         let task_end = std::time::Instant::now();
         info!(
             table = %task_name,
             rows,
-            elapsed_ms = (task_end - task_start).as_millis(),
+            // u64: tracing has no u128 Value impl, so u128 would land in JSON as a string
+            elapsed_ms = (task_end - task_start).as_millis() as u64,
             "Task completed"
         );
     }
@@ -340,11 +351,14 @@ async fn run_finalize(
     phase: &PhaseOutput,
     ldrs_env: &[(String, String)],
     context: &LdrsExecutionContext<'_>,
+    run_modules: &[String],
 ) -> Vec<String> {
     let ambient = ambient_env();
     let runs = items.iter().map(|item| {
         let ambient = ambient.clone();
         async move {
+            let sources =
+                build_sources(run_modules, item.lua_modules()).map_err(|e| format!("{e:#}"))?;
             match item {
                 FinalizeItem::Sf(sf) => {
                     // `target` defaults to the source name; it is both the rendered identity the Lua
@@ -363,7 +377,7 @@ async fn run_finalize(
                         resolve_inherited_sf_env(ldrs_env),
                     )
                     .map_err(|e| format!("{e:#}"))?;
-                    let commands = call_finalize::<SfCommand>(&sf.lua, phase, context)
+                    let commands = call_finalize::<SfCommand>(&sf.lua, phase, context, &sources)
                         .map_err(|e| format!("{e:#}"))?;
                     tokio::task::spawn_blocking(move || run_sf(&conn, commands, ambient))
                         .await
@@ -380,6 +394,7 @@ async fn run_finalize(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_task(
     task: LdrsParsedConfig,
     ldrs_env: &[(String, String)],
@@ -388,9 +403,11 @@ pub async fn execute_task(
     env_params: &[(String, String, Option<ColumnType>)],
     cloud_io_rt: &tokio::runtime::Handle,
     pg_pools: &HashMap<String, Pool>,
+    report: Option<&std::fs::File>,
 ) -> Result<Option<u64>, anyhow::Error> {
     let name = task.src.name().to_string();
     let finalize_items = task.finalize;
+    let lua_modules = task.lua_modules;
     let context = LdrsExecutionContext::try_new(&name, &handlebars, &handlebars_vars)?;
     let source = resolve_source(task.src, &context, env_params, ldrs_env)?;
     let dests = task
@@ -439,10 +456,26 @@ pub async fn execute_task(
                     "delta merge committed"
                 ),
             },
+            DestinationOutcome::Parquet {
+                target,
+                result: Ok(files),
+                ..
+            } => info!(
+                dest = %target,
+                files = files.len(),
+                size_bytes = files.iter().map(|f| f.size_bytes).sum::<u64>(),
+                "parquet write committed"
+            ),
+            DestinationOutcome::Pg {
+                target,
+                result: Ok(()),
+                ..
+            } => info!(dest = %target, "postgres load committed"),
             _ => {}
         }
     }
-    let finalize_failures = run_finalize(&finalize_items, &phase, ldrs_env, &context).await;
+    let finalize_failures =
+        run_finalize(&finalize_items, &phase, ldrs_env, &context, &lua_modules).await;
     let load_failures: Vec<String> = phase
         .destinations
         .iter()
@@ -456,6 +489,15 @@ pub async fn execute_task(
     }
     for f in &finalize_failures {
         error!(phase = "finalize", "{f}");
+    }
+    // The report line covers failed tasks too, and flushes before a failure below aborts the
+    // run, so a report from a dead run still inventories what committed.
+    if let Some(mut f) = report {
+        let mut line = serde_json::to_string(&phase)?;
+        line.push('\n');
+        f.write_all(line.as_bytes())
+            .and_then(|_| f.flush())
+            .with_context(|| "could not write report line")?;
     }
     let mut summary = Vec::new();
     if !load_failures.is_empty() {

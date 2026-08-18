@@ -20,6 +20,7 @@ use ldrs_arrow::ColumnSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
+use tracing::warn;
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct LdrsConfig {
@@ -52,6 +53,10 @@ pub struct LdrsConfig {
     #[serde(default)]
     #[schemars(with = "Option<Vec<serde_json::Value>>")]
     pub finalize: Option<Vec<Value>>,
+    /// Run-level Lua module files, loadable via `require` in every finalize handler. A handler's
+    /// item can add its own `lua_modules`, which win on a same-stem collision.
+    #[serde(default)]
+    pub lua_modules: Option<Vec<String>>,
     #[schemars(with = "Vec<serde_json::Value>")]
     pub tables: Vec<serde_yaml::Value>,
 }
@@ -113,6 +118,8 @@ pub struct LdrsParsedConfig {
     pub src: LdrsSource,
     pub dests: Vec<LdrsDestination>,
     pub finalize: Vec<FinalizeItem>,
+    /// Run-level Lua modules, merged under each finalize item's own list.
+    pub lua_modules: Vec<String>,
     pub unknown_keys: Vec<UnknownKey>,
 }
 
@@ -363,6 +370,8 @@ fn parse_table_flat(
         src,
         dests: vec![dest],
         finalize: Vec::new(),
+        // finalize is nested-only, so the flat form has no consumer for modules
+        lua_modules: Vec::new(),
         unknown_keys,
     })
 }
@@ -423,6 +432,8 @@ fn parse_table_nested(
         .collect();
 
     let (finalize, finalize_unknowns) = parse_finalize(&table, config)?;
+    let lua_modules = config.lua_modules.clone().unwrap_or_default();
+    warn_module_collisions(&lua_modules, &finalize);
 
     let unknown_keys = per_block_unknowns
         .into_iter()
@@ -435,8 +446,38 @@ fn parse_table_nested(
         src,
         dests,
         finalize,
+        lua_modules,
         unknown_keys,
     })
+}
+
+/// Parse-time module-name checks, surfaced before a load runs rather than at `require` time.
+fn warn_module_collisions(run_modules: &[String], items: &[FinalizeItem]) {
+    let warn_list = |scope: &str, modules: &[String]| {
+        let mut seen: Vec<String> = Vec::new();
+        for path in modules {
+            let Ok(stem) = crate::finalize::module_stem(path) else {
+                continue;
+            };
+            if stem == crate::finalize::LDRS_MODULE {
+                warn!("lua module '{path}' ({scope}) is shadowed by the reserved `ldrs` module");
+            }
+            if seen.contains(&stem) {
+                warn!("duplicate lua module stem '{stem}' in {scope}: later entry wins");
+            }
+            seen.push(stem);
+        }
+        seen
+    };
+    let run_stems = warn_list("lua_modules", run_modules);
+    for item in items {
+        let item_stems = warn_list("a finalize item's lua_modules", item.lua_modules());
+        for stem in &item_stems {
+            if run_stems.contains(stem) {
+                warn!("finalize item lua module '{stem}' overrides the run-level module");
+            }
+        }
+    }
 }
 
 /// A nested table's `destinations:`, or the top-level default if the table has none.

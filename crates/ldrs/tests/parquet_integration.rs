@@ -81,6 +81,7 @@ pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
         src,
         dests: vec![dest],
         finalize: Vec::new(),
+        lua_modules: Vec::new(),
         unknown_keys: Vec::new(),
     };
     let expected_config = LdrsParsedConfig {
@@ -98,6 +99,7 @@ pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
             max_bytes: None,
         })],
         finalize: Vec::new(),
+        lua_modules: Vec::new(),
         unknown_keys: Vec::new(),
     };
     assert_eq!(config, expected_config);
@@ -116,6 +118,7 @@ filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
         src,
         dests: vec![dest],
         finalize: Vec::new(),
+        lua_modules: Vec::new(),
         unknown_keys: Vec::new(),
     };
     let expected_config = LdrsParsedConfig {
@@ -134,6 +137,7 @@ filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
             max_bytes: None,
         })],
         finalize: Vec::new(),
+        lua_modules: Vec::new(),
         unknown_keys: Vec::new(),
     };
     assert_eq!(config, expected_config);
@@ -183,6 +187,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await
     .unwrap();
@@ -235,6 +240,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await
     .unwrap();
@@ -280,6 +286,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await
     .unwrap();
@@ -482,6 +489,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await
     .unwrap();
@@ -535,6 +543,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await;
     assert!(
@@ -591,6 +600,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await
     .unwrap();
@@ -653,6 +663,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
+        None,
     )
     .await
     .unwrap();

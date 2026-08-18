@@ -27,6 +27,7 @@ pub struct FileWritten {
     pub full_url: String,
     pub path: String,
     pub rows: u64,
+    pub size_bytes: u64,
 }
 
 /// One destination's identity and its outcome (`result`). Identity is known regardless of outcome;
