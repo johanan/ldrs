@@ -11,7 +11,7 @@ use ldrs_arrow::{
     build_arrow_transform_strategy, build_source_and_target_schema, ArrowColumnTransformStrategy,
     ColumnSpec,
 };
-use ldrs_delta::{ensure_table, DeltaMergeSink, DeltaOverwriteSink};
+use ldrs_delta::{ensure_table, DeltaMergeSink, DeltaOverwriteSink, TableConfig};
 use ldrs_parquet::{default_writer_props, with_bloom_filters, ParquetSink};
 use ldrs_postgres::{build_pg_pool, PgLoad, PgSink};
 use tokio::task::JoinHandle;
@@ -151,6 +151,7 @@ async fn build_sink(
             let (target_cols, out_schema, transform) =
                 resolve_transform(source_cols, delta.columns, schema)?;
             ensure_table(&delta.table_path, &out_schema).await?;
+            let table_config = TableConfig::default();
             let sink = match delta.mode {
                 DeltaMode::Overwrite {
                     max_rows,
@@ -161,12 +162,19 @@ async fn build_sink(
                         out_schema,
                         max_rows,
                         max_bytes,
+                        &table_config,
                         cloud_io,
                     )?,
                     (target_cols, delta.target, delta.table_path),
                 ),
                 DeltaMode::Merge(merge_config) => Sink::DeltaMerge(
-                    DeltaMergeSink::new(&delta.table_path, out_schema, merge_config, cloud_io)?,
+                    DeltaMergeSink::new(
+                        &delta.table_path,
+                        out_schema,
+                        merge_config,
+                        &table_config,
+                        cloud_io,
+                    )?,
                     (target_cols, delta.target, delta.table_path),
                 ),
             };
