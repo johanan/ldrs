@@ -1,3 +1,5 @@
+pub mod delta;
+
 use std::path::{Path, PathBuf};
 
 /// Root of the fixture data directory.

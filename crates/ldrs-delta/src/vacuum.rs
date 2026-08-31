@@ -12,16 +12,17 @@ use chrono::{DateTime, Utc};
 use delta_kernel::commit_range::{CommitRange, DeltaAction};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
-use delta_kernel::table_features::{TableFeature, MAX_VALID_WRITER_VERSION};
+use delta_kernel::table_features::TableFeature;
 use delta_kernel::{Engine, Snapshot, SnapshotRef, Version};
 use futures::StreamExt;
-use ldrs_storage::{base_or_relative_path, build_store};
+use ldrs_storage::{base_or_relative_path, build_store, store_path_from_uri};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use tokio::runtime::Handle;
 use tracing::{debug, info};
 
 use crate::build_engine;
+use crate::features::{check_writer_version, files_are_enumerable, writer_features};
 
 const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -70,7 +71,7 @@ pub async fn vacuum(
     let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
 
     // Everything that can refuse the vacuum resolves before the first delete.
-    refuse_unsupported_features(&snapshot)?;
+    refuse_non_enumerable_features(&snapshot).context("cannot vacuum this table")?;
     let retention_used = effective_retention(
         retention,
         snapshot
@@ -247,66 +248,19 @@ pub fn parse_retention(value: &str) -> Result<Duration, anyhow::Error> {
 
 /// Refuse tables whose protocol names a feature that can reference files outside the add paths and
 /// deletion vectors collected here, or a protocol version whose features are not enumerable.
-fn refuse_unsupported_features(snapshot: &Snapshot) -> Result<(), anyhow::Error> {
-    let protocol = snapshot.table_configuration().protocol();
-    if protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
-        anyhow::bail!(
-            "cannot vacuum a table at writer version {}",
-            protocol.min_writer_version()
-        );
-    }
-    let unsupported: Vec<String> = protocol
-        .writer_features()
-        .unwrap_or_default()
+fn refuse_non_enumerable_features(snapshot: &Snapshot) -> Result<(), anyhow::Error> {
+    check_writer_version(snapshot)?;
+    let unsupported: Vec<String> = writer_features(snapshot)
         .iter()
         .filter(|feature| !files_are_enumerable(feature))
         .map(|feature| feature.to_string())
         .collect();
-    match unsupported.is_empty() {
-        true => Ok(()),
-        false => Err(anyhow::anyhow!(
-            "cannot vacuum a table with the feature(s) {}: they may reference files that are not in the table's add actions",
-            unsupported.join(", ")
+    match unsupported.as_slice() {
+        [] => Ok(()),
+        features => Err(anyhow::anyhow!(
+            "the feature(s) {} may reference files that are not in the table's add actions",
+            features.join(", ")
         )),
-    }
-}
-
-/// Whether a feature leaves the table's full file set reachable from the active add actions and
-/// their deletion vectors.
-fn files_are_enumerable(feature: &TableFeature) -> bool {
-    use TableFeature::*;
-    match feature {
-        // Log-, schema- or parquet-level only: no files beyond the add paths.
-        AppendOnly
-        | Invariants
-        | CheckConstraints
-        | GeneratedColumns
-        | IdentityColumns
-        | InCommitTimestamp
-        | DomainMetadata
-        | RowTracking
-        | ColumnMapping
-        | TypeWidening
-        | TypeWideningPreview
-        | VariantType
-        | VariantTypePreview
-        | VariantShredding
-        | VariantShreddingPreview
-        | GeospatialType
-        | MaterializePartitionColumns
-        | AllowColumnDefaults
-        | ClusteredTable
-        | TimestampWithoutTimezone
-        | DeletionVectors
-        | VacuumProtocolCheck
-        | ChangeDataFeed
-        | V2Checkpoint => true,
-        // Iceberg metadata sits outside `_delta_log` and is not named by any add action.
-        IcebergCompatV1 | IcebergCompatV2 | IcebergCompatV3 | AdaptiveMetadataPreview => false,
-        // Commits can live outside `_delta_log`, so a snapshot read from the store may be stale
-        // and a committed file could look unreferenced.
-        CatalogManaged | CatalogOwnedPreview => false,
-        Unknown(_) => false,
     }
 }
 
@@ -353,7 +307,7 @@ fn collect_keep_set(
             if !selected || paths.is_null(row) {
                 continue;
             }
-            keep.insert(decode_log_path(paths.value(row))?);
+            keep.insert(keep_path(paths.value(row))?);
             // check for a deletion vector
             if !dv.is_null(row) {
                 let storage_type = storage_type.value(row);
@@ -410,18 +364,17 @@ fn read_cdc_paths(
                 if cdc.is_null(row) || cdc_paths.is_null(row) {
                     continue;
                 }
-                paths.insert(decode_log_path(cdc_paths.value(row))?);
+                paths.insert(keep_path(cdc_paths.value(row))?);
             }
         }
     }
     Ok(paths)
 }
 
-fn decode_log_path(path: &str) -> Result<String, anyhow::Error> {
-    if url::Url::parse(path).is_ok() {
-        anyhow::bail!("cannot vacuum a table that references the absolute path {path}. Its files are outside the table root");
-    }
-    Ok(String::from(Path::from_url_path(path)?))
+fn keep_path(path: &str) -> Result<String, anyhow::Error> {
+    store_path_from_uri(path)?.map(String::from).ok_or_else(|| {
+        anyhow::anyhow!("cannot vacuum a table that references the absolute path {path}. Its files are outside the table root")
+    })
 }
 
 fn dv_file_path(storage_type: &str, dv: &str) -> Result<Option<String>, anyhow::Error> {
@@ -721,22 +674,9 @@ mod tests {
     }
 
     #[test]
-    fn decode_log_path_decodes_uri_encoding() {
-        // a partition value of `100%` is `dt=100%25` on disk and `dt=100%2525` in the log
-        assert_eq!(
-            decode_log_path("dt=100%2525/part-0.parquet").unwrap(),
-            "dt=100%25/part-0.parquet"
-        );
-        assert_eq!(
-            decode_log_path("dt=2026-01-01%2000%3A00%3A00/p.parquet").unwrap(),
-            "dt=2026-01-01 00:00:00/p.parquet"
-        );
-    }
-
-    #[test]
-    fn decode_log_path_refuses_absolute_paths() {
-        let err = decode_log_path("s3://other-bucket/t/a.parquet").unwrap_err();
-        assert!(err.to_string().contains("absolute path"));
+    fn keep_path_refuses_an_out_of_table_reference() {
+        let err = keep_path("s3://other-bucket/t/a.parquet").unwrap_err();
+        assert!(err.to_string().contains("absolute path"), "got: {err}");
     }
 
     #[test]

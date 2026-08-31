@@ -1,12 +1,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use anyhow::Context;
 use arrow::row::{RowConverter, SortField};
-use arrow_array::{
-    cast::AsArray,
-    types::{Int32Type, Int64Type},
-    Array, ArrayRef, RecordBatch,
-};
+use arrow_array::{cast::AsArray, types::Int64Type, ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use futures::{Stream, StreamExt};
 use ldrs_parquet::{
@@ -24,9 +21,9 @@ use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::{
-    build_add, build_commit_jsonl, build_engine, build_metadata, cleanup_source_files,
-    ensure_table, merge_protocol, should_checkpoint, version_to_log_filename, write_checkpoint,
-    DeltaAction, DeltaCommitInfo, DeltaRemove, DeltaTxn, CHECKPOINT_INTERVAL, MERGE_MAX_RETRIES,
+    build_add, build_engine, cleanup_source_files, ensure_table, file_path, should_checkpoint,
+    version_to_log_filename, write_checkpoint, Commit, DeltaRemove, DeltaTxn, Operation,
+    TableConfig, CHECKPOINT_INTERVAL, MERGE_MAX_RETRIES,
 };
 
 use super::dv::{build_dv_file, build_dv_inline, serialize_dv};
@@ -34,11 +31,10 @@ use super::stats::{
     delta_stats_to_json, key_bounds_as_scalars, max_stat_as_i64, parquet_metadata_to_delta_stats,
     select_row_groups_by_scalars,
 };
-use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{Expression as Expr, Predicate as Pred};
 use delta_kernel::scan::state::ScanFile;
+use delta_kernel::Engine;
 use delta_kernel::Snapshot;
-use delta_kernel::{engine::arrow_data::ArrowEngineData, Engine};
 use object_store::{PutMode, PutOptions, PutPayload};
 use roaring::RoaringTreemap;
 
@@ -193,13 +189,14 @@ pub async fn merge_delta<S>(
     schema: SchemaRef,
     stream: S,
     merge_config: MergeConfig,
+    table_config: &TableConfig,
     cloud_io: &Handle,
 ) -> Result<MergeStats, anyhow::Error>
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
     ensure_table(table_path, &schema).await?;
-    let mut sink = DeltaMergeSink::new(table_path, schema, merge_config, cloud_io)?;
+    let mut sink = DeltaMergeSink::new(table_path, schema, merge_config, table_config, cloud_io)?;
     let mut stream = std::pin::pin!(stream);
     while let Some(batch) = stream.next().await {
         sink.write_batch(&batch?).await?;
@@ -220,6 +217,7 @@ pub struct DeltaMergeSink {
     url: Url,
     schema: SchemaRef,
     merge_config: MergeConfig,
+    table_config: TableConfig,
 }
 
 impl DeltaMergeSink {
@@ -227,6 +225,7 @@ impl DeltaMergeSink {
         table_path: &str,
         schema: SchemaRef,
         merge_config: MergeConfig,
+        table_config: &TableConfig,
         cloud_io: &Handle,
     ) -> Result<Self, anyhow::Error> {
         let url = base_or_relative_path(table_path)?;
@@ -257,6 +256,7 @@ impl DeltaMergeSink {
             url,
             schema,
             merge_config,
+            table_config: table_config.clone(),
         })
     }
 
@@ -284,6 +284,7 @@ impl DeltaMergeSink {
             &self.url,
             &self.schema,
             &self.merge_config,
+            &self.table_config,
             &source_files,
         )
         .await
@@ -318,6 +319,7 @@ async fn commit_merge(
     url: &Url,
     schema: &SchemaRef,
     merge_config: &MergeConfig,
+    table_config: &TableConfig,
     source_files: &[(String, ParquetMetaData, u64)],
 ) -> Result<MergeStats, anyhow::Error> {
     if !merge_config.allow_null_keys {
@@ -346,16 +348,6 @@ async fn commit_merge(
         // get a fresh snapshot, this is either the first pass or we failed and we need fresh metadata
         let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
         let version = snapshot.version();
-        let metadata = snapshot.table_configuration().metadata();
-        let table_id = metadata.id().to_string();
-        let created_time = metadata.created_time();
-        let configuration = metadata.configuration().clone();
-        let partition_columns = metadata.partition_columns().to_vec();
-        let has_deletion_vectors = snapshot
-            .table_properties()
-            .enable_deletion_vectors
-            .unwrap_or(false);
-
         if let (Some(app_id), Some(batch_version)) = (app_id.as_ref(), batch_version) {
             if let Ok(Some(last_version)) = snapshot.get_app_id_version(app_id, engine.as_ref()) {
                 // if there is a newer version committed, nothing to do so we skip
@@ -400,34 +392,6 @@ async fn commit_merge(
 
         // Build commit and write atomically
         let now = chrono::Utc::now().timestamp_millis();
-
-        let commit_info = DeltaCommitInfo {
-            timestamp: now,
-            operation: "MERGE".to_string(),
-            operation_parameters: HashMap::from([("mode".into(), "Merge".into())]),
-            engine_info: format!("ldrs-{}", env!("CARGO_PKG_VERSION")),
-        };
-
-        // Protocol + metadata upgrade only on first DV table
-        let needs_dv_upgrade = !has_deletion_vectors;
-        let protocol = if needs_dv_upgrade {
-            Some(merge_protocol())
-        } else {
-            None
-        };
-        let metadata_action = if needs_dv_upgrade {
-            let mut configuration = configuration.clone();
-            configuration.insert("delta.enableDeletionVectors".into(), "true".into());
-            Some(build_metadata(
-                schema,
-                Some(&table_id),
-                created_time,
-                configuration,
-                partition_columns,
-            )?)
-        } else {
-            None
-        };
 
         let txn = match (app_id.as_ref(), batch_version) {
             (Some(app_id), Some(batch_version)) => Some(DeltaTxn {
@@ -479,7 +443,13 @@ async fn commit_merge(
 
             adds_with_dvs.push(super::DeltaAdd {
                 path: fm.scan_file.path.clone(),
-                partition_values: HashMap::new(),
+                partition_values: super::partition_values(
+                    snapshot
+                        .table_configuration()
+                        .metadata()
+                        .partition_columns(),
+                    &fm.scan_file.partition_values,
+                ),
                 size: fm.scan_file.size,
                 modification_time: fm.scan_file.modification_time,
                 data_change: true,
@@ -491,24 +461,27 @@ async fn commit_merge(
         let now = chrono::Utc::now().timestamp_millis();
         let new_adds = source_files
             .iter()
-            .map(|(filename, metadata, size)| build_add(filename, metadata, *size, now, schema))
+            .map(|(filename, metadata, size)| {
+                build_add(filename, metadata, *size, now, schema, HashMap::new())
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut actions: Vec<DeltaAction> = vec![DeltaAction::CommitInfo(&commit_info)];
-        if let Some(txn) = txn.as_ref() {
-            actions.push(DeltaAction::Txn(txn));
+        let mut commit = Commit::for_table(
+            Operation::Merge,
+            &snapshot,
+            schema,
+            table_config,
+            engine.as_ref(),
+            now,
+        )?
+        .with_removes(removes)
+        .with_adds(adds_with_dvs)
+        .with_adds(new_adds);
+        if let Some(txn) = txn {
+            commit = commit.with_txn(txn);
         }
-        if let Some(p) = protocol.as_ref() {
-            actions.push(DeltaAction::Protocol(p));
-        }
-        if let Some(m) = metadata_action.as_ref() {
-            actions.push(DeltaAction::MetaData(m));
-        }
-        actions.extend(removes.iter().map(DeltaAction::Remove));
-        actions.extend(adds_with_dvs.iter().map(DeltaAction::Add));
-        actions.extend(new_adds.iter().map(DeltaAction::Add));
 
-        let commit_body = build_commit_jsonl(&actions)?;
+        let commit_body = commit.to_jsonl()?;
         let next_version = version + 1;
         let log_path = base_path
             .clone()
@@ -594,7 +567,8 @@ async fn probe_targets_for_matches(
     let mut matched_rows: usize = 0;
 
     for probe in probes {
-        let path = base_path.clone().join(probe.scan_file.path.as_str());
+        let path = file_path(base_path, &probe.scan_file.path)
+            .with_context(|| "cannot merge into this table")?;
 
         let mut deleted_rows = if probe.scan_file.dv_info.has_vector() {
             probe
@@ -674,7 +648,8 @@ async fn narrow_to_eligible_row_groups(
     let mut file_probes: Vec<FileProbe> = Vec::new();
 
     for candidate in candidates {
-        let path = base_path.clone().join(candidate.path.as_str());
+        let path = file_path(base_path, &candidate.path)
+            .with_context(|| "cannot merge into this table")?;
         let metadata = read_parquet_metadata(
             store.clone(),
             &path,
@@ -787,73 +762,12 @@ fn find_candidate_target_files(
         // `visit_scan_files` applies the selection vector and yields typed `ScanFile`s, but
         // `DvInfo` hides the descriptor; read it off the same batch's `deletionVector` column.
         candidate_files = scan_meta.visit_scan_files(candidate_files, collect)?;
-        existing_dvs.extend(read_existing_dvs(&scan_meta.scan_files)?);
+        existing_dvs.extend(super::dv::read_existing_dvs(&scan_meta.scan_files)?);
     }
     Ok((candidate_files, existing_dvs))
 }
 
 /// Read the as-stored `deletionVector` descriptors off one scan-output batch, keyed by file path.
-pub(crate) fn read_existing_dvs(
-    scan_files: &FilteredEngineData,
-) -> Result<HashMap<String, super::dv::DeletionVectorDescriptor>, anyhow::Error> {
-    let batch = scan_files
-        .data()
-        .any_ref()
-        .downcast_ref::<ArrowEngineData>()
-        .ok_or_else(|| anyhow::anyhow!("scan output was not ArrowEngineData"))?
-        .record_batch();
-    let selection = scan_files.selection_vector();
-
-    let paths = batch
-        .column_by_name("path")
-        .map(|c| c.as_string::<i32>())
-        .ok_or_else(|| anyhow::anyhow!("scan row schema has no path column"))?;
-    let dv = batch
-        .column_by_name("deletionVector")
-        .map(|c| c.as_struct())
-        .ok_or_else(|| anyhow::anyhow!("scan row schema has no deletionVector column"))?;
-    let storage_type = dv
-        .column_by_name("storageType")
-        .map(|c| c.as_string::<i32>())
-        .ok_or_else(|| anyhow::anyhow!("deletionVector has no storageType column"))?;
-    let path_or_inline = dv
-        .column_by_name("pathOrInlineDv")
-        .map(|c| c.as_string::<i32>())
-        .ok_or_else(|| anyhow::anyhow!("deletionVector has no pathOrInlineDv column"))?;
-    let offset = dv
-        .column_by_name("offset")
-        .map(|c| c.as_primitive::<Int32Type>())
-        .ok_or_else(|| anyhow::anyhow!("deletionVector has no offset column"))?;
-    let size_in_bytes = dv
-        .column_by_name("sizeInBytes")
-        .map(|c| c.as_primitive::<Int32Type>())
-        .ok_or_else(|| anyhow::anyhow!("deletionVector has no sizeInBytes column"))?;
-    let cardinality = dv
-        .column_by_name("cardinality")
-        .map(|c| c.as_primitive::<Int64Type>())
-        .ok_or_else(|| anyhow::anyhow!("deletionVector has no cardinality column"))?;
-
-    let mut out = HashMap::new();
-    for row in 0..batch.num_rows() {
-        // selection vector may be shorter than the batch; a missing tail entry means selected
-        let selected = selection.get(row).copied().unwrap_or(true);
-        if !selected || dv.is_null(row) {
-            continue;
-        }
-        out.insert(
-            paths.value(row).to_string(),
-            super::dv::DeletionVectorDescriptor {
-                storage_type: storage_type.value(row).to_string(),
-                path_or_inline_dv: path_or_inline.value(row).to_string(),
-                offset: (!offset.is_null(row)).then(|| offset.value(row)),
-                size_in_bytes: size_in_bytes.value(row),
-                cardinality: cardinality.value(row),
-            },
-        );
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

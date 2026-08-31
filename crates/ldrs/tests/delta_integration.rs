@@ -3,8 +3,10 @@ use futures::TryStreamExt;
 use ldrs::ldrs_config::{execute_configs, parse_yaml_config, resolve_delta_targets};
 use ldrs_delta::{
     delta_stats_to_json, overwrite_delta, parquet_metadata_to_delta_stats, vacuum, Retention,
+    TableConfig,
 };
 use ldrs_parquet::builder_from_string;
+use ldrs_test_fixtures::delta::{cleanup_table, delta_table_path, make_target_batch, test_schema};
 use ldrs_test_fixtures::{data_url, fixture, fixture_url};
 
 #[tokio::test]
@@ -300,9 +302,17 @@ async fn test_overwrite_delta() {
         .unwrap()
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
 
-    overwrite_delta(&table_url, schema.clone(), stream, None, None, rt.handle())
-        .await
-        .unwrap();
+    overwrite_delta(
+        &table_url,
+        schema.clone(),
+        stream,
+        None,
+        None,
+        &TableConfig::default(),
+        rt.handle(),
+    )
+    .await
+    .unwrap();
 
     let v0_path = format!("{}/_delta_log/00000000000000000000.json", table_path);
     assert!(std::path::Path::new(&v0_path).exists());
@@ -321,9 +331,15 @@ async fn test_overwrite_delta() {
     assert!(std::path::Path::new(&v1_path).exists());
     let v1_content = std::fs::read_to_string(&v1_path).unwrap();
     let v1_lines: Vec<&str> = v1_content.lines().collect();
+    // The overwrite writes the schema v0 created, so nothing about the table moved and the commit
+    // says nothing about it: `commitInfo` and the file actions only.
     assert!(
-        v1_lines.len() >= 4,
-        "Version 1 should have at least 4 actions"
+        !v1_content.contains("\"metaData\""),
+        "an overwrite that changes neither schema nor configuration writes no metaData: {v1_content}"
+    );
+    assert!(
+        v1_lines.len() >= 2,
+        "Version 1 should have at least 2 actions (commitInfo, add)"
     );
 
     let v1_commit: serde_json::Value = serde_json::from_str(v1_lines[0]).unwrap();
@@ -333,12 +349,13 @@ async fn test_overwrite_delta() {
         "Overwrite"
     );
 
-    let v1_protocol: serde_json::Value = serde_json::from_str(v1_lines[1]).unwrap();
-    assert!(v1_protocol.get("protocol").is_some());
-    let v1_metadata: serde_json::Value = serde_json::from_str(v1_lines[2]).unwrap();
-    assert!(v1_metadata.get("metaData").is_some());
+    // Version 0 already declares everything an overwrite needs, so the commit carries no protocol action.
+    assert!(
+        !v1_content.contains("\"protocol\""),
+        "Version 1 should not re-declare an unchanged protocol"
+    );
 
-    let v1_add: serde_json::Value = serde_json::from_str(v1_lines[3]).unwrap();
+    let v1_add: serde_json::Value = serde_json::from_str(v1_lines[1]).unwrap();
     assert!(v1_add.get("add").is_some());
     let add = &v1_add["add"];
     assert!(add["path"].as_str().unwrap().ends_with(".parquet"));
@@ -364,9 +381,17 @@ async fn test_overwrite_delta() {
         .unwrap()
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
 
-    overwrite_delta(&table_url, schema, stream2, None, None, rt.handle())
-        .await
-        .unwrap();
+    overwrite_delta(
+        &table_url,
+        schema,
+        stream2,
+        None,
+        None,
+        &TableConfig::default(),
+        rt.handle(),
+    )
+    .await
+    .unwrap();
 
     let v2_path = format!("{}/_delta_log/00000000000000000002.json", table_path);
     assert!(std::path::Path::new(&v2_path).exists());
@@ -374,8 +399,12 @@ async fn test_overwrite_delta() {
     let v2_lines: Vec<&str> = v2_content.lines().collect();
 
     assert!(
-        v2_lines.len() >= 5,
-        "Version 2 should have at least 5 actions (with removes)"
+        !v2_content.contains("\"metaData\""),
+        "the second overwrite changes nothing about the table either: {v2_content}"
+    );
+    assert!(
+        v2_lines.len() >= 3,
+        "Version 2 should have at least 3 actions (commitInfo, remove, add)"
     );
 
     let has_remove = v2_lines.iter().any(|line| {
@@ -673,9 +702,17 @@ async fn test_overwrite_writes_checkpoint_past_interval() {
             .build()
             .unwrap()
             .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
-        overwrite_delta(&table_url, schema, stream, None, None, rt.handle())
-            .await
-            .unwrap();
+        overwrite_delta(
+            &table_url,
+            schema,
+            stream,
+            None,
+            None,
+            &TableConfig::default(),
+            rt.handle(),
+        )
+        .await
+        .unwrap();
     }
 
     let checkpoint = format!(
@@ -691,18 +728,6 @@ async fn test_overwrite_writes_checkpoint_past_interval() {
         serde_json::from_str(&std::fs::read_to_string(&hint).unwrap()).unwrap();
     assert_eq!(hint_json["version"], 10);
 
-    // The table id as committed at v11, before that commit history goes away.
-    let v11 = std::fs::read_to_string(format!(
-        "{}/_delta_log/00000000000000000011.json",
-        table_path
-    ))
-    .unwrap();
-    let table_id = v11
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .find_map(|v| v.get("metaData").map(|m| m["id"].clone()))
-        .expect("v11 should carry metaData");
-
     for v in 0..=10 {
         std::fs::remove_file(format!("{}/_delta_log/{:020}.json", table_path, v)).unwrap();
     }
@@ -716,9 +741,17 @@ async fn test_overwrite_writes_checkpoint_past_interval() {
         .build()
         .unwrap()
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
-    overwrite_delta(&table_url, schema, stream, None, None, rt.handle())
-        .await
-        .unwrap();
+    overwrite_delta(
+        &table_url,
+        schema,
+        stream,
+        None,
+        None,
+        &TableConfig::default(),
+        rt.handle(),
+    )
+    .await
+    .unwrap();
 
     let v12 = std::fs::read_to_string(format!(
         "{}/_delta_log/00000000000000000012.json",
@@ -729,17 +762,9 @@ async fn test_overwrite_writes_checkpoint_past_interval() {
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
-    let metadata = actions
-        .iter()
-        .find_map(|v| v.get("metaData"))
-        .expect("v12 should carry metaData");
-    assert_eq!(
-        metadata["id"], table_id,
-        "the table id can only have come from the checkpoint"
-    );
     assert!(
         actions.iter().any(|v| v.get("remove").is_some()),
-        "the overwrite should tombstone the file it replaces"
+        "the file the overwrite tombstoned can only have come from the checkpoint"
     );
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
@@ -783,9 +808,17 @@ async fn test_vacuum_deletes_orphans_and_keeps_referenced_files() {
             .build()
             .unwrap()
             .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
-        overwrite_delta(&table_url, schema, stream, None, None, rt.handle())
-            .await
-            .unwrap();
+        overwrite_delta(
+            &table_url,
+            schema,
+            stream,
+            None,
+            None,
+            &TableConfig::default(),
+            rt.handle(),
+        )
+        .await
+        .unwrap();
     }
 
     let orphan = added_path(&format!(
@@ -886,9 +919,17 @@ async fn test_vacuum_refuses_retention_under_the_table_floor() {
         .build()
         .unwrap()
         .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
-    overwrite_delta(&table_url, schema, stream, None, None, rt.handle())
-        .await
-        .unwrap();
+    overwrite_delta(
+        &table_url,
+        schema,
+        stream,
+        None,
+        None,
+        &TableConfig::default(),
+        rt.handle(),
+    )
+    .await
+    .unwrap();
 
     let err = vacuum(
         &table_url,
@@ -901,6 +942,170 @@ async fn test_vacuum_refuses_retention_under_the_table_floor() {
     assert!(
         err.to_string().contains("shorter than the table's"),
         "got: {err}"
+    );
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_created_tables_enable_in_commit_timestamps() {
+    let source_path = fixture_url("public.users/public.users.snappy.parquet");
+    let table_path = fixture("delta_writes/ict_users_delta/")
+        .display()
+        .to_string();
+    let table_url = fixture_url("delta_writes/ict_users_delta/");
+    let _ = std::fs::remove_dir_all(&table_path);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let overwrite_once = async || {
+        let builder = builder_from_string(source_path.clone(), rt.handle().clone())
+            .await
+            .unwrap();
+        let schema = builder.schema().clone();
+        let stream = builder
+            .with_batch_size(1024)
+            .build()
+            .unwrap()
+            .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
+        overwrite_delta(
+            &table_url,
+            schema,
+            stream,
+            None,
+            None,
+            &TableConfig::default(),
+            rt.handle(),
+        )
+        .await
+        .unwrap();
+    };
+
+    let action_at = |version: u64, action: &str| -> serde_json::Value {
+        let path = format!("{}_delta_log/{:020}.json", table_path, version);
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find_map(|v| v.get(action).cloned())
+            .unwrap_or_else(|| panic!("commit {version} should carry {action}"))
+    };
+    let ict_at = |version: u64| -> i64 {
+        action_at(version, "commitInfo")["inCommitTimestamp"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("commit {version} should carry an in-commit timestamp"))
+    };
+
+    overwrite_once().await;
+
+    // Both halves of enablement: the protocol declares the feature, the metadata switches it on.
+    let writer_features = action_at(0, "protocol")["writerFeatures"].clone();
+    assert_eq!(
+        writer_features,
+        serde_json::json!(["timestampNtz", "inCommitTimestamp"])
+    );
+    assert_eq!(
+        action_at(0, "protocol")["readerFeatures"],
+        serde_json::json!(["timestampNtz"]),
+        "inCommitTimestamp is writer-only and must not appear on the reader side"
+    );
+    assert_eq!(
+        action_at(0, "metaData")["configuration"]["delta.enableInCommitTimestamps"],
+        "true"
+    );
+
+    // A second overwrite appends v2, so v0/v1/v2 all have to carry a timestamp.
+    overwrite_once().await;
+
+    let (v0, v1, v2) = (ict_at(0), ict_at(1), ict_at(2));
+    assert!(v1 > v0, "v1 ({v1}) must advance past v0 ({v0})");
+    assert!(v2 > v1, "v2 ({v2}) must advance past v1 ({v1})");
+
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_overwrite_refuses_a_commit_missing_its_in_commit_timestamp() {
+    let source_path = fixture_url("public.users/public.users.snappy.parquet");
+    let table_path = fixture("delta_writes/ict_missing_users_delta/")
+        .display()
+        .to_string();
+    let table_url = fixture_url("delta_writes/ict_missing_users_delta/");
+    let _ = std::fs::remove_dir_all(&table_path);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let overwrite_once = async || {
+        let builder = builder_from_string(source_path.clone(), rt.handle().clone())
+            .await
+            .unwrap();
+        let schema = builder.schema().clone();
+        let stream = builder
+            .with_batch_size(1024)
+            .build()
+            .unwrap()
+            .map_err(|e: parquet::errors::ParquetError| anyhow::anyhow!(e));
+        overwrite_delta(
+            &table_url,
+            schema,
+            stream,
+            None,
+            None,
+            &TableConfig::default(),
+            rt.handle(),
+        )
+        .await
+    };
+
+    overwrite_once().await.unwrap();
+
+    // Stand in for a writer that does not implement the feature: the table still declares and
+    // enables it, but the head commit carries no timestamp for the next one to advance past.
+    let head = std::fs::read_dir(format!("{}_delta_log/", table_path))
+        .unwrap()
+        .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(".json")?.parse::<u64>().ok())
+        .max()
+        .unwrap();
+    let head_path = format!("{}_delta_log/{:020}.json", table_path, head);
+    let stripped = std::fs::read_to_string(&head_path)
+        .unwrap()
+        .lines()
+        .map(
+            |line| match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(mut action) if action.get("commitInfo").is_some() => {
+                    action["commitInfo"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("inCommitTimestamp");
+                    action.to_string()
+                }
+                _ => line.to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&head_path, stripped).unwrap();
+
+    let err = overwrite_once().await.unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("inCommitTimestamp") && message.contains(&format!("{head:020}.json")),
+        "got: {message}"
+    );
+    assert!(
+        !std::fs::exists(format!("{}_delta_log/{:020}.json", table_path, head + 1)).unwrap(),
+        "the refused commit must not have been written"
     );
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
@@ -961,24 +1166,24 @@ tables:
         .unwrap();
     }
 
-    let configuration_at = |version: u64| -> serde_json::Value {
+    let metadata_at = |version: u64| -> Option<serde_json::Value> {
         std::fs::read_to_string(format!("{}_delta_log/{:020}.json", table_path, version))
             .unwrap()
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find_map(|v| v.get("metaData").map(|m| m["configuration"].clone()))
-            .expect("commit should carry metaData")
+            .find_map(|v| v.get("metaData").cloned())
     };
 
     assert_eq!(
-        configuration_at(1)["delta.enableDeletionVectors"],
+        metadata_at(1).expect("the merge changed the configuration, so v1 carries metaData")
+            ["configuration"]["delta.enableDeletionVectors"],
         "true",
         "the merge should have enabled deletion vectors at v1"
     );
-    assert_eq!(
-        configuration_at(2)["delta.enableDeletionVectors"],
-        "true",
-        "the overwrite at v2 must not drop the property the merge set"
+    assert!(
+        metadata_at(2).is_none(),
+        "the overwrite at v2 changed neither schema nor configuration: {:?}",
+        metadata_at(2)
     );
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
@@ -986,10 +1191,7 @@ tables:
 
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
-async fn test_overwrite_preserves_partition_columns() {
-    // ldrs never writes a partitioned table, so the partitioning is introduced by hand: v0 comes
-    // from an overwrite, v1 restates its metaData with `partitionColumns`, and the overwrite at v2
-    // has to carry that forward.
+async fn test_overwrite_refuses_a_partitioned_table() {
     let config = r#"
 src: file
 dest: delta.overwrite
@@ -1027,39 +1229,62 @@ tables:
             None,
         )
         .await
-        .unwrap();
     };
 
     let commit_path = |version: u64| format!("{}_delta_log/{:020}.json", table_path, version);
-    let metadata_at = |version: u64| -> serde_json::Value {
+    let metadata_at = |version: u64| -> Option<serde_json::Value> {
         std::fs::read_to_string(commit_path(version))
             .unwrap()
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .find_map(|v| v.get("metaData").cloned())
-            .expect("commit should carry metaData")
+    };
+    let metadata_required = |version: u64| -> serde_json::Value {
+        metadata_at(version).expect("commit should carry metaData")
     };
 
-    run().await;
+    run().await.unwrap();
     assert_eq!(
-        metadata_at(0)["partitionColumns"],
+        metadata_required(0)["partitionColumns"],
         serde_json::json!([]),
         "ldrs creates unpartitioned tables"
     );
 
-    let mut partitioned = metadata_at(0);
+    let v0_ict = std::fs::read_to_string(commit_path(0))
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|v| v.get("commitInfo")?.get("inCommitTimestamp")?.as_i64())
+        .expect("v0 should carry an in-commit timestamp");
+
+    let mut partitioned = metadata_required(0);
     partitioned["partitionColumns"] = serde_json::json!(["bigint_value"]);
     std::fs::write(
         commit_path(1),
-        format!("{}\n", serde_json::json!({ "metaData": partitioned })),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({ "commitInfo": {
+                "timestamp": v0_ict + 1,
+                "operation": "SET TBLPROPERTIES",
+                "operationParameters": {},
+                "inCommitTimestamp": v0_ict + 1,
+            }}),
+            serde_json::json!({ "metaData": partitioned })
+        ),
     )
     .unwrap();
 
-    run().await;
+    run()
+        .await
+        .err()
+        .expect("a partitioned table must be refused");
+    assert!(
+        !std::path::Path::new(&commit_path(2)).exists(),
+        "the refusal must leave the table at v1"
+    );
     assert_eq!(
-        metadata_at(2)["partitionColumns"],
-        serde_json::json!(["bigint_value"]),
-        "the overwrite at v2 must not drop the partitioning named at v1"
+        metadata_required(1)["partitionColumns"],
+        serde_json::json!(["bigint_value"])
     );
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
@@ -1099,12 +1324,12 @@ tables:
     )
     .unwrap();
 
-    let names: Vec<&str> = targets.iter().map(|(name, _)| name.as_str()).collect();
+    let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, vec!["public.numbers", "public.users"]);
     assert!(
         targets
             .iter()
-            .all(|(_, path)| path.starts_with(dest_url.trim_end_matches('/'))),
+            .all(|t| t.table_path.starts_with(dest_url.trim_end_matches('/'))),
         "every target resolves under the delta root: {targets:?}"
     );
 
@@ -1115,7 +1340,7 @@ tables:
     )
     .unwrap();
     assert_eq!(selected.len(), 1, "--select narrows to one table");
-    assert_eq!(selected[0].0, "public.users");
+    assert_eq!(selected[0].name, "public.users");
 }
 
 #[test]
@@ -1176,5 +1401,80 @@ tables:
     )
     .unwrap();
     assert_eq!(targets.len(), 1);
-    assert!(targets[0].1.ends_with("public.numbers"), "{targets:?}");
+    assert!(
+        targets[0].table_path.ends_with("public.numbers"),
+        "{targets:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_table_properties_are_added_changed_and_never_removed() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path = delta_table_path("properties_reconcile");
+    cleanup_table(&table_path);
+    let table_url = format!("file://{}/", table_path);
+
+    let overwrite = async |config: TableConfig| {
+        overwrite_delta(
+            &table_url,
+            test_schema(),
+            futures::stream::iter(vec![Ok(make_target_batch(1..11))]),
+            None,
+            None,
+            &config,
+            &rt,
+        )
+        .await
+        .unwrap()
+    };
+    let configuration_at = |version: u64| -> Option<serde_json::Value> {
+        std::fs::read_to_string(format!("{}/_delta_log/{:020}.json", table_path, version))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find_map(|v| v.get("metaData").map(|m| m["configuration"].clone()))
+    };
+
+    let sized = |bytes: u64| TableConfig {
+        target_file_size: Some(std::num::NonZeroU64::new(bytes).unwrap()),
+        ..Default::default()
+    };
+
+    overwrite(sized(1024)).await;
+    assert_eq!(
+        configuration_at(1).expect("v1 declares a property the table lacked")
+            ["delta.targetFileSize"],
+        "1024"
+    );
+
+    overwrite(sized(1024)).await;
+    assert!(
+        configuration_at(2).is_none(),
+        "an unchanged property writes no metaData: {:?}",
+        configuration_at(2)
+    );
+
+    overwrite(sized(2048)).await;
+    assert_eq!(
+        configuration_at(3).expect("v3 changes the property")["delta.targetFileSize"],
+        "2048"
+    );
+
+    overwrite(TableConfig::default()).await;
+    assert!(
+        configuration_at(4).is_none(),
+        "declaring nothing removes nothing: {:?}",
+        configuration_at(4)
+    );
+    assert_eq!(
+        configuration_at(3).expect("v3 is still the newest metaData")["delta.targetFileSize"],
+        "2048",
+        "the property v3 set is what the table still carries"
+    );
+
+    assert_eq!(
+        configuration_at(3).unwrap()["delta.enableInCommitTimestamps"],
+        "true"
+    );
 }

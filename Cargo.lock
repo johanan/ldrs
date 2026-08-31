@@ -2044,7 +2044,10 @@ dependencies = [
 name = "ldrs-test-fixtures"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "rstest",
+ "serde_json",
  "test-log",
 ]
 
