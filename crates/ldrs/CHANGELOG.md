@@ -2,6 +2,51 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.0] - 2026-08-31
+
+### Bug Fixes
+
+- *(delta)* Protocol and metaData as diffs
+
+Changing from fixed to a diff from the actual delta table.
+
+- fixes the remove in overwrite with deletion vectors
+- properly read partitioned files
+- adds in-commit timestamps
+
+- *(duckdb)* Tests a range for duckdb
+
+Fixes the -no-init that forced 1.5. Now there is a MIN and MAX version
+that are actually tested.
+
+The test range is no 1.2.1 to 1.5.2
+
+
+### Features
+
+- *(delta)* Optimize
+
+Replicates, in our own way, optimize that will try and make fewer files
+and remove deletion vectors. Makes reading much easier.
+
+Not as complex as the Spark version, but it does order and optimize the
+delta table.
+
+- *(cli)* Delta optimize and maintenance commands
+
+Adds commands to run the new features. Each can take a config or run on
+a one-off table.
+
+
+### Tests
+
+- *(delta)* Spark fixture tables
+
+Real tables from the penguin dataset that are written by Spark. Used in
+the ecosystem integration tests along with Duckdb to prove ldrs is
+following the delta spec.
+
+
 ## [0.22.4] - 2026-08-18
 
 ### Bug Fixes
