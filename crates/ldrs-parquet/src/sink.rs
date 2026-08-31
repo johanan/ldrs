@@ -43,7 +43,28 @@ impl ParquetSink {
     ) -> Result<Self, anyhow::Error> {
         let url = base_or_relative_path(dir_path)?;
         let (store, base_path, _) = build_store(&url)?;
+        Self::with_store(
+            store,
+            base_path,
+            schema,
+            max_rows,
+            max_bytes,
+            namer,
+            writer_props,
+        )
+    }
 
+    /// Writes through a store the caller already holds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_store(
+        store: Arc<dyn ObjectStore>,
+        base_path: object_store::path::Path,
+        schema: SchemaRef,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
+        namer: FileNamer,
+        writer_props: Option<WriterProperties>,
+    ) -> Result<Self, anyhow::Error> {
         // namer(0) validates the template before any data moves. When rotation is
         // possible, consecutive names must differ or every rotation silently
         // overwrites the same file.

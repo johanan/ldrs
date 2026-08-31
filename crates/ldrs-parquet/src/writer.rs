@@ -164,6 +164,20 @@ pub async fn read_parquet_metadata(
     Ok(reader.get_metadata(None).await?)
 }
 
+/// Stream every column of every row group, in file order.
+pub async fn stream_parquet(
+    store: Arc<dyn ObjectStore>,
+    path: &object_store::path::Path,
+    size: u64,
+    handle: Handle,
+) -> Result<parquet::arrow::async_reader::ParquetRecordBatchStream<SpawnedStoreReader>, anyhow::Error>
+{
+    let reader = StoreReader::spawned(store, path.clone(), size, handle);
+    Ok(ParquetRecordBatchStreamBuilder::new(reader)
+        .await?
+        .build()?)
+}
+
 pub async fn stream_projected_parquet(
     store: Arc<dyn ObjectStore>,
     path: &object_store::path::Path,

@@ -22,7 +22,11 @@ fn duckdb_source(script: String) -> Spawned {
     Spawned {
         binary: which::which("duckdb")
             .expect("duckdb must be on PATH; see scripts/setup_duckdb.sh"),
-        args: vec!["-bail".to_string(), "-no-init".to_string()],
+        args: vec![
+            "-bail".to_string(),
+            "-init".to_string(),
+            "/dev/null".to_string(),
+        ],
         stdin: Some(script),
         env: std::env::vars()
             .map(|(key, value)| (key, value.into()))

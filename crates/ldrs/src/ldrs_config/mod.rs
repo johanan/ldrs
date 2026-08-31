@@ -243,13 +243,25 @@ fn delta_table_path(
     Ok(join_into_url(crate::delta::storage_url(&dest_value.1), resolved_target)?.to_string())
 }
 
-/// Resolve the delta destinations a config names into their table paths, paired with the table
-/// they came from.
+/// A delta table a maintenance command should act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaTarget {
+    /// The task's name from `tables:`. Not unique: one task can write several delta tables.
+    pub name: String,
+    /// The rendered destination target
+    pub target: String,
+    /// Table root and identity
+    pub table_path: String,
+    /// Pack order for optimize: the first merge key, when the destination is a merge; arbitrary otherwise.
+    pub order_column: Option<String>,
+}
+
+/// Resolve the delta destinations a config names into the tables to act on.
 pub fn resolve_delta_targets(
     tasks: Vec<LdrsParsedConfig>,
     select: Option<Vec<String>>,
     ldrs_env: &[(String, String)],
-) -> Result<Vec<(String, String)>, anyhow::Error> {
+) -> Result<Vec<DeltaTarget>, anyhow::Error> {
     let exec_env = ExecutionEnv::create(ldrs_env);
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
@@ -264,10 +276,19 @@ pub fn resolve_delta_targets(
             LdrsDestination::Delta(delta) => Some(delta),
             _ => None,
         }) {
-            let resolved_target = context.render_template(delta_target_name(dest))?;
-            let table_path = delta_table_path(&resolved_target, ldrs_env)?;
+            let target = context.render_template(delta_target_name(dest))?;
+            let table_path = delta_table_path(&target, ldrs_env)?;
+            let order_column = match dest {
+                DeltaDestination::Merge(merge) => merge.merge_keys.first().cloned(),
+                DeltaDestination::Overwrite(_) => None,
+            };
             if seen.insert(table_path.clone()) {
-                targets.push((name.clone(), table_path));
+                targets.push(DeltaTarget {
+                    name: name.clone(),
+                    target,
+                    table_path,
+                    order_column,
+                });
             }
         }
     }
@@ -296,7 +317,12 @@ pub async fn execute_configs(
         .as_deref()
         .map(std::fs::File::create)
         .transpose()
-        .with_context(|| format!("could not create report file '{}'", report.unwrap_or_default()))?;
+        .with_context(|| {
+            format!(
+                "could not create report file '{}'",
+                report.unwrap_or_default()
+            )
+        })?;
 
     let exec_env = ExecutionEnv::create(ldrs_env);
     // One connection pool per Postgres destination URL, shared read-only across every task. Strip

@@ -68,6 +68,20 @@ pub fn join_into_url(base: &str, relative: &str) -> Result<Url, anyhow::Error> {
         .with_context(|| "Could not join relative path onto base URL")
 }
 
+/// Convert a relative path encoded as a URI (RFC 2396) into the object store's spelling of it
+pub fn store_path_from_uri(path: &str) -> Result<Option<Path>, anyhow::Error> {
+    match Url::parse(path) {
+        Ok(_) => Ok(None),
+        Err(_) => Ok(Some(Path::from_url_path(path)?)),
+    }
+}
+
+pub fn join_store_path(base: &Path, relative: &Path) -> Path {
+    relative
+        .parts()
+        .fold(base.clone(), |path, part| path.join(part))
+}
+
 pub fn build_store(
     url: &Url,
 ) -> Result<(Arc<dyn ObjectStore>, Path, ObjectStoreScheme), anyhow::Error> {
@@ -103,6 +117,57 @@ pub fn build_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn store_path(uri: &str) -> Option<String> {
+        store_path_from_uri(uri).unwrap().map(String::from)
+    }
+
+    #[test]
+    fn store_path_from_uri_decodes_uri_encoding() {
+        // a partition value of `100%` is `dt=100%25` as an object key and `dt=100%2525` as a URI
+        assert_eq!(
+            store_path("dt=100%2525/part-0.parquet").as_deref(),
+            Some("dt=100%25/part-0.parquet")
+        );
+        assert_eq!(
+            store_path("dt=2026-01-01%2000%3A00%3A00/p.parquet").as_deref(),
+            Some("dt=2026-01-01 00:00:00/p.parquet")
+        );
+    }
+
+    #[test]
+    fn store_path_from_uri_has_no_answer_for_an_absolute_uri() {
+        assert_eq!(store_path("s3://other-bucket/t/a.parquet"), None);
+    }
+
+    #[test]
+    fn join_store_path_keeps_the_relative_path_nested() {
+        let base = Path::from("tables/users");
+        let relative = store_path_from_uri("dt=100%2525/part-0.parquet")
+            .unwrap()
+            .unwrap();
+        // Handing the relative path to `Path::join` as a string would encode both the separator and
+        // the percent, giving one segment named `dt=100%2525%2Fpart-0.parquet`.
+        assert_eq!(
+            String::from(join_store_path(&base, &relative)),
+            "tables/users/dt=100%25/part-0.parquet"
+        );
+        assert_eq!(
+            String::from(base.clone().join("dt=100%25/part-0.parquet")),
+            "tables/users/dt=100%2525%2Fpart-0.parquet",
+            "the broken form this exists to replace"
+        );
+    }
+
+    #[test]
+    fn join_store_path_handles_a_file_at_the_table_root() {
+        let base = Path::from("tables/users");
+        let relative = store_path_from_uri("part-0.parquet").unwrap().unwrap();
+        assert_eq!(
+            String::from(join_store_path(&base, &relative)),
+            "tables/users/part-0.parquet"
+        );
+    }
 
     #[test]
     fn test_base_or_relative_path() {

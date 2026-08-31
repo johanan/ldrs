@@ -1,4 +1,11 @@
+use std::collections::HashMap;
+
+use arrow::array::AsArray;
+use arrow_array::types::{Int32Type, Int64Type};
+use arrow_array::Array;
 use crc::{Crc, CRC_32_ISO_HDLC};
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine_data::FilteredEngineData;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -65,4 +72,66 @@ pub(crate) async fn build_dv_file(
         size_in_bytes: bytes.len() as i32,
         cardinality,
     })
+}
+
+/// The descriptor for every DV'd file in a scan batch, keyed by path.
+pub(crate) fn read_existing_dvs(
+    scan_files: &FilteredEngineData,
+) -> Result<HashMap<String, DeletionVectorDescriptor>, anyhow::Error> {
+    let batch = scan_files
+        .data()
+        .any_ref()
+        .downcast_ref::<ArrowEngineData>()
+        .ok_or_else(|| anyhow::anyhow!("scan output was not ArrowEngineData"))?
+        .record_batch();
+    let selection = scan_files.selection_vector();
+
+    let paths = batch
+        .column_by_name("path")
+        .map(|c| c.as_string::<i32>())
+        .ok_or_else(|| anyhow::anyhow!("scan row schema has no path column"))?;
+    let dv = batch
+        .column_by_name("deletionVector")
+        .map(|c| c.as_struct())
+        .ok_or_else(|| anyhow::anyhow!("scan row schema has no deletionVector column"))?;
+    let storage_type = dv
+        .column_by_name("storageType")
+        .map(|c| c.as_string::<i32>())
+        .ok_or_else(|| anyhow::anyhow!("deletionVector has no storageType column"))?;
+    let path_or_inline = dv
+        .column_by_name("pathOrInlineDv")
+        .map(|c| c.as_string::<i32>())
+        .ok_or_else(|| anyhow::anyhow!("deletionVector has no pathOrInlineDv column"))?;
+    let offset = dv
+        .column_by_name("offset")
+        .map(|c| c.as_primitive::<Int32Type>())
+        .ok_or_else(|| anyhow::anyhow!("deletionVector has no offset column"))?;
+    let size_in_bytes = dv
+        .column_by_name("sizeInBytes")
+        .map(|c| c.as_primitive::<Int32Type>())
+        .ok_or_else(|| anyhow::anyhow!("deletionVector has no sizeInBytes column"))?;
+    let cardinality = dv
+        .column_by_name("cardinality")
+        .map(|c| c.as_primitive::<Int64Type>())
+        .ok_or_else(|| anyhow::anyhow!("deletionVector has no cardinality column"))?;
+
+    let mut out = HashMap::new();
+    for row in 0..batch.num_rows() {
+        // selection vector may be shorter than the batch; a missing tail entry means selected
+        let selected = selection.get(row).copied().unwrap_or(true);
+        if !selected || dv.is_null(row) {
+            continue;
+        }
+        out.insert(
+            paths.value(row).to_string(),
+            DeletionVectorDescriptor {
+                storage_type: storage_type.value(row).to_string(),
+                path_or_inline_dv: path_or_inline.value(row).to_string(),
+                offset: (!offset.is_null(row)).then(|| offset.value(row)),
+                size_in_bytes: size_in_bytes.value(row),
+                cardinality: cardinality.value(row),
+            },
+        );
+    }
+    Ok(out)
 }

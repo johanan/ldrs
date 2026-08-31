@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -14,8 +15,8 @@ use uuid::Uuid;
 
 use crate::{
     build_add, build_engine, build_overwrite_commit, cleanup_source_files, should_checkpoint,
-    snapshot_table_state, version_to_log_filename, write_checkpoint, CHECKPOINT_INTERVAL,
-    MAX_COMMIT_RETRIES,
+    snapshot_table_state, version_to_log_filename, write_checkpoint, TableConfig,
+    CHECKPOINT_INTERVAL, MAX_COMMIT_RETRIES,
 };
 
 /// Streaming Delta overwrite. Writes data files through an embedded [`ParquetSink`]
@@ -28,6 +29,7 @@ pub struct DeltaOverwriteSink {
     base_path: object_store::path::Path,
     url: Url,
     schema: SchemaRef,
+    table_config: TableConfig,
 }
 
 impl DeltaOverwriteSink {
@@ -36,6 +38,7 @@ impl DeltaOverwriteSink {
         schema: SchemaRef,
         max_rows: Option<usize>,
         max_bytes: Option<usize>,
+        table_config: &TableConfig,
         cloud_io: &Handle,
     ) -> Result<Self, anyhow::Error> {
         let url = base_or_relative_path(table_path)?;
@@ -58,6 +61,7 @@ impl DeltaOverwriteSink {
             base_path,
             url,
             schema,
+            table_config: table_config.clone(),
         })
     }
 
@@ -81,6 +85,7 @@ impl DeltaOverwriteSink {
             &self.base_path,
             &self.url,
             &self.schema,
+            &self.table_config,
             &files,
         )
         .await
@@ -108,17 +113,21 @@ async fn commit_overwrite(
     base_path: &object_store::path::Path,
     url: &Url,
     schema: &SchemaRef,
+    table_config: &TableConfig,
     files: &[(String, ParquetMetaData, u64)],
 ) -> Result<(), anyhow::Error> {
     let now = chrono::Utc::now().timestamp_millis();
     let adds = files
         .iter()
-        .map(|(filename, metadata, size)| build_add(filename, metadata, *size, now, schema))
+        .map(|(filename, metadata, size)| {
+            build_add(filename, metadata, *size, now, schema, HashMap::new())
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     for _attempt in 0..MAX_COMMIT_RETRIES {
         let table_state = snapshot_table_state(engine.as_ref(), url)?;
-        let (commit_body, next_version) = build_overwrite_commit(&table_state, schema, &adds)?;
+        let (commit_body, next_version) =
+            build_overwrite_commit(&table_state, schema, &adds, table_config, engine.as_ref())?;
         let log_path = base_path
             .clone()
             .join("_delta_log")

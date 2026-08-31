@@ -19,7 +19,7 @@ pub struct DeltaStats {
     pub columns: Vec<(String, ColumnStats)>,
 }
 
-fn stats_to_scalars(stats: &Statistics) -> (Option<Scalar>, Option<Scalar>) {
+pub(crate) fn stats_to_scalars(stats: &Statistics) -> (Option<Scalar>, Option<Scalar>) {
     match stats {
         Statistics::Int32(s) => (
             s.min_opt().map(|v| Scalar::Integer(*v)),
@@ -84,7 +84,11 @@ fn coerce_to_logical(scalar: Option<Scalar>, data_type: &DataType) -> Option<Sca
     }
 }
 
-fn pick_bound(current: Option<Scalar>, new: Option<Scalar>, ordering: Ordering) -> Option<Scalar> {
+pub(crate) fn pick_bound(
+    current: Option<Scalar>,
+    new: Option<Scalar>,
+    ordering: Ordering,
+) -> Option<Scalar> {
     match (current, new) {
         (None, new) => new,
         (current, None) => current,

@@ -1,145 +1,18 @@
 use std::ops::Range;
-use std::process::Command;
 use std::sync::Arc;
 
 use arrow_array::builder::Int64Builder;
 use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use futures::stream;
-use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, TxnConfig};
-
-// 2026-01-01T00:00:00Z in microseconds
-const TARGET_BASE_TS: i64 = 1_767_225_600_000_000;
-// 2026-04-12T00:00:00Z in microseconds
-const SOURCE_BASE_TS: i64 = 1_775_952_000_000_000;
-// 1 minute in microseconds
-const TS_STEP: i64 = 60_000_000;
-
-fn test_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, true),
-        Field::new("value", DataType::Int64, true),
-        Field::new("name", DataType::Utf8, true),
-        Field::new(
-            "updated_at",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            true,
-        ),
-    ]))
-}
-
-fn make_batch(id_range: Range<i64>, value_offset: i64, base_ts: i64) -> RecordBatch {
-    make_batch_from_ids(id_range.collect(), value_offset, base_ts)
-}
-
-fn make_batch_from_ids(ids: Vec<i64>, value_offset: i64, base_ts: i64) -> RecordBatch {
-    let values: Vec<i64> = ids.iter().map(|id| id + value_offset).collect();
-    let names: Vec<String> = ids.iter().map(|id| format!("row-{:06}", id)).collect();
-    let timestamps: Vec<i64> = ids.iter().map(|id| base_ts + id * TS_STEP).collect();
-
-    RecordBatch::try_new(
-        test_schema(),
-        vec![
-            Arc::new(Int64Array::from(ids)),
-            Arc::new(Int64Array::from(values)),
-            Arc::new(StringArray::from(names)),
-            Arc::new(TimestampMicrosecondArray::from(timestamps).with_timezone("UTC")),
-        ],
-    )
-    .unwrap()
-}
-
-fn make_target_batch(id_range: Range<i64>) -> RecordBatch {
-    make_batch(id_range, 0, TARGET_BASE_TS)
-}
-
-fn make_source_batch(id_range: Range<i64>) -> RecordBatch {
-    make_batch(id_range, 10_000, SOURCE_BASE_TS)
-}
+use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, TableConfig, TxnConfig};
+use ldrs_test_fixtures::delta::{
+    cleanup_table, count_actions, delta_table_path, duckdb_count, find_action, latest_version,
+    make_batch, make_batch_from_ids, make_source_batch, make_target_batch, read_log_actions,
+    test_schema, SOURCE_BASE_TS, TARGET_BASE_TS, TS_STEP,
+};
 
 fn test_table_path(name: &str) -> String {
-    let cd = std::env::current_dir().unwrap();
-    format!(
-        "{}/tests/test_data/delta_writes/merge_{}",
-        cd.display(),
-        name
-    )
-}
-
-fn cleanup_table(path: &str) {
-    let _ = std::fs::remove_dir_all(path);
-}
-
-fn read_log_actions(table_path: &str, version: u64) -> Vec<serde_json::Value> {
-    let log_path = format!("{}/_delta_log/{:020}.json", table_path, version);
-    let content = std::fs::read_to_string(&log_path)
-        .unwrap_or_else(|_| panic!("Failed to read log version {}", version));
-    content
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
-}
-
-fn count_actions(actions: &[serde_json::Value], action_type: &str) -> usize {
-    actions
-        .iter()
-        .filter(|a| a.get(action_type).is_some())
-        .count()
-}
-
-fn find_action<'a>(
-    actions: &'a [serde_json::Value],
-    action_type: &str,
-) -> Option<&'a serde_json::Value> {
-    actions.iter().find_map(|a| a.get(action_type))
-}
-
-// Interop check: read the Delta table with the DuckDB CLI and assert the row count.
-// Skipped with a warning if `duckdb` is not on PATH so local `cargo test` still passes
-// for devs without DuckDB installed. CI installs it.
-fn verify_duckdb_count(table_path: &str, expected: i64) {
-    let sql = format!("SELECT count(*) FROM delta_scan('{}')", table_path);
-    let output = match Command::new("duckdb")
-        .args(["-noheader", "-csv", "-c", &sql])
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("SKIP: duckdb CLI not on PATH; interop check skipped for {table_path}");
-            return;
-        }
-        Err(e) => panic!("failed to invoke duckdb: {e}"),
-    };
-    assert!(
-        output.status.success(),
-        "duckdb failed for {table_path}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let actual: i64 = stdout
-        .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("could not parse duckdb output: {stdout:?}"));
-    assert_eq!(
-        actual, expected,
-        "duckdb row count mismatch for {table_path}"
-    );
-}
-
-// Highest committed version in `_delta_log`.
-fn latest_version(table_path: &str) -> u64 {
-    let log_dir = format!("{}/_delta_log", table_path);
-    std::fs::read_dir(&log_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            e.file_name()
-                .to_str()
-                .and_then(|n| n.strip_suffix(".json"))
-                .and_then(|n| n.parse::<u64>().ok())
-        })
-        .max()
-        .expect("at least one commit")
+    delta_table_path(&format!("merge_{name}"))
 }
 
 // A deletion vector larger than the 1024-byte inline threshold is stored as a file
@@ -163,6 +36,7 @@ async fn test_merge_file_based_dv_round_trip() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -185,6 +59,7 @@ async fn test_merge_file_based_dv_round_trip() {
         schema.clone(),
         stream::iter(vec![Ok(source1)]),
         config(),
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -211,6 +86,7 @@ async fn test_merge_file_based_dv_round_trip() {
         schema.clone(),
         stream::iter(vec![Ok(source2)]),
         config(),
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -229,7 +105,7 @@ async fn test_merge_file_based_dv_round_trip() {
     assert_eq!(unioned, m1 + m2, "DV should be the union of both merges");
 
     // Updates delete + reinsert, so the logical count is unchanged.
-    verify_duckdb_count(&table_path, 2000);
+    assert_eq!(duckdb_count(&table_path), "2000");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -245,9 +121,17 @@ async fn test_merge_basic_int_key() {
     // Write target: ids 1..=1000 via overwrite
     let target = make_target_batch(1..1001);
     let target_stream = stream::iter(vec![Ok(target)]);
-    overwrite_delta(&table_url, schema.clone(), target_stream, None, None, &rt)
-        .await
-        .unwrap();
+    overwrite_delta(
+        &table_url,
+        schema.clone(),
+        target_stream,
+        None,
+        None,
+        &TableConfig::default(),
+        &rt,
+    )
+    .await
+    .unwrap();
 
     // Merge source: ids 501..=1500
     // 500 updates (501..=1000), 500 inserts (1001..=1500)
@@ -261,9 +145,16 @@ async fn test_merge_basic_int_key() {
         txn_config: TxnConfig::None,
     };
 
-    let stats = merge_delta(&table_url, schema.clone(), source_stream, config, &rt)
-        .await
-        .unwrap();
+    let stats = merge_delta(
+        &table_url,
+        schema.clone(),
+        source_stream,
+        config,
+        &TableConfig::default(),
+        &rt,
+    )
+    .await
+    .unwrap();
 
     // Verify MergeStats
     assert_eq!(stats.source_rows, 1000, "source should have 1000 rows");
@@ -342,7 +233,7 @@ async fn test_merge_basic_int_key() {
     assert!(new_adds.len() > 0, "should have new source file adds");
 
     // Interop: after merge the logical table is ids 1..=1500
-    verify_duckdb_count(&table_path, 1500);
+    assert_eq!(duckdb_count(&table_path), "1500");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -366,9 +257,16 @@ async fn test_merge_empty_table() {
         txn_config: TxnConfig::None,
     };
 
-    let stats = merge_delta(&table_url, schema.clone(), source_stream, config, &rt)
-        .await
-        .unwrap();
+    let stats = merge_delta(
+        &table_url,
+        schema.clone(),
+        source_stream,
+        config,
+        &TableConfig::default(),
+        &rt,
+    )
+    .await
+    .unwrap();
 
     // Pure insert: no matches, no DVs
     assert_eq!(stats.source_rows, 500, "500 source rows");
@@ -424,9 +322,17 @@ async fn test_merge_all_matches() {
     // Target: ids 1..=1000
     let target = make_target_batch(1..1001);
     let target_stream = stream::iter(vec![Ok(target)]);
-    overwrite_delta(&table_url, schema.clone(), target_stream, None, None, &rt)
-        .await
-        .unwrap();
+    overwrite_delta(
+        &table_url,
+        schema.clone(),
+        target_stream,
+        None,
+        None,
+        &TableConfig::default(),
+        &rt,
+    )
+    .await
+    .unwrap();
 
     // Source: same ids 1..=1000 all updates, no inserts
     let source = make_source_batch(1..1001);
@@ -439,9 +345,16 @@ async fn test_merge_all_matches() {
         txn_config: TxnConfig::None,
     };
 
-    let stats = merge_delta(&table_url, schema.clone(), source_stream, config, &rt)
-        .await
-        .unwrap();
+    let stats = merge_delta(
+        &table_url,
+        schema.clone(),
+        source_stream,
+        config,
+        &TableConfig::default(),
+        &rt,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(stats.source_rows, 1000);
     assert_eq!(stats.matched_rows, 1000, "every source row should match");
@@ -501,6 +414,7 @@ async fn test_merge_with_existing_dvs() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -521,6 +435,7 @@ async fn test_merge_with_existing_dvs() {
         schema.clone(),
         stream::iter(vec![Ok(first_source)]),
         config.clone(),
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -536,6 +451,7 @@ async fn test_merge_with_existing_dvs() {
         schema.clone(),
         stream::iter(vec![Ok(second_source)]),
         config.clone(),
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -575,7 +491,7 @@ async fn test_merge_with_existing_dvs() {
     );
 
     // Interop: both merges were pure updates logical table is still ids 1..=1000
-    verify_duckdb_count(&table_path, 1000);
+    assert_eq!(duckdb_count(&table_path), "1000");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -596,6 +512,7 @@ async fn test_merge_string_key() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -617,6 +534,7 @@ async fn test_merge_string_key() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -668,6 +586,7 @@ async fn test_merge_timestamp_key() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -687,6 +606,7 @@ async fn test_merge_timestamp_key() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -731,6 +651,7 @@ async fn test_merge_composite_key() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -752,6 +673,7 @@ async fn test_merge_composite_key() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -796,6 +718,7 @@ async fn test_merge_txn_watermark_skip() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -819,6 +742,7 @@ async fn test_merge_txn_watermark_skip() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config.clone(),
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -839,6 +763,7 @@ async fn test_merge_txn_watermark_skip() {
         schema.clone(),
         stream::iter(vec![Ok(same_source)]),
         config.clone(),
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -879,6 +804,7 @@ async fn test_merge_txn_processing_time_skip() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -904,6 +830,7 @@ async fn test_merge_txn_processing_time_skip() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config.clone(),
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -927,6 +854,7 @@ async fn test_merge_txn_processing_time_skip() {
         schema.clone(),
         stream::iter(vec![Ok(same_source)]),
         config.clone(),
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -948,6 +876,7 @@ async fn test_merge_txn_processing_time_skip() {
         schema.clone(),
         stream::iter(vec![Ok(different_source)]),
         newer_config,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -988,6 +917,7 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -1031,6 +961,7 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
+        &TableConfig::default(),
         &rt,
     )
     .await;
@@ -1070,6 +1001,7 @@ async fn test_merge_small_change_uses_inline_dv() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -1090,6 +1022,7 @@ async fn test_merge_small_change_uses_inline_dv() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -1157,6 +1090,7 @@ async fn test_merge_small_change_uses_inline_dv() {
         schema.clone(),
         stream::iter(vec![Ok(second_source)]),
         second_config,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -1180,7 +1114,7 @@ async fn test_merge_small_change_uses_inline_dv() {
 
     // Interop: both merges were pure updates logical table is still ids 1..=1000.
     // This also proves DuckDB can decode our inline DV bytes (storageType "i").
-    verify_duckdb_count(&table_path, 1000);
+    assert_eq!(duckdb_count(&table_path), "1000");
 }
 
 // Recovering an existing *sidecar* ('u') DV descriptor for the remove action: the first merge
@@ -1205,6 +1139,7 @@ async fn test_merge_recovers_existing_sidecar_dv() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -1228,6 +1163,7 @@ async fn test_merge_recovers_existing_sidecar_dv() {
         schema.clone(),
         stream::iter(vec![Ok(first_source)]),
         config.clone(),
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -1260,6 +1196,7 @@ async fn test_merge_recovers_existing_sidecar_dv() {
         schema.clone(),
         stream::iter(vec![Ok(second_source)]),
         config.clone(),
+        &TableConfig::default(),
         &rt,
     )
     .await
@@ -1308,7 +1245,7 @@ async fn test_merge_recovers_existing_sidecar_dv() {
     );
 
     // Interop: both merges were pure updates logical table is still ids 1..=2000.
-    verify_duckdb_count(&table_path, 2000);
+    assert_eq!(duckdb_count(&table_path), "2000");
 }
 
 // A checkpoint lands once the log grows CHECKPOINT_INTERVAL (10) versions past the last one.
@@ -1334,18 +1271,33 @@ async fn test_merge_writes_checkpoint_past_interval() {
 
     // v0 creates the table, v1 seeds ids 1..=100.
     let target_stream = stream::iter(vec![Ok(make_target_batch(1..101))]);
-    overwrite_delta(&table_url, schema.clone(), target_stream, None, None, &rt)
-        .await
-        .unwrap();
+    overwrite_delta(
+        &table_url,
+        schema.clone(),
+        target_stream,
+        None,
+        None,
+        &TableConfig::default(),
+        &rt,
+    )
+    .await
+    .unwrap();
 
     // Ten merges of disjoint ids commit v2..=v11. The tenth builds its snapshot at v10 with
     // no checkpoint behind it — a gap of exactly 10 — so it checkpoints v10 before committing.
     for i in 0..10i64 {
         let start = 101 + i * 10;
         let source_stream = stream::iter(vec![Ok(make_source_batch(start..start + 10))]);
-        let stats = merge_delta(&table_url, schema.clone(), source_stream, config(), &rt)
-            .await
-            .unwrap();
+        let stats = merge_delta(
+            &table_url,
+            schema.clone(),
+            source_stream,
+            config(),
+            &TableConfig::default(),
+            &rt,
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.inserted_rows, 10, "merge {i} should insert 10 rows");
     }
 
@@ -1378,9 +1330,16 @@ async fn test_merge_writes_checkpoint_past_interval() {
     // One more merge, overlapping the seeded ids. Matching them at all means the file list
     // was resolved out of the checkpoint.
     let source_stream = stream::iter(vec![Ok(make_source_batch(1..11))]);
-    let stats = merge_delta(&table_url, schema.clone(), source_stream, config(), &rt)
-        .await
-        .unwrap();
+    let stats = merge_delta(
+        &table_url,
+        schema.clone(),
+        source_stream,
+        config(),
+        &TableConfig::default(),
+        &rt,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         stats.matched_rows, 10,
         "the seeded rows are only reachable through the checkpoint"
@@ -1401,5 +1360,83 @@ async fn test_merge_writes_checkpoint_past_interval() {
 
     // 100 seeded + 100 inserted; the last merge only updated rows. An external reader has to
     // make sense of the checkpoint too — this is the half our own read path cannot vouch for.
-    verify_duckdb_count(&table_path, 200);
+    assert_eq!(duckdb_count(&table_path), "200");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_overwrite_after_merge_retires_deletion_vectored_files() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path = test_table_path("overwrite_after_merge_dv");
+    cleanup_table(&table_path);
+
+    let schema = test_schema();
+    let table_url = format!("file://{}/", table_path);
+
+    let overwrite = async |ids: Range<i64>| {
+        let batch = make_target_batch(ids);
+        let stream = stream::iter(vec![Ok(batch)]);
+        overwrite_delta(
+            &table_url,
+            schema.clone(),
+            stream,
+            None,
+            None,
+            &TableConfig::default(),
+            &rt,
+        )
+        .await
+        .unwrap();
+    };
+
+    overwrite(1..1001).await;
+
+    let source = make_source_batch(501..1501);
+    let config = MergeConfig {
+        merge_keys: vec!["id".to_string()],
+        allow_null_keys: false,
+        max_rows: None,
+        max_bytes: None,
+        txn_config: TxnConfig::None,
+    };
+    let stats = merge_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(source)]),
+        config,
+        &TableConfig::default(),
+        &rt,
+    )
+    .await
+    .unwrap();
+    assert!(stats.files_with_dvs > 0, "merge should have written a DV");
+
+    let dv_paths: Vec<String> = read_log_actions(&table_path, 2)
+        .iter()
+        .filter_map(|action| action.get("add"))
+        .filter(|add| add.get("deletionVector").is_some())
+        .map(|add| add["path"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!dv_paths.is_empty(), "merge should have added a DV'd file");
+
+    overwrite(1..101).await;
+
+    let overwrite_actions = read_log_actions(&table_path, 3);
+    let removes: Vec<&serde_json::Value> = overwrite_actions
+        .iter()
+        .filter_map(|action| action.get("remove"))
+        .collect();
+    for path in &dv_paths {
+        let remove = removes
+            .iter()
+            .find(|remove| remove["path"].as_str() == Some(path.as_str()))
+            .unwrap_or_else(|| panic!("overwrite should remove the DV'd file {path}"));
+        assert!(
+            remove.get("deletionVector").is_some(),
+            "the remove for {path} must carry the descriptor of the DV it tombstones, or it names a \
+             different logical file than the add: {remove}"
+        );
+    }
+
+    assert_eq!(duckdb_count(&table_path), "100");
 }

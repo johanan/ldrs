@@ -259,8 +259,13 @@ pub fn duckdb_spawned(
         .collect();
 
     let (mut args, statements) = match src {
+        // `-init /dev/null` rather than `-no-init`, which only exists from 1.5.
         DuckDbSource::Query(_) => (
-            vec!["-bail".to_string(), "-no-init".to_string()],
+            vec![
+                "-bail".to_string(),
+                "-init".to_string(),
+                "/dev/null".to_string(),
+            ],
             managed_statements(sql, pre_sql, src_url, &ambient),
         ),
         DuckDbSource::Raw(_) => (vec!["-bail".to_string()], raw_statements(sql, pre_sql)),
@@ -479,7 +484,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             spawned.args,
-            vec!["-bail", "-no-init", "-readonly", "/data/warehouse.db"]
+            vec![
+                "-bail",
+                "-init",
+                "/dev/null",
+                "-readonly",
+                "/data/warehouse.db"
+            ]
         );
 
         let spawned = duckdb_spawned(

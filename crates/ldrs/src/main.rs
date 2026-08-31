@@ -7,13 +7,13 @@ use dotenvy::dotenv;
 use ldrs::cli_schema;
 use ldrs::ldrs_config::config::{find_unknown_block_keys, parse_dest, parse_src, LdrsParsedConfig};
 use ldrs::ldrs_config::{
-    execute_configs, infer_env_type, parse_yaml_config, resolve_delta_targets,
+    execute_configs, infer_env_type, parse_yaml_config, resolve_delta_targets, DeltaTarget,
 };
 use ldrs::ldrs_env::{ambient_env, get_all_ldrs_env_vars};
 use ldrs::lua_logic::lua_args::{modules_from_args, LuaArgs, SnowflakeResult, SnowflakeStrategy};
 use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
 use ldrs::path_pattern;
-use ldrs_delta::{vacuum, Retention};
+use ldrs_delta::{execute_plan, plan_optimize, vacuum, Retention};
 use ldrs_storage::build_store;
 use serde_yaml::{Mapping, Value};
 use tracing::{debug, error, info};
@@ -25,6 +25,14 @@ enum DeltaCommands {
     Vacuum(VacuumLdArgs),
     /// Vacuum a single delta table
     VacuumTable(VacuumTableArgs),
+    /// Compact the small files of every delta destination a config names
+    Optimize(OptimizeLdArgs),
+    /// Compact the small files of a single delta table
+    OptimizeTable(OptimizeTableArgs),
+    /// Optimize, then vacuum, then checkpoint every delta destination a config names
+    Maintenance(MaintenanceLdArgs),
+    /// Optimize, then vacuum, then checkpoint a single delta table
+    MaintenanceTable(MaintenanceTableArgs),
 }
 
 #[derive(Args)]
@@ -33,6 +41,9 @@ struct VacuumLdArgs {
     config: ConfigArgs,
     #[command(flatten)]
     vacuum: VacuumArgs,
+    #[arg(short, long)]
+    /// Just report what would be deleted.
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -42,6 +53,9 @@ struct VacuumTableArgs {
     url: String,
     #[command(flatten)]
     vacuum: VacuumArgs,
+    #[arg(short, long)]
+    /// Just report what would be deleted.
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -52,9 +66,61 @@ struct VacuumArgs {
     /// Retention period for vacuuming, e.g. "7 days". If specified, this will override the default retention period. Cannot be used with --retention.
     #[arg(long, conflicts_with = "retention", value_parser = ldrs_delta::parse_retention)]
     retention_unchecked: Option<Duration>,
+}
+
+#[derive(Args)]
+struct OptimizeLdArgs {
+    #[command(flatten)]
+    config: ConfigArgs,
+    #[command(flatten)]
+    optimize: OptimizeArgs,
     #[arg(short, long)]
-    /// Just report what would be deleted.
+    /// Just report the bins that would be rewritten.
     dry_run: bool,
+}
+
+#[derive(Args)]
+struct OptimizeTableArgs {
+    /// Table root object_store URL
+    #[arg(long)]
+    url: String,
+    #[command(flatten)]
+    optimize: OptimizeArgs,
+    #[arg(short, long)]
+    /// Just report the bins that would be rewritten.
+    dry_run: bool,
+}
+
+#[derive(Args)]
+struct OptimizeArgs {
+    /// Bytes to pack each output file toward. Overrides the table's `delta.targetFileSize`.
+    #[arg(long)]
+    target_size: Option<u64>,
+    /// Column to pack each bin in order of, so the outputs keep tight min/max ranges. Overrides the
+    /// first merge key, which a config's merge destination supplies on its own.
+    #[arg(long)]
+    order_column: Option<String>,
+}
+
+#[derive(Args)]
+struct MaintenanceLdArgs {
+    #[command(flatten)]
+    config: ConfigArgs,
+    #[command(flatten)]
+    optimize: OptimizeArgs,
+    #[command(flatten)]
+    vacuum: VacuumArgs,
+}
+
+#[derive(Args)]
+struct MaintenanceTableArgs {
+    /// Table root object_store URL
+    #[arg(long)]
+    url: String,
+    #[command(flatten)]
+    optimize: OptimizeArgs,
+    #[command(flatten)]
+    vacuum: VacuumArgs,
 }
 
 impl VacuumArgs {
@@ -167,38 +233,183 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
         })
 }
 
-/// Vacuum each target in turn. One table's failure is collected
-async fn run_vacuum(
-    targets: Vec<(String, String)>,
+/// A single table named on the command line rather than resolved from a config.
+fn target_from_url(url: &str) -> DeltaTarget {
+    DeltaTarget {
+        name: url.to_string(),
+        target: url.to_string(),
+        table_path: ldrs::delta::storage_url(url).to_string(),
+        order_column: None,
+    }
+}
+
+/// Read the config a maintenance verb was pointed at and resolve its delta destinations.
+fn targets_from_config(args: &ConfigArgs) -> Result<Vec<DeltaTarget>, anyhow::Error> {
+    let config_string = fs::read_to_string(&args.config)
+        .with_context(|| format!("Failed to read config file: {}", args.config))?;
+    let ldrs_env = get_all_ldrs_env_vars();
+    let configs = parse_yaml_config(&config_string, &ldrs_env)?;
+    resolve_delta_targets(configs, args.select.clone(), &ldrs_env)
+}
+
+async fn vacuum_target(
+    target: &DeltaTarget,
     args: &VacuumArgs,
+    dry_run: bool,
     cloud_io: &tokio::runtime::Handle,
 ) -> Result<(), anyhow::Error> {
-    let retention = args.retention();
+    let outcome = vacuum(&target.table_path, args.retention(), dry_run, cloud_io).await?;
+    info!(
+        table = %target.target,
+        listed = outcome.files_listed,
+        kept = outcome.files_kept,
+        selected = outcome.files_selected,
+        deleted = outcome.files_deleted,
+        retention_secs = outcome.retention_used.as_secs(),
+        dry_run = outcome.dry_run,
+        errors = outcome.delete_errors.len(),
+        "vacuum complete"
+    );
+    Ok(())
+}
+
+async fn optimize_target(
+    target: &DeltaTarget,
+    args: &OptimizeArgs,
+    dry_run: bool,
+    cloud_io: &tokio::runtime::Handle,
+) -> Result<(), anyhow::Error> {
+    // The flag wins over the merge key the config supplied.
+    let order_column = args
+        .order_column
+        .as_deref()
+        .or(target.order_column.as_deref());
+    let plan = plan_optimize(&target.table_path, args.target_size, order_column, cloud_io).await?;
+
+    let bins = plan.bins().len();
+    let input_files: usize = plan.bins().iter().map(|bin| bin.input_files()).sum();
+    if dry_run {
+        info!(
+            table = %target.target,
+            bins,
+            input_files,
+            "optimize plan (dry run, nothing written)"
+        );
+        return Ok(());
+    }
+
+    let outcome = execute_plan(plan, cloud_io).await?;
+    info!(
+        table = %target.target,
+        version = ?outcome.version,
+        files_added = outcome.files_added,
+        files_removed = outcome.files_removed,
+        bytes_added = outcome.bytes_added,
+        bytes_removed = outcome.bytes_removed,
+        deletion_vectors_removed = outcome.deletion_vectors_removed,
+        skipped = outcome.skipped,
+        "optimize complete"
+    );
+    Ok(())
+}
+
+async fn checkpoint_target(
+    target: &DeltaTarget,
+    cloud_io: &tokio::runtime::Handle,
+) -> Result<(), anyhow::Error> {
+    let outcome = ldrs_delta::checkpoint(&target.table_path, cloud_io).await?;
+    info!(
+        table = %target.target,
+        version = outcome.version,
+        written = outcome.written,
+        "checkpoint complete"
+    );
+    Ok(())
+}
+
+/// Optimize, then vacuum, then checkpoint.
+async fn maintain_target(
+    target: &DeltaTarget,
+    optimize: &OptimizeArgs,
+    vacuum: &VacuumArgs,
+    cloud_io: &tokio::runtime::Handle,
+) -> Result<(), anyhow::Error> {
     let mut failed = Vec::new();
-    for (name, table_path) in targets {
-        info!(table = %name, path = %table_path, "vacuuming");
-        match vacuum(&table_path, retention, args.dry_run, cloud_io).await {
-            Ok(outcome) => info!(
-                table = %name,
-                listed = outcome.files_listed,
-                kept = outcome.files_kept,
-                selected = outcome.files_selected,
-                deleted = outcome.files_deleted,
-                retention_secs = outcome.retention_used.as_secs(),
-                dry_run = outcome.dry_run,
-                errors = outcome.delete_errors.len(),
-                "vacuum complete"
-            ),
-            Err(e) => {
-                error!(table = %name, "vacuum failed: {e}");
-                failed.push(name);
-            }
-        }
+    if let Err(e) = optimize_target(target, optimize, false, cloud_io).await {
+        error!(table = %target.target, "optimize failed: {e:#}");
+        failed.push("optimize");
+    }
+    if let Err(e) = vacuum_target(target, vacuum, false, cloud_io).await {
+        error!(table = %target.target, "vacuum failed: {e:#}");
+        failed.push("vacuum");
+    }
+    if let Err(e) = checkpoint_target(target, cloud_io).await {
+        error!(table = %target.target, "checkpoint failed: {e:#}");
+        failed.push("checkpoint");
     }
     match failed.is_empty() {
         true => Ok(()),
+        false => Err(anyhow::anyhow!("{}", failed.join(", "))),
+    }
+}
+
+async fn run_vacuum(
+    targets: Vec<DeltaTarget>,
+    args: &VacuumArgs,
+    dry_run: bool,
+    cloud_io: &tokio::runtime::Handle,
+) -> Result<(), anyhow::Error> {
+    let mut failed = Vec::new();
+    for target in targets {
+        info!(table = %target.target, path = %target.table_path, "vacuuming");
+        if let Err(e) = vacuum_target(&target, args, dry_run, cloud_io).await {
+            error!(table = %target.target, "vacuum failed: {e:#}");
+            failed.push(target.target);
+        }
+    }
+    report_failures("vacuum", failed)
+}
+
+async fn run_optimize(
+    targets: Vec<DeltaTarget>,
+    args: &OptimizeArgs,
+    dry_run: bool,
+    cloud_io: &tokio::runtime::Handle,
+) -> Result<(), anyhow::Error> {
+    let mut failed = Vec::new();
+    for target in targets {
+        info!(table = %target.target, path = %target.table_path, "optimizing");
+        if let Err(e) = optimize_target(&target, args, dry_run, cloud_io).await {
+            error!(table = %target.target, "optimize failed: {e:#}");
+            failed.push(target.target);
+        }
+    }
+    report_failures("optimize", failed)
+}
+
+async fn run_maintenance(
+    targets: Vec<DeltaTarget>,
+    optimize: &OptimizeArgs,
+    vacuum: &VacuumArgs,
+    cloud_io: &tokio::runtime::Handle,
+) -> Result<(), anyhow::Error> {
+    let mut failed = Vec::new();
+    for target in targets {
+        info!(table = %target.target, path = %target.table_path, "maintaining");
+        if let Err(phases) = maintain_target(&target, optimize, vacuum, cloud_io).await {
+            error!(table = %target.target, "maintenance incomplete: {phases}");
+            failed.push(target.target);
+        }
+    }
+    report_failures("maintenance", failed)
+}
+
+/// A run that could not finish every table exits non-zero naming them, whatever else it managed.
+fn report_failures(verb: &str, failed: Vec<String>) -> Result<(), anyhow::Error> {
+    match failed.is_empty() {
+        true => Ok(()),
         false => Err(anyhow::anyhow!(
-            "vacuum failed for {} table(s): {}",
+            "{verb} failed for {} table(s): {}",
             failed.len(),
             failed.join(", ")
         )),
@@ -304,29 +515,32 @@ fn main() -> Result<(), anyhow::Error> {
                     let configs = parse_yaml_config(&config_string, &ldrs_env)?;
                     execute_configs(configs, args.select, &ldrs_env, rt.handle(), args.report).await
                 }
-                Destination::Delta {
-                    command: DeltaCommands::Vacuum(args),
-                } => {
-                    let config_string =
-                        fs::read_to_string(&args.config.config).with_context(|| {
-                            format!("Failed to read config file: {}", args.config.config)
-                        })?;
-                    let ldrs_env = get_all_ldrs_env_vars();
-                    let configs = parse_yaml_config(&config_string, &ldrs_env)?;
-                    let targets = resolve_delta_targets(configs, args.config.select, &ldrs_env)?;
-                    run_vacuum(targets, &args.vacuum, rt.handle()).await
-                }
-                Destination::Delta {
-                    command: DeltaCommands::VacuumTable(args),
-                } => {
-                    let table_path = ldrs::delta::storage_url(&args.url).to_string();
-                    run_vacuum(
-                        vec![(args.url.clone(), table_path)],
-                        &args.vacuum,
-                        rt.handle(),
-                    )
-                    .await
-                }
+                Destination::Delta { command } => match command {
+                    DeltaCommands::Vacuum(args) => {
+                        let targets = targets_from_config(&args.config)?;
+                        run_vacuum(targets, &args.vacuum, args.dry_run, rt.handle()).await
+                    }
+                    DeltaCommands::VacuumTable(args) => {
+                        let targets = vec![target_from_url(&args.url)];
+                        run_vacuum(targets, &args.vacuum, args.dry_run, rt.handle()).await
+                    }
+                    DeltaCommands::Optimize(args) => {
+                        let targets = targets_from_config(&args.config)?;
+                        run_optimize(targets, &args.optimize, args.dry_run, rt.handle()).await
+                    }
+                    DeltaCommands::OptimizeTable(args) => {
+                        let targets = vec![target_from_url(&args.url)];
+                        run_optimize(targets, &args.optimize, args.dry_run, rt.handle()).await
+                    }
+                    DeltaCommands::Maintenance(args) => {
+                        let targets = targets_from_config(&args.config)?;
+                        run_maintenance(targets, &args.optimize, &args.vacuum, rt.handle()).await
+                    }
+                    DeltaCommands::MaintenanceTable(args) => {
+                        let targets = vec![target_from_url(&args.url)];
+                        run_maintenance(targets, &args.optimize, &args.vacuum, rt.handle()).await
+                    }
+                },
                 Destination::Run(args) => {
                     let ldrs_env = get_all_ldrs_env_vars();
                     let config = build_run_block(&args)?;
