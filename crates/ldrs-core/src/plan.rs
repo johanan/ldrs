@@ -69,6 +69,7 @@ pub struct DeltaDest {
     pub mode: DeltaMode,
     pub columns: Vec<ColumnSpec>,
     pub target: String,
+    pub truncate_timestamps: bool,
 }
 
 pub enum DeltaMode {

@@ -1,8 +1,7 @@
-use ldrs_arrow::ColumnSpec;
+use ldrs_arrow::{ColumnSpec, TimeUnit};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
 
 fn default_app_id() -> String {
     "ldrs-merge-{{ name }}".to_string()
@@ -25,6 +24,9 @@ pub struct DeltaCommon {
     pub max_rows: Option<usize>,
     #[serde(alias = "delta.max_bytes")]
     pub max_bytes: Option<usize>,
+    /// Write nanosecond source timestamps as microseconds accepting the truncation.
+    #[serde(default, alias = "delta.truncate_timestamps")]
+    pub truncate_timestamps: bool,
 }
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -50,6 +52,9 @@ pub struct DeltaMerge {
     pub batch_version: Option<String>,
     #[serde(default = "default_app_id", alias = "delta.app_id")]
     pub app_id: String,
+    /// Store a small deletion vector in the commit instead of a sidecar file.
+    #[serde(default, alias = "delta.inline_deletion_vectors")]
+    pub inline_deletion_vectors: bool,
 }
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -83,27 +88,31 @@ pub enum MergeTxnConfig {
     },
 }
 
-/// Look up a key under a namespaced form first (`prefix.key`), then fall back to bare `key`.
-fn get_ns<'a>(value: &'a Value, prefix: &str, key: &str) -> Option<&'a Value> {
-    let ns_key = format!("{}.{}", prefix, key);
-    value.get(&ns_key).or(value.get(key))
-}
-
-pub fn validate(value: &Value, parsed: &DeltaDestination) -> Result<(), anyhow::Error> {
-    match parsed {
-        DeltaDestination::Overwrite(_) => {
-            if get_ns(value, "delta", "merge_keys").is_some() {
-                anyhow::bail!("merge_keys not allowed with dest: delta.overwrite");
-            }
+/// Whether the resulting configuration is valid, inherited values included.
+pub fn validate(parsed: &DeltaDestination) -> Result<(), anyhow::Error> {
+    let columns = match parsed {
+        DeltaDestination::Overwrite(c) => &c.columns,
+        DeltaDestination::Merge(m) => &m.common.columns,
+    };
+    for column in columns {
+        let (ColumnSpec::Timestamp { name, time_unit }
+        | ColumnSpec::TimestampTz { name, time_unit }) = column
+        else {
+            continue;
+        };
+        if matches!(time_unit, TimeUnit::Nanos) {
+            anyhow::bail!(
+                "column '{name}': delta stores microsecond timestamps, so 'time_unit: Nanos' cannot be written"
+            );
         }
-        DeltaDestination::Merge(m) => {
-            if m.merge_keys.is_empty() {
-                anyhow::bail!("merge_keys cannot be empty");
-            }
-            if matches!(m.txn_mode, Some(TxnMode::SourceWatermark)) && m.watermark_column.is_none()
-            {
-                anyhow::bail!("source_watermark requires watermark_column");
-            }
+    }
+
+    if let DeltaDestination::Merge(m) = parsed {
+        if m.merge_keys.is_empty() {
+            anyhow::bail!("merge_keys cannot be empty");
+        }
+        if matches!(m.txn_mode, Some(TxnMode::SourceWatermark)) && m.watermark_column.is_none() {
+            anyhow::bail!("source_watermark requires watermark_column");
         }
     }
     Ok(())
@@ -112,12 +121,43 @@ pub fn validate(value: &Value, parsed: &DeltaDestination) -> Result<(), anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_yaml::Value;
 
     fn parse_and_validate(yaml: &str) -> Result<DeltaDestination, anyhow::Error> {
         let value: Value = serde_yaml::from_str(yaml)?;
-        let parsed: DeltaDestination = serde_yaml::from_value(value.clone())?;
-        validate(&value, &parsed)?;
+        let parsed: DeltaDestination = serde_yaml::from_value(value)?;
+        validate(&parsed)?;
         Ok(parsed)
+    }
+
+    #[test]
+    fn a_declared_nanosecond_timestamp_is_refused() {
+        let err = parse_and_validate(
+            r#"
+dest: delta.overwrite
+name: events
+columns:
+  - { type: timestamp, name: occurred_at, time_unit: Nanos }
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("occurred_at"), "{err}");
+    }
+
+    #[test]
+    fn truncate_timestamps_defaults_off() {
+        let parsed = parse_and_validate(
+            r#"
+dest: delta.overwrite
+name: events
+"#,
+        )
+        .unwrap();
+        let DeltaDestination::Overwrite(common) = parsed else {
+            panic!("expected an overwrite destination");
+        };
+        assert!(!common.truncate_timestamps);
     }
 
     #[test]
@@ -257,15 +297,16 @@ batch_version: "{{ run_id }}"
     }
 
     #[test]
-    fn stray_merge_keys_on_overwrite_errors() {
-        let err = parse_and_validate(
+    fn merge_keys_on_overwrite_is_ignored() {
+        let dest = parse_and_validate(
             r#"
 dest: delta.overwrite
 name: public.users
 merge_keys: [id]
 "#,
-        );
-        assert!(err.is_err(), "expected validate to reject stray merge_keys");
+        )
+        .unwrap();
+        assert!(matches!(dest, DeltaDestination::Overwrite(_)));
     }
 
     #[test]

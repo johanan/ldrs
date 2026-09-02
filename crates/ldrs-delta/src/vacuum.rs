@@ -15,7 +15,7 @@ use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::{Engine, Snapshot, SnapshotRef, Version};
 use futures::StreamExt;
-use ldrs_storage::{base_or_relative_path, build_store, store_path_from_uri};
+use ldrs_storage::{base_or_relative_path, build_store, kernel_url, store_path_from_uri};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use tokio::runtime::Handle;
@@ -68,7 +68,7 @@ pub async fn vacuum(
     let url = base_or_relative_path(table_path)?;
     let (store, base_path, _) = build_store(&url)?;
     let engine = build_engine(store.clone(), cloud_io);
-    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(kernel_url(&url)?).build(engine.as_ref())?;
 
     // Everything that can refuse the vacuum resolves before the first delete.
     refuse_non_enumerable_features(&snapshot).context("cannot vacuum this table")?;

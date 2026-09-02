@@ -703,6 +703,10 @@ fn resolve_dest(
                 DeltaDestination::Overwrite(c) => c.columns.clone(),
                 DeltaDestination::Merge(m) => m.common.columns.clone(),
             };
+            let truncate_timestamps = match &delta_dest {
+                DeltaDestination::Overwrite(c) => c.truncate_timestamps,
+                DeltaDestination::Merge(m) => m.common.truncate_timestamps,
+            };
             let table_path = delta_table_path(&resolved_target, ldrs_env)?;
             let mode = match delta_dest {
                 DeltaDestination::Overwrite(o) => DeltaMode::Overwrite {
@@ -739,6 +743,7 @@ fn resolve_dest(
                         max_rows: m.common.max_rows,
                         max_bytes: m.common.max_bytes,
                         txn_config,
+                        inline_deletion_vectors: m.inline_deletion_vectors,
                     })
                 }
             };
@@ -747,6 +752,7 @@ fn resolve_dest(
                 mode,
                 columns,
                 target: resolved_target,
+                truncate_timestamps,
             }))
         }
         LdrsDestination::Arrow(arrow_dest) => {

@@ -114,12 +114,80 @@ pub fn build_store(
     Ok((store, path, scheme))
 }
 
+/// Workaround for delta-io/delta-kernel-rs#2209.
+pub fn kernel_url(url: &Url) -> Result<Url, anyhow::Error> {
+    let (scheme, base) = ObjectStoreScheme::parse(url).context("Not an ObjectStore URL")?;
+    if Path::from_url_path(url.path())? == base {
+        return Ok(url.clone());
+    }
+    let native = match scheme {
+        ObjectStoreScheme::MicrosoftAzure => "az",
+        ObjectStoreScheme::AmazonS3 => "s3",
+        ObjectStoreScheme::GoogleCloudStorage => "gs",
+        _ => return Ok(url.clone()),
+    };
+    // `parse` strips the leading segment; it is the container or bucket by construction.
+    let container = url
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .context("object store URL has no container or bucket segment")?;
+    Url::parse(&format!("{native}://{container}/{}", base.as_ref()))
+        .context("Could not rebuild the table URL for delta-kernel")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn store_path(uri: &str) -> Option<String> {
         store_path_from_uri(uri).unwrap().map(String::from)
+    }
+
+    #[test]
+    fn kernel_url_path_matches_the_store_root() {
+        for uri in [
+            "https://acct.blob.core.windows.net/cont/a/b",
+            "https://acct.dfs.core.windows.net/cont/a/b",
+            "https://s3.us-east-1.amazonaws.com/bucket/a/b",
+            "https://bucket.s3.amazonaws.com/a/b",
+            "az://cont/a/b",
+            "abfss://cont@acct.dfs.core.windows.net/a/b",
+            "s3://bucket/a/b",
+            "gs://bucket/a/b",
+        ] {
+            let url = Url::parse(uri).unwrap();
+            let (_, base) = ObjectStoreScheme::parse(&url).unwrap();
+            let rebuilt = kernel_url(&url).unwrap();
+            assert_eq!(
+                Path::from_url_path(rebuilt.path()).unwrap(),
+                base,
+                "kernel path disagrees with the store root for {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_url_rewrites_only_the_https_forms() {
+        let unchanged = "az://cont/a/b";
+        let url = Url::parse(unchanged).unwrap();
+        assert_eq!(kernel_url(&url).unwrap().as_str(), unchanged);
+
+        let url = Url::parse("https://acct.blob.core.windows.net/cont/a/b").unwrap();
+        assert_eq!(kernel_url(&url).unwrap().as_str(), "az://cont/a/b");
+    }
+
+    #[test]
+    fn kernel_url_handles_a_table_at_the_container_root() {
+        let url = Url::parse("https://acct.blob.core.windows.net/cont").unwrap();
+        let rebuilt = kernel_url(&url).unwrap();
+        assert_eq!(rebuilt.as_str(), "az://cont/");
+        assert_eq!(
+            Path::from_url_path(rebuilt.path()).unwrap(),
+            Path::from_url_path("").unwrap()
+        );
     }
 
     #[test]

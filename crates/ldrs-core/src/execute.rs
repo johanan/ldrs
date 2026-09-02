@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit as ArrowTimeUnit};
 use deadpool_postgres::Pool;
 use ldrs_arrow::{
     build_arrow_transform_strategy, build_source_and_target_schema, ArrowColumnTransformStrategy,
-    ColumnSpec,
+    ColumnSpec, TimeUnit,
 };
 use ldrs_delta::{ensure_table, DeltaMergeSink, DeltaOverwriteSink, TableConfig};
 use ldrs_parquet::{default_writer_props, with_bloom_filters, ParquetSink};
@@ -32,21 +32,19 @@ pub async fn run_task(
     pg_pools: &HashMap<String, Pool>,
     task: Task,
 ) -> Result<Option<PhaseOutput>, anyhow::Error> {
-    // Matching destinations share one transform; otherwise each casts its own.
-    let shared = all_columns_match(&task.dests);
     let src = open_source(task.source, cloud_io_rt).await?;
     let cleanup_handle = src.cleanup_handle;
     match src.schema {
         Some(schema) => {
-            let built =
-                build_sinks(task.dests, &src.source_cols, &schema, pg_pools, cloud_io_rt).await?;
-            let (mut sinks, per_dest): (Vec<Sink>, Vec<Option<BatchTransform>>) =
-                built.into_iter().unzip();
-            let transforms = if shared {
-                Transforms::Shared(per_dest.into_iter().next().flatten())
-            } else {
-                Transforms::PerDest(per_dest)
+            // Resolve every destination before opening any of them, so a later failure cannot
+            // leave an earlier one's table already created.
+            let (resolved, per_dest) = resolve_dests(task.dests, &src.source_cols, &schema)?;
+            // Destinations that resolved to the same columns share one transform.
+            let transforms = match transform_is_shared(&resolved) {
+                true => Transforms::Shared(per_dest.into_iter().next().flatten()),
+                false => Transforms::PerDest(per_dest),
             };
+            let mut sinks = build_sinks(resolved, pg_pools, cloud_io_rt).await?;
             match drive(src.stream_type, &mut sinks, &transforms).await {
                 Ok(rows) => {
                     // Settle the source before committing. A spawned source that dies mid-stream
@@ -84,21 +82,69 @@ pub async fn run_task(
     }
 }
 
-/// Build one sink per resolved destination spec, paired with the transform it needs (the executor
-/// owns the cast; sinks are passthrough writers). Aborts already-built sinks if a later one fails.
-pub async fn build_sinks(
+/// What a destination resolved to against the source schema
+pub struct ResolvedDest {
+    spec: DestSpec,
+    target_cols: Vec<ColumnSpec>,
+    out_schema: SchemaRef,
+}
+
+/// Resolve every destination against the source schema
+pub fn resolve_dests(
     dests: Vec<DestSpec>,
     source_cols: &[ColumnSpec],
     schema: &SchemaRef,
+) -> Result<(Vec<ResolvedDest>, Vec<Option<BatchTransform>>), anyhow::Error> {
+    dests
+        .into_iter()
+        .map(|dest| resolve_dest(dest, source_cols, schema))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|pairs| pairs.into_iter().unzip())
+}
+
+fn resolve_dest(
+    dest: DestSpec,
+    source_cols: &[ColumnSpec],
+    schema: &SchemaRef,
+) -> Result<(ResolvedDest, Option<BatchTransform>), anyhow::Error> {
+    let columns = match &dest {
+        // Delta stores timestamps at microsecond precision
+        DestSpec::Delta(delta) => {
+            timestamps_as_micros(schema, delta.columns.clone(), delta.truncate_timestamps)?
+        }
+        other => other.columns().to_vec(),
+    };
+    let (target_cols, out_schema, transform) = resolve_transform(source_cols, columns, schema)?;
+    Ok((
+        ResolvedDest {
+            spec: dest,
+            target_cols,
+            out_schema,
+        },
+        transform,
+    ))
+}
+
+/// Whether every destination resolved to the same target columns
+pub fn transform_is_shared(resolved: &[ResolvedDest]) -> bool {
+    resolved.len() > 1
+        && resolved
+            .windows(2)
+            .all(|w| w[0].target_cols == w[1].target_cols)
+}
+
+/// Construct one sink per resolved destination
+pub async fn build_sinks(
+    resolved: Vec<ResolvedDest>,
     pg_pools: &HashMap<String, Pool>,
     cloud_io: &tokio::runtime::Handle,
-) -> Result<Vec<(Sink, Option<BatchTransform>)>, anyhow::Error> {
-    let mut built = Vec::with_capacity(dests.len());
-    for dest in dests {
-        match build_sink(dest, source_cols, schema, pg_pools, cloud_io).await {
-            Ok(pair) => built.push(pair),
+) -> Result<Vec<Sink>, anyhow::Error> {
+    let mut built = Vec::with_capacity(resolved.len());
+    for dest in resolved {
+        match build_sink(dest, pg_pools, cloud_io).await {
+            Ok(sink) => built.push(sink),
             Err(e) => {
-                abort_all(built.into_iter().map(|(sink, _)| sink).collect()).await;
+                abort_all(built).await;
                 return Err(e);
             }
         }
@@ -106,20 +152,21 @@ pub async fn build_sinks(
     Ok(built)
 }
 
-/// Build one sink from its resolved plan spec: compute the schema-derived target columns and the
-/// cast, then construct the sink. The schema-dependent half of destination handling.
+/// Open the stores, create the table, and construct the writer.
 async fn build_sink(
-    dest: DestSpec,
-    source_cols: &[ColumnSpec],
-    schema: &SchemaRef,
+    resolved: ResolvedDest,
     pg_pools: &HashMap<String, Pool>,
     cloud_io: &tokio::runtime::Handle,
-) -> Result<(Sink, Option<BatchTransform>), anyhow::Error> {
-    match dest {
+) -> Result<Sink, anyhow::Error> {
+    let ResolvedDest {
+        spec,
+        target_cols,
+        out_schema,
+        ..
+    } = resolved;
+    match spec {
         DestSpec::Pg(pg) => {
             // PG keeps `target_cols` for COPY encoding; the cast runs in the executor.
-            let (target_cols, _out_schema, transform) =
-                resolve_transform(source_cols, pg.columns, schema)?;
             let target_and_cols = (target_cols.clone(), pg.target.clone());
             let load = PgLoad {
                 role: pg.role,
@@ -131,11 +178,9 @@ async fn build_sink(
             };
             let conn = pool_for(pg_pools, &pg.conn_url)?.get().await?;
             let sink = PgSink::open(conn, load).await?;
-            Ok((Sink::Pg(sink, target_and_cols), transform))
+            Ok(Sink::Pg(sink, target_and_cols))
         }
         DestSpec::Pq(pq) => {
-            let (target_cols, out_schema, transform) =
-                resolve_transform(source_cols, pq.columns, schema)?;
             let props = with_bloom_filters(default_writer_props(), pq.bloom_filters);
             let sink = ParquetSink::new(
                 &pq.url,
@@ -145,11 +190,9 @@ async fn build_sink(
                 pq.namer,
                 Some(props),
             )?;
-            Ok((Sink::Pq(sink, (target_cols, pq.target, pq.url)), transform))
+            Ok(Sink::Pq(sink, (target_cols, pq.target, pq.url)))
         }
         DestSpec::Delta(delta) => {
-            let (target_cols, out_schema, transform) =
-                resolve_transform(source_cols, delta.columns, schema)?;
             ensure_table(&delta.table_path, &out_schema).await?;
             let table_config = TableConfig::default();
             let sink = match delta.mode {
@@ -178,15 +221,52 @@ async fn build_sink(
                     (target_cols, delta.target, delta.table_path),
                 ),
             };
-            Ok((sink, transform))
+            Ok(sink)
         }
         DestSpec::Arrow(arrow) => {
-            let (_target_cols, out_schema, transform) =
-                resolve_transform(source_cols, arrow.columns, schema)?;
+            let _ = arrow;
             let sink = ArrowStdoutSink::new(io::stdout(), out_schema)?;
-            Ok((Sink::Arrow(sink), transform))
+            Ok(Sink::Arrow(sink))
         }
     }
+}
+
+/// Force every timestamp column to microseconds, required by delta.
+fn timestamps_as_micros(
+    schema: &SchemaRef,
+    mut columns: Vec<ColumnSpec>,
+    truncate: bool,
+) -> Result<Vec<ColumnSpec>, anyhow::Error> {
+    for field in schema.fields() {
+        let DataType::Timestamp(unit, tz) = field.data_type() else {
+            continue;
+        };
+        if matches!(unit, ArrowTimeUnit::Nanosecond) && !truncate {
+            anyhow::bail!(
+                "column '{}' is a nanosecond timestamp and delta stores microseconds; set 'truncate_timestamps: true' on the destination to truncate",
+                field.name()
+            );
+        }
+        let name = field.name().clone();
+        let spec = match tz {
+            Some(_) => ColumnSpec::TimestampTz {
+                name,
+                time_unit: TimeUnit::Micros,
+            },
+            None => ColumnSpec::Timestamp {
+                name,
+                time_unit: TimeUnit::Micros,
+            },
+        };
+        match columns
+            .iter()
+            .position(|c| c.name().eq_ignore_ascii_case(field.name()))
+        {
+            Some(index) => columns[index] = spec,
+            None => columns.push(spec),
+        }
+    }
+    Ok(columns)
 }
 
 /// Resolve a destination's column specs into its target columns, output schema, and the transform
@@ -238,12 +318,6 @@ fn column_helper(
     Ok((target_cols, strategies))
 }
 
-/// Whether every destination resolved to the same column specs. If they all match, the source
-/// columns are the same too, so one shared transform serves them all.
-fn all_columns_match(dests: &[DestSpec]) -> bool {
-    dests.len() > 1 && dests.windows(2).all(|w| w[0].columns() == w[1].columns())
-}
-
 /// Await a spawned source's cleanup task, if any, and report whether it settled cleanly. A
 /// truncated stream reads without error, so a non-zero child exit surfaces only here. `None` (e.g.
 /// the file source) settles clean. Also reaps the child on every path.
@@ -283,6 +357,146 @@ fn pool_for(pools: &HashMap<String, Pool>, url: &str) -> Result<Pool, anyhow::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use arrow_schema::Field;
+
+    fn schema_of(unit: ArrowTimeUnit, tz: Option<&str>) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("ts", DataType::Timestamp(unit, tz.map(Into::into)), true),
+        ]))
+    }
+
+    fn unit_of(columns: &[ColumnSpec], name: &str) -> Option<TimeUnit> {
+        columns.iter().find_map(|c| match c {
+            ColumnSpec::Timestamp { name: n, time_unit }
+            | ColumnSpec::TimestampTz { name: n, time_unit }
+                if n == name =>
+            {
+                Some(time_unit.clone())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn millis_widen_to_micros() {
+        let columns =
+            timestamps_as_micros(&schema_of(ArrowTimeUnit::Millisecond, None), vec![], false)
+                .unwrap();
+        assert_eq!(unit_of(&columns, "ts"), Some(TimeUnit::Micros));
+    }
+
+    #[test]
+    fn seconds_widen_to_micros() {
+        let columns =
+            timestamps_as_micros(&schema_of(ArrowTimeUnit::Second, None), vec![], false).unwrap();
+        assert_eq!(unit_of(&columns, "ts"), Some(TimeUnit::Micros));
+    }
+
+    /// A tz-carrying column has to stay tz-carrying, or the delta type flips to timestamp_ntz.
+    #[test]
+    fn a_zoned_timestamp_stays_zoned() {
+        let columns = timestamps_as_micros(
+            &schema_of(ArrowTimeUnit::Millisecond, Some("UTC")),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            columns.iter().find(|c| c.name() == "ts"),
+            Some(ColumnSpec::TimestampTz { .. })
+        ));
+    }
+
+    #[test]
+    fn nanos_are_refused_without_the_flag() {
+        let err = timestamps_as_micros(&schema_of(ArrowTimeUnit::Nanosecond, None), vec![], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'ts'"), "{err}");
+        assert!(err.contains("truncate_timestamps"), "{err}");
+    }
+
+    #[test]
+    fn nanos_truncate_when_the_flag_is_set() {
+        let columns =
+            timestamps_as_micros(&schema_of(ArrowTimeUnit::Nanosecond, None), vec![], true)
+                .unwrap();
+        assert_eq!(unit_of(&columns, "ts"), Some(TimeUnit::Micros));
+    }
+
+    /// A declared unit is replaced rather than duplicated
+    #[test]
+    fn a_declared_unit_is_replaced_not_duplicated() {
+        let declared = vec![ColumnSpec::Timestamp {
+            name: "ts".to_string(),
+            time_unit: TimeUnit::Millis,
+        }];
+        let columns = timestamps_as_micros(
+            &schema_of(ArrowTimeUnit::Millisecond, None),
+            declared,
+            false,
+        )
+        .unwrap();
+        assert_eq!(columns.iter().filter(|c| c.name() == "ts").count(), 1);
+        assert_eq!(unit_of(&columns, "ts"), Some(TimeUnit::Micros));
+    }
+
+    /// An already-micros column still gets a spec; the transform diff turns it into no work.
+    #[test]
+    fn micros_needs_no_cast() {
+        let schema = schema_of(ArrowTimeUnit::Microsecond, None);
+        let columns = timestamps_as_micros(&schema, vec![], false).unwrap();
+        let (_, _, transform) = resolve_transform(&[], columns, &schema).unwrap();
+        assert!(transform.is_none());
+    }
+
+    use crate::plan::{DeltaDest, PqDest};
+
+    fn delta_dest() -> DestSpec {
+        DestSpec::Delta(DeltaDest {
+            table_path: "file:///tmp/t".to_string(),
+            mode: DeltaMode::Overwrite {
+                max_rows: None,
+                max_bytes: None,
+            },
+            columns: vec![],
+            target: "t".to_string(),
+            truncate_timestamps: false,
+        })
+    }
+
+    fn pq_dest() -> DestSpec {
+        DestSpec::Pq(PqDest {
+            url: "file:///tmp/t".to_string(),
+            namer: Box::new(|_| Ok("part-0.parquet".to_string())),
+            bloom_filters: vec![],
+            max_rows: None,
+            max_bytes: None,
+            columns: vec![],
+            target: "t".to_string(),
+        })
+    }
+
+    /// Delta coerces timestamps to micros and parquet does not
+    #[test]
+    fn a_delta_and_pq_fanout_over_millis_does_not_share_a_transform() {
+        let schema = schema_of(ArrowTimeUnit::Millisecond, None);
+        let (resolved, per_dest) =
+            resolve_dests(vec![pq_dest(), delta_dest()], &[], &schema).unwrap();
+
+        assert!(!transform_is_shared(&resolved));
+        assert!(per_dest[0].is_none(), "parquet keeps the source unit");
+        assert!(per_dest[1].is_some(), "delta must cast millis to micros");
+    }
+
+    #[test]
+    fn a_fanout_over_micros_still_shares() {
+        let schema = schema_of(ArrowTimeUnit::Microsecond, None);
+        let (resolved, _) = resolve_dests(vec![pq_dest(), delta_dest()], &[], &schema).unwrap();
+        assert!(transform_is_shared(&resolved));
+    }
 
     // build_pg_pool is lazy (no connection), so these exercise the map offline.
 

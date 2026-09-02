@@ -13,7 +13,9 @@ use delta_kernel::{Engine, Snapshot, SnapshotRef, Version};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use futures::{Stream, StreamExt};
-use ldrs_storage::{base_or_relative_path, build_store, join_store_path, store_path_from_uri};
+use ldrs_storage::{
+    base_or_relative_path, build_store, join_store_path, kernel_url, store_path_from_uri,
+};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::Serialize;
 use tokio::runtime::Handle;
@@ -27,13 +29,15 @@ mod overwrite;
 mod stats;
 mod vacuum;
 
+pub use features::refuse_non_micros_timestamps;
 pub use merge::*;
 pub use optimize::*;
 pub use overwrite::*;
 pub use stats::*;
 pub use vacuum::*;
 
-const CHECKPOINT_INTERVAL: u64 = 10;
+/// Delta's cadence for a table that sets no `delta.checkpointInterval`.
+const DEFAULT_CHECKPOINT_INTERVAL: u64 = 10;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -256,6 +260,14 @@ fn should_checkpoint(version: Version, last_checkpoint: Option<Version>, interva
     version.saturating_sub(last_checkpoint.unwrap_or(0)) >= interval
 }
 
+fn checkpoint_interval(snapshot: &Snapshot) -> u64 {
+    snapshot
+        .table_properties()
+        .checkpoint_interval
+        .map(NonZeroU64::get)
+        .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL)
+}
+
 async fn write_checkpoint(
     engine: Arc<dyn Engine>,
     snapshot: SnapshotRef,
@@ -285,7 +297,7 @@ pub async fn checkpoint(
     let url = base_or_relative_path(table_path)?;
     let (store, _, _) = build_store(&url)?;
     let engine = build_engine(store, cloud_io);
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(kernel_url(&url)?).build(engine.as_ref())?;
     let version = snapshot.version();
 
     let (result, _) = write_checkpoint(engine, snapshot).await?;
@@ -720,6 +732,7 @@ fn configuration_with(
 }
 
 pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), anyhow::Error> {
+    refuse_non_micros_timestamps(schema)?;
     let url = base_or_relative_path(table_path)?;
     let (store, base_path, _) = build_store(&url)?;
 
@@ -781,7 +794,7 @@ fn snapshot_table_state(
     engine: &dyn Engine,
     table_url: &url::Url,
 ) -> Result<TableState, anyhow::Error> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine)?;
+    let snapshot = Snapshot::builder_for(kernel_url(table_url)?).build(engine)?;
     let version = snapshot.version();
     let scan = snapshot
         .clone()

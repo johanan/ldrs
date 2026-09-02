@@ -1,8 +1,6 @@
-use anyhow::Context;
 use ldrs_arrow::ColumnSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
 
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct PgCommon {
@@ -12,6 +10,7 @@ pub struct PgCommon {
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
     pub role: Option<String>,
+    #[serde(default)]
     #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
 }
@@ -24,6 +23,7 @@ pub struct PgDeleteInsert {
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
     pub role: Option<String>,
+    #[serde(default)]
     #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
     pub delete_keys: Vec<String>,
@@ -37,6 +37,7 @@ pub struct PgMerge {
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
     pub role: Option<String>,
+    #[serde(default)]
     #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
     pub merge_keys: Vec<String>,
@@ -248,87 +249,6 @@ impl PgDestination {
     }
 }
 
-fn get_either<'a>(yaml: &'a Value, ns_tag: &'a str, tag: &'a str) -> Option<&'a Value> {
-    yaml.get(ns_tag).or(yaml.get(tag))
-}
-
-pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<PgDestination, anyhow::Error> {
-    let name = yaml
-        .get("name")
-        .and_then(|v| String::deserialize(v).ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Missing name for kind pg (see `ldrs schema pg` for required fields)")
-        })?;
-    let target = yaml.get("target").and_then(|v| String::deserialize(v).ok());
-    // get common values
-    let pre_sql =
-        get_either(yaml, "pg.pre_sql", "pre_sql").and_then(|v| String::deserialize(v).ok());
-    let post_sql =
-        get_either(yaml, "pg.post_sql", "post_sql").and_then(|v| String::deserialize(v).ok());
-    let role = get_either(yaml, "pg.role", "role").and_then(|v| String::deserialize(v).ok());
-    let columns = get_either(yaml, "pg.columns", "columns")
-        .map(|v| Vec::<ColumnSpec>::deserialize(v))
-        .transpose()
-        .context("failed to parse columns for kind pg")?
-        .unwrap_or_default();
-    // get discriminators
-    let merge_keys = get_either(yaml, "pg.merge_keys", "merge_keys")
-        .and_then(|v| Vec::<String>::deserialize(v).ok());
-    let delete_keys = get_either(yaml, "pg.delete_keys", "delete_keys")
-        .and_then(|v| Vec::<String>::deserialize(v).ok());
-    // create destination
-    match (merge_keys, delete_keys) {
-        (Some(_), Some(_)) => Err(anyhow::anyhow!("Both merge_keys and delete_keys are set")),
-        (Some(merge_keys), None) => match tag {
-            Some("pg.merge") | Some("pg") | None => Ok(PgDestination::Merge(PgMerge {
-                name,
-                target,
-                pre_sql,
-                post_sql,
-                role,
-                columns,
-                merge_keys,
-            })),
-            _ => Err(anyhow::anyhow!("Invalid tag for merge destination")),
-        },
-        (None, Some(delete_keys)) => match tag {
-            Some("pg.delete_insert") | Some("pg") | None => {
-                Ok(PgDestination::DeleteInsert(PgDeleteInsert {
-                    name,
-                    target,
-                    pre_sql,
-                    post_sql,
-                    role,
-                    columns,
-                    delete_keys,
-                }))
-            }
-            _ => Err(anyhow::anyhow!("Invalid tag for delete_insert destination")),
-        },
-        (None, None) => match tag {
-            Some("pg.drop_replace") => Ok(PgDestination::DropReplace(PgCommon {
-                name,
-                target,
-                pre_sql,
-                post_sql,
-                role,
-                columns,
-            })),
-            Some("pg.truncate_insert") => Ok(PgDestination::TruncateInsert(PgCommon {
-                name,
-                target,
-                pre_sql,
-                post_sql,
-                role,
-                columns,
-            })),
-            _ => Err(anyhow::anyhow!(
-                "Must specify a tag for drop_replace or truncate_insert destination"
-            )),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,12 +265,6 @@ columns: []
 "#;
 
         let pg_drop_replace: PgDestination = serde_yaml::from_str(yaml).unwrap();
-        let pg_drop_replace_parse = from_serde_yaml(
-            &(serde_yaml::from_str(yaml).unwrap()),
-            Some("pg.drop_replace"),
-        )
-        .unwrap();
-
         let expected = PgDestination::DropReplace(PgCommon {
             name: "my_table".to_string(),
             target: None,
@@ -363,7 +277,6 @@ columns: []
         });
 
         assert_eq!(pg_drop_replace, expected);
-        assert_eq!(pg_drop_replace_parse, expected);
     }
 
     #[test]
@@ -377,12 +290,6 @@ columns: []
 "#;
 
         let pg_truncate_insert: PgDestination = serde_yaml::from_str(yaml).unwrap();
-        let pg_truncate_insert_parse = from_serde_yaml(
-            &(serde_yaml::from_str(yaml).unwrap()),
-            Some("pg.truncate_insert"),
-        )
-        .unwrap();
-
         let expected = PgDestination::TruncateInsert(PgCommon {
             name: "my_table".to_string(),
             target: None,
@@ -395,7 +302,6 @@ columns: []
         });
 
         assert_eq!(pg_truncate_insert, expected);
-        assert_eq!(pg_truncate_insert_parse, expected);
     }
 
     #[test]
@@ -411,15 +317,6 @@ delete_keys: [id]
 "#;
 
         let pg_delete_insert: PgDestination = serde_yaml::from_str(yaml).unwrap();
-        let pg_delete_insert_parse = from_serde_yaml(
-            &(serde_yaml::from_str(yaml).unwrap()),
-            Some("pg.delete_insert"),
-        )
-        .unwrap();
-
-        let pg_delete_insert_infer =
-            from_serde_yaml(&(serde_yaml::from_str(yaml).unwrap()), None).unwrap();
-
         let expected = PgDestination::DeleteInsert(PgDeleteInsert {
             name: "my_table".to_string(),
             target: None,
@@ -433,8 +330,6 @@ delete_keys: [id]
         });
 
         assert_eq!(pg_delete_insert, expected);
-        assert_eq!(pg_delete_insert_parse, expected);
-        assert_eq!(pg_delete_insert_infer, expected);
     }
 
     #[test]
@@ -448,12 +343,6 @@ merge_keys: [id]
 "#;
 
         let pg_merge: PgDestination = serde_yaml::from_str(yaml).unwrap();
-        let pg_merge_parsed =
-            from_serde_yaml(&(serde_yaml::from_str(yaml).unwrap()), Some("pg.merge")).unwrap();
-
-        let pg_merge_inferred =
-            from_serde_yaml(&(serde_yaml::from_str(yaml).unwrap()), None).unwrap();
-
         let expected = PgDestination::Merge(PgMerge {
             name: "my_table".to_string(),
             target: None,
@@ -465,7 +354,40 @@ merge_keys: [id]
         });
 
         assert_eq!(pg_merge, expected);
-        assert_eq!(pg_merge_parsed, expected);
-        assert_eq!(pg_merge_inferred, expected);
+    }
+
+    #[test]
+    fn a_bare_drop_replace_block_parses() {
+        let parsed: PgDestination = serde_yaml::from_str(
+            r#"
+dest: pg.drop_replace
+name: my_table
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            PgDestination::DropReplace(PgCommon {
+                name: "my_table".to_string(),
+                target: None,
+                pre_sql: None,
+                post_sql: None,
+                role: None,
+                columns: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn a_stray_merge_keys_does_not_reshape_the_variant() {
+        let parsed: PgDestination = serde_yaml::from_str(
+            r#"
+dest: pg.drop_replace
+name: my_table
+merge_keys: [id]
+"#,
+        )
+        .unwrap();
+        assert!(matches!(parsed, PgDestination::DropReplace(_)));
     }
 }

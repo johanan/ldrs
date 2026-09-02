@@ -10,7 +10,7 @@ use ldrs_parquet::{
     default_writer_props, read_parquet_metadata, stream_projected_parquet, with_bloom_filters,
     FileNamer, ParquetSink, ROW_NUMBER_COLUMN,
 };
-use ldrs_storage::base_or_relative_path;
+use ldrs_storage::{base_or_relative_path, kernel_url};
 use object_store::ObjectStore;
 use parquet::file::metadata::ParquetMetaData;
 use tokio::runtime::Handle;
@@ -21,9 +21,9 @@ use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::{
-    build_add, build_engine, cleanup_source_files, ensure_table, file_path, should_checkpoint,
-    version_to_log_filename, write_checkpoint, Commit, DeltaRemove, DeltaTxn, Operation,
-    TableConfig, CHECKPOINT_INTERVAL, MERGE_MAX_RETRIES,
+    build_add, build_engine, checkpoint_interval, cleanup_source_files, ensure_table, file_path,
+    should_checkpoint, version_to_log_filename, write_checkpoint, Commit, DeltaRemove, DeltaTxn,
+    Operation, TableConfig, MERGE_MAX_RETRIES,
 };
 
 use super::dv::{build_dv_file, build_dv_inline, serialize_dv};
@@ -45,6 +45,7 @@ pub struct MergeConfig {
     pub max_rows: Option<usize>,
     pub max_bytes: Option<usize>,
     pub txn_config: TxnConfig,
+    pub inline_deletion_vectors: bool,
 }
 
 #[derive(Clone)]
@@ -228,6 +229,7 @@ impl DeltaMergeSink {
         table_config: &TableConfig,
         cloud_io: &Handle,
     ) -> Result<Self, anyhow::Error> {
+        crate::refuse_non_micros_timestamps(&schema)?;
         let url = base_or_relative_path(table_path)?;
         let bloom_columns: Vec<Vec<String>> = merge_config
             .merge_keys
@@ -343,10 +345,12 @@ async fn commit_merge(
     let (app_id, batch_version) =
         compute_batch_version(&merge_config.txn_config, source_files, schema)?;
 
+    let table_url = kernel_url(url)?;
+
     // Retry loop
     for _attempt in 0..MERGE_MAX_RETRIES {
         // get a fresh snapshot, this is either the first pass or we failed and we need fresh metadata
-        let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let version = snapshot.version();
         if let (Some(app_id), Some(batch_version)) = (app_id.as_ref(), batch_version) {
             if let Ok(Some(last_version)) = snapshot.get_app_id_version(app_id, engine.as_ref()) {
@@ -426,16 +430,19 @@ async fn commit_merge(
             })
             .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
-        const DV_INLINE_THRESHOLD: usize = 1024;
+        // A vector past this size bloats the commit, so it goes to a file whatever was asked for.
+        const DV_INLINE_CEILING: usize = 1024;
 
         let mut adds_with_dvs = Vec::with_capacity(file_matches.len());
         for fm in &file_matches {
             let dv_bytes = serialize_dv(&fm.deleted_rows);
             let cardinality = fm.deleted_rows.len() as i64;
-            let descriptor = if dv_bytes.len() <= DV_INLINE_THRESHOLD {
-                build_dv_inline(&dv_bytes, cardinality)
-            } else {
-                build_dv_file(store.as_ref(), base_path, &dv_bytes, cardinality).await?
+            let descriptor = match (
+                merge_config.inline_deletion_vectors,
+                dv_bytes.len() <= DV_INLINE_CEILING,
+            ) {
+                (true, true) => build_dv_inline(&dv_bytes, cardinality),
+                _ => build_dv_file(store.as_ref(), base_path, &dv_bytes, cardinality).await?,
             };
 
             let file_stats = parquet_metadata_to_delta_stats(&fm.metadata, schema);
@@ -504,7 +511,7 @@ async fn commit_merge(
                 if should_checkpoint(
                     version,
                     snapshot.log_segment().checkpoint_version,
-                    CHECKPOINT_INTERVAL,
+                    checkpoint_interval(&snapshot),
                 ) {
                     match write_checkpoint(engine.clone(), snapshot).await {
                         Ok((r, _)) => info!(version, result = ?r, "checkpoint"),

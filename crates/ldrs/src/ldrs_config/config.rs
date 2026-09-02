@@ -8,9 +8,7 @@ use crate::{
         from_serde_yaml as from_sf_serde_yaml, SFQuery, SFSource, SFTable,
     },
     parquet::ParquetDestination,
-    postgres::postgres_destination::{
-        from_serde_yaml, PgCommon, PgDeleteInsert, PgDestination, PgMerge,
-    },
+    postgres::postgres_destination::{PgCommon, PgDeleteInsert, PgDestination, PgMerge},
 };
 
 use std::collections::HashSet;
@@ -261,8 +259,7 @@ pub fn parse_dest(
     match dest_prefix {
         "pg" => {
             let parsed = serde_yaml::from_value::<PgDestination>(value.clone())
-                .with_context(|| format!("failed to parse pg destination: {}", dest))
-                .or_else(|_| from_serde_yaml(&value, Some(&dest)))?;
+                .with_context(|| format!("failed to parse pg destination: {}", dest))?;
             Ok(LdrsDestination::Pg(parsed))
         }
         "pq" => {
@@ -272,7 +269,7 @@ pub fn parse_dest(
         "delta" => {
             let parsed: DeltaDestination = serde_yaml::from_value(value.clone())
                 .with_context(|| format!("failed to parse delta destination: {}", dest))?;
-            delta::validate(&value, &parsed)?;
+            delta::validate(&parsed)?;
             Ok(LdrsDestination::Delta(parsed))
         }
         "arrow" => {
@@ -388,14 +385,16 @@ fn parse_table_nested(
         src_default,
     )?;
 
-    // `name` (fixed) and `columns` (unless the block overrides) inherited into each block.
+    // `name` (fixed), plus `columns` and `merge_keys` unless the block overrides them.
     let mut inherited = serde_yaml::Mapping::new();
     inherited.insert(
         Value::String("name".to_string()),
         Value::String(src.name().to_string()),
     );
-    if let Some(cols) = table.get("columns") {
-        inherited.insert(Value::String("columns".to_string()), cols.clone());
+    for key in ["columns", "merge_keys"] {
+        if let Some(value) = table.get(key) {
+            inherited.insert(Value::String(key.to_string()), value.clone());
+        }
     }
     let inherited = Some(Value::Mapping(inherited));
 
@@ -423,12 +422,12 @@ fn parse_table_nested(
         .into_iter()
         .unzip();
 
-    // source-block unknown keys against src fields + `src`/`destinations`/`columns` (not `dest`).
+    // source-block unknown keys against src fields + the keys a table declares for its destinations (not `dest`).
     let src_fields = source_known_fields(&src);
     let src_allowed: HashSet<&str> = src_fields
         .iter()
         .map(String::as_str)
-        .chain(["src", "destinations", "columns", "finalize"])
+        .chain(["src", "destinations", "columns", "merge_keys", "finalize"])
         .collect();
 
     let (finalize, finalize_unknowns) = parse_finalize(&table, config)?;
@@ -544,6 +543,7 @@ mod tests {
                 columns: Vec::new(),
                 max_rows: None,
                 max_bytes: None,
+                truncate_timestamps: false,
             },
             merge_keys: Vec::new(),
             allow_null_keys: false,
@@ -551,6 +551,7 @@ mod tests {
             watermark_column: None,
             batch_version: None,
             app_id: String::new(),
+            inline_deletion_vectors: false,
         }));
         let mut got = destination_known_fields(&dest);
         got.sort();
@@ -561,11 +562,13 @@ mod tests {
                 "app_id",
                 "batch_version",
                 "columns",
+                "inline_deletion_vectors",
                 "max_bytes",
                 "max_rows",
                 "merge_keys",
                 "name",
                 "target",
+                "truncate_timestamps",
                 "txn_mode",
                 "watermark_column",
             ]
@@ -677,6 +680,96 @@ tables:
             LdrsDestination::Pq(p) => assert_eq!(p.columns.len(), 3),
             other => panic!("expected pq, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn nested_merge_keys_inherit_into_the_blocks_that_use_them() {
+        let yaml = r#"
+src: file
+destinations:
+  - dest: delta.merge
+  - dest: pq
+    filename: "out/{{ name }}.parquet"
+tables:
+  - name: users
+    merge_keys: [id]
+"#;
+        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let dests = &configs[0].dests;
+        match &dests[0] {
+            LdrsDestination::Delta(DeltaDestination::Merge(m)) => {
+                assert_eq!(m.merge_keys, vec!["id".to_string()])
+            }
+            other => panic!("expected delta merge, got {:?}", other),
+        }
+        assert!(matches!(&dests[1], LdrsDestination::Pq(_)));
+    }
+
+    #[test]
+    fn nested_dest_merge_keys_override_the_table() {
+        let yaml = r#"
+src: file
+destinations:
+  - dest: delta.merge
+    merge_keys: [account_id]
+tables:
+  - name: users
+    merge_keys: [id]
+"#;
+        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        match &configs[0].dests[0] {
+            LdrsDestination::Delta(DeltaDestination::Merge(m)) => {
+                assert_eq!(m.merge_keys, vec!["account_id".to_string()])
+            }
+            other => panic!("expected delta merge, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_merge_keys_do_not_reshape_a_non_merge_pg_block() {
+        let yaml = r#"
+src: file
+destinations:
+  - dest: pg.merge
+  - dest: pg.drop_replace
+  - dest: pg.delete_insert
+    delete_keys: [id]
+tables:
+  - name: users
+    merge_keys: [id]
+"#;
+        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let dests = &configs[0].dests;
+        assert!(matches!(
+            &dests[0],
+            LdrsDestination::Pg(PgDestination::Merge(_))
+        ));
+        assert!(matches!(
+            &dests[1],
+            LdrsDestination::Pg(PgDestination::DropReplace(_))
+        ));
+        assert!(matches!(
+            &dests[2],
+            LdrsDestination::Pg(PgDestination::DeleteInsert(_))
+        ));
+    }
+
+    #[test]
+    fn nested_table_merge_keys_is_not_an_unknown_key() {
+        let yaml = r#"
+src: file
+destinations:
+  - dest: delta.merge
+tables:
+  - name: users
+    merge_keys: [id]
+"#;
+        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        assert!(
+            configs[0].unknown_keys.is_empty(),
+            "got {:?}",
+            configs[0].unknown_keys
+        );
     }
 
     #[test]

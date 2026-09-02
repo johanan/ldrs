@@ -14,9 +14,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    build_add, build_engine, build_overwrite_commit, cleanup_source_files, should_checkpoint,
-    snapshot_table_state, version_to_log_filename, write_checkpoint, TableConfig,
-    CHECKPOINT_INTERVAL, MAX_COMMIT_RETRIES,
+    build_add, build_engine, build_overwrite_commit, checkpoint_interval, cleanup_source_files,
+    should_checkpoint, snapshot_table_state, version_to_log_filename, write_checkpoint, TableConfig,
+    MAX_COMMIT_RETRIES,
 };
 
 /// Streaming Delta overwrite. Writes data files through an embedded [`ParquetSink`]
@@ -41,6 +41,7 @@ impl DeltaOverwriteSink {
         table_config: &TableConfig,
         cloud_io: &Handle,
     ) -> Result<Self, anyhow::Error> {
+        crate::refuse_non_micros_timestamps(&schema)?;
         let url = base_or_relative_path(table_path)?;
         let namer: FileNamer = Box::new(|_| Ok(format!("{}.parquet", Uuid::new_v4())));
         let inner = ParquetSink::new(
@@ -149,7 +150,7 @@ async fn commit_overwrite(
                 if should_checkpoint(
                     version,
                     table_state.snapshot.log_segment().checkpoint_version,
-                    CHECKPOINT_INTERVAL,
+                    checkpoint_interval(&table_state.snapshot),
                 ) {
                     match write_checkpoint(engine.clone(), table_state.snapshot).await {
                         Ok((r, _)) => info!(version, result = ?r, "checkpoint"),
