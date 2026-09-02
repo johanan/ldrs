@@ -10,7 +10,7 @@ use ldrs_parquet::{
     default_writer_props, read_parquet_metadata, stream_projected_parquet, with_bloom_filters,
     FileNamer, ParquetSink, ROW_NUMBER_COLUMN,
 };
-use ldrs_storage::base_or_relative_path;
+use ldrs_storage::{base_or_relative_path, kernel_url};
 use object_store::ObjectStore;
 use parquet::file::metadata::ParquetMetaData;
 use tokio::runtime::Handle;
@@ -343,10 +343,12 @@ async fn commit_merge(
     let (app_id, batch_version) =
         compute_batch_version(&merge_config.txn_config, source_files, schema)?;
 
+    let table_url = kernel_url(url)?;
+
     // Retry loop
     for _attempt in 0..MERGE_MAX_RETRIES {
         // get a fresh snapshot, this is either the first pass or we failed and we need fresh metadata
-        let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let version = snapshot.version();
         if let (Some(app_id), Some(batch_version)) = (app_id.as_ref(), batch_version) {
             if let Ok(Some(last_version)) = snapshot.get_app_id_version(app_id, engine.as_ref()) {

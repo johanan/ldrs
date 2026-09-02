@@ -13,7 +13,9 @@ use delta_kernel::{Engine, Snapshot, SnapshotRef, Version};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use futures::{Stream, StreamExt};
-use ldrs_storage::{base_or_relative_path, build_store, join_store_path, store_path_from_uri};
+use ldrs_storage::{
+    base_or_relative_path, build_store, join_store_path, kernel_url, store_path_from_uri,
+};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::Serialize;
 use tokio::runtime::Handle;
@@ -285,7 +287,7 @@ pub async fn checkpoint(
     let url = base_or_relative_path(table_path)?;
     let (store, _, _) = build_store(&url)?;
     let engine = build_engine(store, cloud_io);
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(kernel_url(&url)?).build(engine.as_ref())?;
     let version = snapshot.version();
 
     let (result, _) = write_checkpoint(engine, snapshot).await?;
@@ -781,7 +783,7 @@ fn snapshot_table_state(
     engine: &dyn Engine,
     table_url: &url::Url,
 ) -> Result<TableState, anyhow::Error> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine)?;
+    let snapshot = Snapshot::builder_for(kernel_url(table_url)?).build(engine)?;
     let version = snapshot.version();
     let scan = snapshot
         .clone()
