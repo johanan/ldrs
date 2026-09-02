@@ -45,6 +45,7 @@ pub struct MergeConfig {
     pub max_rows: Option<usize>,
     pub max_bytes: Option<usize>,
     pub txn_config: TxnConfig,
+    pub inline_deletion_vectors: bool,
 }
 
 #[derive(Clone)]
@@ -429,16 +430,19 @@ async fn commit_merge(
             })
             .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
-        const DV_INLINE_THRESHOLD: usize = 1024;
+        // A vector past this size bloats the commit, so it goes to a file whatever was asked for.
+        const DV_INLINE_CEILING: usize = 1024;
 
         let mut adds_with_dvs = Vec::with_capacity(file_matches.len());
         for fm in &file_matches {
             let dv_bytes = serialize_dv(&fm.deleted_rows);
             let cardinality = fm.deleted_rows.len() as i64;
-            let descriptor = if dv_bytes.len() <= DV_INLINE_THRESHOLD {
-                build_dv_inline(&dv_bytes, cardinality)
-            } else {
-                build_dv_file(store.as_ref(), base_path, &dv_bytes, cardinality).await?
+            let descriptor = match (
+                merge_config.inline_deletion_vectors,
+                dv_bytes.len() <= DV_INLINE_CEILING,
+            ) {
+                (true, true) => build_dv_inline(&dv_bytes, cardinality),
+                _ => build_dv_file(store.as_ref(), base_path, &dv_bytes, cardinality).await?,
             };
 
             let file_stats = parquet_metadata_to_delta_stats(&fm.metadata, schema);

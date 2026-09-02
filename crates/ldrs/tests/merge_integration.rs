@@ -48,6 +48,7 @@ async fn test_merge_file_based_dv_round_trip() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
 
     // Merge 1: 700 scattered matches
@@ -143,6 +144,7 @@ async fn test_merge_basic_int_key() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
 
     let stats = merge_delta(
@@ -255,6 +257,7 @@ async fn test_merge_empty_table() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
 
     let stats = merge_delta(
@@ -343,6 +346,7 @@ async fn test_merge_all_matches() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
 
     let stats = merge_delta(
@@ -426,6 +430,7 @@ async fn test_merge_with_existing_dvs() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
 
     // First merge: update ids 1..=500 (creates DVs covering rows 1-500)
@@ -527,6 +532,7 @@ async fn test_merge_string_key() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
 
     let stats = merge_delta(
@@ -599,6 +605,7 @@ async fn test_merge_timestamp_key() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
 
     let stats = merge_delta(
@@ -666,6 +673,7 @@ async fn test_merge_composite_key() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
 
     let stats = merge_delta(
@@ -733,6 +741,7 @@ async fn test_merge_txn_watermark_skip() {
             app_id: "ldrs-merge-test".to_string(),
             watermark_column: "updated_at".to_string(),
         },
+        inline_deletion_vectors: false,
     };
 
     // First merge should commit
@@ -821,6 +830,7 @@ async fn test_merge_txn_processing_time_skip() {
             app_id: "ldrs-merge-test".to_string(),
             batch_version: Some(batch_version),
         },
+        inline_deletion_vectors: false,
     };
 
     // First merge: commits
@@ -954,6 +964,7 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
 
     let result = merge_delta(
@@ -983,9 +994,80 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
     );
 }
 
+/// DV goes to a sidecar unless asked for inline.
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
-async fn test_merge_small_change_uses_inline_dv() {
+async fn test_a_small_dv_goes_to_a_file_by_default() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path = test_table_path("file_dv_default");
+    cleanup_table(&table_path);
+
+    let schema = test_schema();
+    let table_url = format!("file://{}/", table_path);
+
+    let target = make_target_batch(1..1001);
+    overwrite_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(target)]),
+        None,
+        None,
+        &TableConfig::default(),
+        &rt,
+    )
+    .await
+    .unwrap();
+
+    let source = make_source_batch(100..110);
+    let config = MergeConfig {
+        merge_keys: vec!["id".to_string()],
+        allow_null_keys: false,
+        max_rows: None,
+        max_bytes: None,
+        txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
+    };
+
+    let stats = merge_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(source)]),
+        config,
+        &TableConfig::default(),
+        &rt,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.files_with_dvs, 1);
+
+    let actions = read_log_actions(&table_path, 2);
+    let dv = actions
+        .iter()
+        .filter_map(|a| a.get("add"))
+        .find_map(|a| a.get("deletionVector"))
+        .expect("an add should carry a DV");
+    assert_eq!(
+        dv["storageType"].as_str(),
+        Some("u"),
+        "a small DV should still go to a file; got: {dv}"
+    );
+    assert_eq!(dv["cardinality"].as_i64(), Some(10));
+
+    let dv_files: Vec<_> = std::fs::read_dir(&table_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("deletion_vector_")
+        })
+        .collect();
+    assert_eq!(dv_files.len(), 1, "expected one sidecar DV file");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_inline_option_stores_a_small_dv_in_the_commit() {
     let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("inline_dv");
     cleanup_table(&table_path);
@@ -1015,6 +1097,7 @@ async fn test_merge_small_change_uses_inline_dv() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: true,
     };
 
     let stats = merge_delta(
@@ -1084,6 +1167,7 @@ async fn test_merge_small_change_uses_inline_dv() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: true,
     };
     let stats2 = merge_delta(
         &table_url,
@@ -1151,6 +1235,7 @@ async fn test_merge_recovers_existing_sidecar_dv() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
 
     // First merge: update every even id (1000 scattered rows). Scattered deletes defeat roaring's
@@ -1267,6 +1352,7 @@ async fn test_merge_writes_checkpoint_past_interval() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
 
     // v0 creates the table, v1 seeds ids 1..=100.
@@ -1398,6 +1484,7 @@ async fn test_overwrite_after_merge_retires_deletion_vectored_files() {
         max_rows: None,
         max_bytes: None,
         txn_config: TxnConfig::None,
+        inline_deletion_vectors: false,
     };
     let stats = merge_delta(
         &table_url,

@@ -52,6 +52,9 @@ pub struct DeltaMerge {
     pub batch_version: Option<String>,
     #[serde(default = "default_app_id", alias = "delta.app_id")]
     pub app_id: String,
+    /// Store a small deletion vector in the commit instead of a sidecar file.
+    #[serde(default, alias = "delta.inline_deletion_vectors")]
+    pub inline_deletion_vectors: bool,
 }
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]

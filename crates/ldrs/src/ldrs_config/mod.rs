@@ -743,6 +743,7 @@ fn resolve_dest(
                         max_rows: m.common.max_rows,
                         max_bytes: m.common.max_bytes,
                         txn_config,
+                        inline_deletion_vectors: m.inline_deletion_vectors,
                     })
                 }
             };
