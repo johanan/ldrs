@@ -1,5 +1,22 @@
+use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use delta_kernel::table_features::{TableFeature, MAX_VALID_WRITER_VERSION};
 use delta_kernel::Snapshot;
+
+/// `timestamp` and `timestamp_ntz` are the only timestamp types delta has
+pub fn refuse_non_micros_timestamps(schema: &SchemaRef) -> Result<(), anyhow::Error> {
+    for field in schema.fields() {
+        let DataType::Timestamp(unit, _) = field.data_type() else {
+            continue;
+        };
+        if !matches!(unit, TimeUnit::Microsecond) {
+            anyhow::bail!(
+                "column '{}' is {unit:?}; delta requires microsecond timestamps",
+                field.name()
+            );
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn check_writer_version(snapshot: &Snapshot) -> Result<(), anyhow::Error> {
     let version = snapshot
@@ -103,6 +120,31 @@ pub(crate) fn rewrite_is_supported(feature: &TableFeature) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{Field, Schema};
+    use std::sync::Arc;
+
+    fn schema_of(unit: TimeUnit) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(unit, None),
+            true,
+        )]))
+    }
+
+    #[test]
+    fn micros_is_the_only_unit_a_delta_writer_accepts() {
+        assert!(refuse_non_micros_timestamps(&schema_of(TimeUnit::Microsecond)).is_ok());
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Nanosecond,
+        ] {
+            let err = refuse_non_micros_timestamps(&schema_of(unit))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("'ts'"), "{err}");
+        }
+    }
 
     #[test]
     fn enumerable_and_rewritable_differ_on_row_tracking_and_clustering() {

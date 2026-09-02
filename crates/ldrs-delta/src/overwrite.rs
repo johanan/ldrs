@@ -41,6 +41,7 @@ impl DeltaOverwriteSink {
         table_config: &TableConfig,
         cloud_io: &Handle,
     ) -> Result<Self, anyhow::Error> {
+        crate::refuse_non_micros_timestamps(&schema)?;
         let url = base_or_relative_path(table_path)?;
         let namer: FileNamer = Box::new(|_| Ok(format!("{}.parquet", Uuid::new_v4())));
         let inner = ParquetSink::new(

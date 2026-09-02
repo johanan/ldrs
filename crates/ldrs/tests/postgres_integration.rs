@@ -39,10 +39,11 @@ tables:
     filename: public.users/public.users.snappy.parquet
     post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
 ",
-    // should be able to infer based on delete_keys
+    // delete_insert against a table-scoped param
     "
 tables:
   - name: public_test.users
+    dest: pg.delete_insert
     filename: public.users/public.users.snappy.parquet
     delete_keys: [created]
 ",
@@ -51,12 +52,14 @@ tables:
     "
 tables:
   - name: public_test.users
+    dest: pg.delete_insert
     filename: public.users/public.users.snappy.parquet
     delete_keys: [name]
 ",
     "
 tables:
   - name: public_test.users
+    dest: pg.merge
     filename: public.users/public.users.snappy.parquet
     merge_keys: [unique_id]
 ",

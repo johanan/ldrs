@@ -29,6 +29,7 @@ mod overwrite;
 mod stats;
 mod vacuum;
 
+pub use features::refuse_non_micros_timestamps;
 pub use merge::*;
 pub use optimize::*;
 pub use overwrite::*;
@@ -722,6 +723,7 @@ fn configuration_with(
 }
 
 pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), anyhow::Error> {
+    refuse_non_micros_timestamps(schema)?;
     let url = base_or_relative_path(table_path)?;
     let (store, base_path, _) = build_store(&url)?;
 
