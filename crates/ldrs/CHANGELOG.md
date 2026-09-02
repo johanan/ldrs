@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.1] - 2026-09-02
+
+### Bug Fixes
+
+- *(delta)* Correct URL for delta-kernel
+
+Delta kernel does not use the correct root when the url is https for
+azure or s3.
+
+See https://github.com/delta-io/delta-kernel-rs/issues/2209
+
+- *(delta)* Delta timestamps
+
+Delta only uses microsecond timestamps and ldrs did not respect that.
+Now ldrs will widen any units below that or error on nanosecond
+timestamps. This can be overriden with truncate_timestamps.
+
+Also can use merge_keys at the source so delta destinations can be
+defaulted.
+
+- *(delta)* Deletion vectors default to file
+
+Previously the decision to write a deletion vector file or not was based
+on size. Now it takes inline_deletion_vectors. They will only be written
+if this is changed to true as the default is false.
+
+- *(delta)* Checkpoint based on table
+
+ldrs will respect checkpointInterval from the table.
+
+
 ## [0.23.0] - 2026-08-31
 
 ### Bug Fixes
