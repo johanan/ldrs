@@ -1338,6 +1338,64 @@ async fn test_merge_recovers_existing_sidecar_dv() {
 // instead of the JSON commits it stands in for — for our reads and for DuckDB's.
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
+async fn test_the_table_property_sets_the_checkpoint_cadence() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path = test_table_path("checkpoint_property");
+    cleanup_table(&table_path);
+
+    let schema = test_schema();
+    let table_url = format!("file://{}/", table_path);
+
+    let mut table_config = TableConfig::default();
+    table_config.set("delta.checkpointInterval", "100").unwrap();
+
+    overwrite_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(make_target_batch(1..101))]),
+        None,
+        None,
+        &table_config,
+        &rt,
+    )
+    .await
+    .unwrap();
+
+    // The same ten merges that checkpoint under the default interval.
+    for i in 0..10i64 {
+        let start = 101 + i * 10;
+        merge_delta(
+            &table_url,
+            schema.clone(),
+            stream::iter(vec![Ok(make_source_batch(start..start + 10))]),
+            MergeConfig {
+                merge_keys: vec!["id".to_string()],
+                allow_null_keys: false,
+                max_rows: None,
+                max_bytes: None,
+                txn_config: TxnConfig::None,
+                inline_deletion_vectors: false,
+            },
+            &table_config,
+            &rt,
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(latest_version(&table_path), 11);
+    let checkpoint = format!(
+        "{}/_delta_log/00000000000000000010.checkpoint.parquet",
+        table_path
+    );
+    assert!(
+        !std::path::Path::new(&checkpoint).exists(),
+        "an interval of 100 should not checkpoint at a gap of 10"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_merge_writes_checkpoint_past_interval() {
     let rt = tokio::runtime::Handle::current();
     let table_path = test_table_path("checkpoint_interval");

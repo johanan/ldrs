@@ -36,7 +36,8 @@ pub use overwrite::*;
 pub use stats::*;
 pub use vacuum::*;
 
-const CHECKPOINT_INTERVAL: u64 = 10;
+/// Delta's cadence for a table that sets no `delta.checkpointInterval`.
+const DEFAULT_CHECKPOINT_INTERVAL: u64 = 10;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -257,6 +258,14 @@ enum DeltaAction<'a> {
 
 fn should_checkpoint(version: Version, last_checkpoint: Option<Version>, interval: u64) -> bool {
     version.saturating_sub(last_checkpoint.unwrap_or(0)) >= interval
+}
+
+fn checkpoint_interval(snapshot: &Snapshot) -> u64 {
+    snapshot
+        .table_properties()
+        .checkpoint_interval
+        .map(NonZeroU64::get)
+        .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL)
 }
 
 async fn write_checkpoint(

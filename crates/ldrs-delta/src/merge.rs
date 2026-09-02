@@ -21,9 +21,9 @@ use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::{
-    build_add, build_engine, cleanup_source_files, ensure_table, file_path, should_checkpoint,
-    version_to_log_filename, write_checkpoint, Commit, DeltaRemove, DeltaTxn, Operation,
-    TableConfig, CHECKPOINT_INTERVAL, MERGE_MAX_RETRIES,
+    build_add, build_engine, checkpoint_interval, cleanup_source_files, ensure_table, file_path,
+    should_checkpoint, version_to_log_filename, write_checkpoint, Commit, DeltaRemove, DeltaTxn,
+    Operation, TableConfig, MERGE_MAX_RETRIES,
 };
 
 use super::dv::{build_dv_file, build_dv_inline, serialize_dv};
@@ -511,7 +511,7 @@ async fn commit_merge(
                 if should_checkpoint(
                     version,
                     snapshot.log_segment().checkpoint_version,
-                    CHECKPOINT_INTERVAL,
+                    checkpoint_interval(&snapshot),
                 ) {
                     match write_checkpoint(engine.clone(), snapshot).await {
                         Ok((r, _)) => info!(version, result = ?r, "checkpoint"),
