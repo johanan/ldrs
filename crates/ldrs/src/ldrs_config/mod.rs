@@ -346,7 +346,7 @@ pub async fn execute_configs(
         // owned so it can still name the task in the completion line, after `task` is moved
         let task_name = task.src.name().to_string();
         warn_unknown_keys(&task_name, &task.unknown_keys);
-        info!(table = %task_name, "Running task: {}/{}", i + 1, total_tasks);
+        info!(name = %task_name, "Running task: {}/{}", i + 1, total_tasks);
         let rows = execute_task(
             task,
             exec_env.ldrs_env,
@@ -360,7 +360,7 @@ pub async fn execute_configs(
         .await?;
         let task_end = std::time::Instant::now();
         info!(
-            table = %task_name,
+            name = %task_name,
             rows,
             // u64: tracing has no u128 Value impl, so u128 would land in JSON as a string
             elapsed_ms = (task_end - task_start).as_millis() as u64,
@@ -459,13 +459,13 @@ pub async fn execute_task(
                 result: Ok(commit),
                 ..
             } => match commit {
-                DeltaCommit::Overwrite => info!(dest = %target, "delta overwrite committed"),
+                DeltaCommit::Overwrite => info!(target = %target, "delta overwrite committed"),
                 DeltaCommit::Merge {
                     skipped: true,
                     skipped_version,
                     ..
                 } => info!(
-                    dest = %target,
+                    target = %target,
                     committed_version = skipped_version,
                     "delta merge skipped: source is not newer than the committed version"
                 ),
@@ -475,7 +475,7 @@ pub async fn execute_task(
                     files_written,
                     ..
                 } => info!(
-                    dest = %target,
+                    target = %target,
                     matched = matched_rows,
                     inserted = inserted_rows,
                     files_written,
@@ -487,7 +487,7 @@ pub async fn execute_task(
                 result: Ok(files),
                 ..
             } => info!(
-                dest = %target,
+                target = %target,
                 files = files.len(),
                 size_bytes = files.iter().map(|f| f.size_bytes).sum::<u64>(),
                 "parquet write committed"
@@ -496,7 +496,7 @@ pub async fn execute_task(
                 target,
                 result: Ok(()),
                 ..
-            } => info!(dest = %target, "postgres load committed"),
+            } => info!(target = %target, "postgres load committed"),
             _ => {}
         }
     }

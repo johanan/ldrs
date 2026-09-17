@@ -260,7 +260,7 @@ async fn vacuum_target(
 ) -> Result<(), anyhow::Error> {
     let outcome = vacuum(&target.table_path, args.retention(), dry_run, cloud_io).await?;
     info!(
-        table = %target.target,
+        target = %target.target,
         listed = outcome.files_listed,
         kept = outcome.files_kept,
         selected = outcome.files_selected,
@@ -290,7 +290,7 @@ async fn optimize_target(
     let input_files: usize = plan.bins().iter().map(|bin| bin.input_files()).sum();
     if dry_run {
         info!(
-            table = %target.target,
+            target = %target.target,
             bins,
             input_files,
             "optimize plan (dry run, nothing written)"
@@ -300,7 +300,7 @@ async fn optimize_target(
 
     let outcome = execute_plan(plan, cloud_io).await?;
     info!(
-        table = %target.target,
+        target = %target.target,
         version = ?outcome.version,
         files_added = outcome.files_added,
         files_removed = outcome.files_removed,
@@ -319,7 +319,7 @@ async fn checkpoint_target(
 ) -> Result<(), anyhow::Error> {
     let outcome = ldrs_delta::checkpoint(&target.table_path, cloud_io).await?;
     info!(
-        table = %target.target,
+        target = %target.target,
         version = outcome.version,
         written = outcome.written,
         "checkpoint complete"
@@ -336,15 +336,15 @@ async fn maintain_target(
 ) -> Result<(), anyhow::Error> {
     let mut failed = Vec::new();
     if let Err(e) = optimize_target(target, optimize, false, cloud_io).await {
-        error!(table = %target.target, "optimize failed: {e:#}");
+        error!(target = %target.target, "optimize failed: {e:#}");
         failed.push("optimize");
     }
     if let Err(e) = vacuum_target(target, vacuum, false, cloud_io).await {
-        error!(table = %target.target, "vacuum failed: {e:#}");
+        error!(target = %target.target, "vacuum failed: {e:#}");
         failed.push("vacuum");
     }
     if let Err(e) = checkpoint_target(target, cloud_io).await {
-        error!(table = %target.target, "checkpoint failed: {e:#}");
+        error!(target = %target.target, "checkpoint failed: {e:#}");
         failed.push("checkpoint");
     }
     match failed.is_empty() {
@@ -361,9 +361,9 @@ async fn run_vacuum(
 ) -> Result<(), anyhow::Error> {
     let mut failed = Vec::new();
     for target in targets {
-        info!(table = %target.target, path = %target.table_path, "vacuuming");
+        info!(target = %target.target, url = %target.table_path, "vacuuming");
         if let Err(e) = vacuum_target(&target, args, dry_run, cloud_io).await {
-            error!(table = %target.target, "vacuum failed: {e:#}");
+            error!(target = %target.target, "vacuum failed: {e:#}");
             failed.push(target.target);
         }
     }
@@ -378,9 +378,9 @@ async fn run_optimize(
 ) -> Result<(), anyhow::Error> {
     let mut failed = Vec::new();
     for target in targets {
-        info!(table = %target.target, path = %target.table_path, "optimizing");
+        info!(target = %target.target, url = %target.table_path, "optimizing");
         if let Err(e) = optimize_target(&target, args, dry_run, cloud_io).await {
-            error!(table = %target.target, "optimize failed: {e:#}");
+            error!(target = %target.target, "optimize failed: {e:#}");
             failed.push(target.target);
         }
     }
@@ -395,9 +395,9 @@ async fn run_maintenance(
 ) -> Result<(), anyhow::Error> {
     let mut failed = Vec::new();
     for target in targets {
-        info!(table = %target.target, path = %target.table_path, "maintaining");
+        info!(target = %target.target, url = %target.table_path, "maintaining");
         if let Err(phases) = maintain_target(&target, optimize, vacuum, cloud_io).await {
-            error!(table = %target.target, "maintenance incomplete: {phases}");
+            error!(target = %target.target, "maintenance incomplete: {phases}");
             failed.push(target.target);
         }
     }
