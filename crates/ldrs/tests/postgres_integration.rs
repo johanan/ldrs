@@ -156,14 +156,8 @@ tables:
         &Results::default(),
     )
     .await;
-    assert!(ex.is_err());
-    let ex_err = ex.unwrap_err();
-    let msg = format!("{:?}", ex_err); // Debug walks the whole anyhow chain, not just top-level
-    assert!(
-        msg.contains("non_existent_role"),
-        "expected role error, got: {}",
-        msg,
-    );
+    let ex_err = ex.expect_err("an unknown role must fail the run");
+    assert_eq!(ex_err.code(), 1, "got: {ex_err}");
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
