@@ -114,6 +114,66 @@ pub fn build_store(
     Ok((store, path, scheme))
 }
 
+/// The container or bucket a URL denotes, however that URL spells it. Names are lowercased.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StoreBase {
+    Azure { account: String, container: String },
+}
+
+pub struct StoreLocation {
+    pub base: StoreBase,
+    /// Trailing slash when non-empty, empty at the container root.
+    pub path: String,
+}
+
+pub fn store_location(url: &Url) -> Result<StoreLocation, anyhow::Error> {
+    match ObjectStoreScheme::parse(url) {
+        Ok((ObjectStoreScheme::MicrosoftAzure, _)) => azure_location(url),
+        _ => Err(anyhow::anyhow!("'{url}' is not an azure url")),
+    }
+}
+
+/// Every Azure spelling: `abfs[s]`, `az`, `adl`, `azure`, and the `https` endpoint forms.
+fn azure_location(url: &Url) -> Result<StoreLocation, anyhow::Error> {
+    use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
+
+    let host = url.host_str().context("azure url has no host")?;
+
+    let (account, container, path) = match (url.username(), host.split_once('.')) {
+        // abfss://container@account.host/path
+        (container, Some((account, _))) if !container.is_empty() => {
+            Ok((account.to_string(), container.to_string(), url.path()))
+        }
+        // https://account.host/container/path, and Snowflake's azure://account.host/container/path
+        ("", Some((account, _))) => match url.path().trim_start_matches('/').split_once('/') {
+            Some((container, path)) => Ok((account.to_string(), container.to_string(), path)),
+            None => Ok((
+                account.to_string(),
+                url.path().trim_matches('/').to_string(),
+                "",
+            )),
+        },
+        // az://container/path
+        ("", None) => MicrosoftAzureBuilder::from_env()
+            .get_config_value(&AzureConfigKey::AccountName)
+            .context("url carries no storage account and AZURE_STORAGE_ACCOUNT_NAME is unset")
+            .map(|account| (account, host.to_string(), url.path())),
+        _ => Err(anyhow::anyhow!("unrecognised azure url '{url}'")),
+    }?;
+
+    let path = path.trim_matches('/');
+    Ok(StoreLocation {
+        base: StoreBase::Azure {
+            account: account.to_lowercase(),
+            container: container.to_lowercase(),
+        },
+        path: match path.is_empty() {
+            true => String::new(),
+            false => format!("{path}/"),
+        },
+    })
+}
+
 /// Workaround for delta-io/delta-kernel-rs#2209.
 pub fn kernel_url(url: &Url) -> Result<Url, anyhow::Error> {
     let (scheme, base) = ObjectStoreScheme::parse(url).context("Not an ObjectStore URL")?;
@@ -144,6 +204,76 @@ mod tests {
 
     fn store_path(uri: &str) -> Option<String> {
         store_path_from_uri(uri).unwrap().map(String::from)
+    }
+
+    fn location(uri: &str) -> StoreLocation {
+        store_location(&Url::parse(uri).unwrap()).unwrap()
+    }
+
+    fn azure(account: &str, container: &str) -> StoreBase {
+        StoreBase::Azure {
+            account: account.to_string(),
+            container: container.to_string(),
+        }
+    }
+
+    #[test]
+    fn azure_location_agrees_across_spellings() {
+        for uri in [
+            "abfss://cont@acct.dfs.core.windows.net/a/b",
+            "abfs://cont@acct.blob.core.windows.net/a/b",
+            "https://acct.dfs.core.windows.net/cont/a/b",
+            "https://acct.blob.core.windows.net/cont/a/b",
+            // the spelling Snowflake reports for an external volume
+            "azure://acct.blob.core.windows.net/cont/a/b",
+            // lowercased
+            "https://ACCT.blob.core.windows.net/CONT/a/b",
+        ] {
+            let got = location(uri);
+            assert_eq!(got.base, azure("acct", "cont"), "disagreed for {uri}");
+            assert_eq!(got.path, "a/b/", "disagreed for {uri}");
+        }
+    }
+
+    #[test]
+    fn azure_location_at_the_container_root_has_no_path() {
+        for uri in [
+            "azure://acct.blob.core.windows.net/cont/",
+            "azure://acct.blob.core.windows.net/cont",
+        ] {
+            let got = location(uri);
+            assert_eq!(got.base, azure("acct", "cont"));
+            assert_eq!(got.path, "", "disagreed for {uri}");
+        }
+    }
+
+    #[test]
+    fn azure_location_path_subtraction_yields_the_base_location() {
+        let volume = location("azure://acct.blob.core.windows.net/cont/");
+        let table = location("https://acct.blob.core.windows.net/cont/one/two/tbl");
+        assert_eq!(table.path.strip_prefix(&volume.path), Some("one/two/tbl/"));
+
+        let scoped = location("azure://acct.blob.core.windows.net/cont/one/");
+        assert_eq!(table.path.strip_prefix(&scoped.path), Some("two/tbl/"));
+
+        // a partial segment is not a prefix
+        let sibling = location("azure://acct.blob.core.windows.net/cont/on/");
+        assert_eq!(table.path.strip_prefix(&sibling.path), None);
+    }
+
+    #[test]
+    fn store_location_rejects_other_stores() {
+        for uri in [
+            "s3://bucket/a/b",
+            "gs://bucket/a/b",
+            "https://example.com/a/b",
+            "file:///tmp/a/b",
+        ] {
+            assert!(
+                store_location(&Url::parse(uri).unwrap()).is_err(),
+                "accepted {uri}"
+            );
+        }
     }
 
     #[test]
