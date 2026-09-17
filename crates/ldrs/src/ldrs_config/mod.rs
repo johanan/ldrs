@@ -22,9 +22,10 @@ use url::Url;
 
 use crate::error::RunError;
 use crate::ldrs_env::{ambient_env, starts_with_ignore_ascii_case};
+use crate::register::{register_sf, resolve_registers, run_register};
 use crate::results::{ResultLine, Results};
 use crate::{
-    delta::{DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
+    delta::{delta_target_name, DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
     finalize::{build_sources, call_finalize, run_sf, FinalizeItem, SfCommand},
     ldrs_config::{
         config::{
@@ -230,13 +231,6 @@ fn warn_unknown_keys(task_name: &str, unknown_keys: &[UnknownKey]) {
     }
 }
 
-fn delta_target_name(dest: &DeltaDestination) -> &str {
-    match dest {
-        DeltaDestination::Overwrite(c) => c.target.as_deref().unwrap_or(&c.name),
-        DeltaDestination::Merge(m) => m.common.target.as_deref().unwrap_or(&m.common.name),
-    }
-}
-
 fn delta_table_path(
     resolved_target: &str,
     ldrs_env: &[(String, String)],
@@ -298,6 +292,57 @@ pub fn resolve_delta_targets(
     match targets.is_empty() {
         true => Err(anyhow::anyhow!("the config names no delta destinations")),
         false => Ok(targets),
+    }
+}
+
+/// Ensure every register block a config declares, without loading. Returns the targets that failed.
+pub async fn register_from_config(
+    tasks: Vec<LdrsParsedConfig>,
+    select: Option<Vec<String>>,
+    ldrs_env: &[(String, String)],
+    results: &Results,
+) -> Result<Vec<String>, anyhow::Error> {
+    let exec_env = ExecutionEnv::create(ldrs_env);
+    let ambient = ambient_env();
+    let mut declared = 0usize;
+    let mut failed = Vec::new();
+
+    for task in select_tasks(tasks, select) {
+        let name = task.src.name().to_string();
+        warn_unknown_keys(&name, &task.unknown_keys);
+        let context =
+            LdrsExecutionContext::try_new(&name, &exec_env.handlebars, &exec_env.handlebars_vars)?;
+        let registers = resolve_registers(&task.dests, &context, ldrs_env)?;
+
+        for pair in task.dests.iter().zip(registers) {
+            match pair {
+                (LdrsDestination::Delta(delta), Some(register)) => {
+                    declared += 1;
+                    let target = context.render_template(delta_target_name(delta))?;
+                    let table_path = delta_table_path(&target, ldrs_env)?;
+                    let outcome = register_sf(&register, &table_path, ambient.clone()).await;
+                    if let Ok(action) = &outcome {
+                        info!(target = %target, catalog_table = %register.table, action, "registered");
+                    }
+                    results.write(ResultLine::Register {
+                        name: &name,
+                        target: &target,
+                        catalog_table: &register.table,
+                        result: outcome.as_ref().copied().map_err(String::as_str),
+                    })?;
+                    if let Err(e) = outcome {
+                        error!(target = %target, "register failed: {e}");
+                        failed.push(target);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    match declared {
+        0 => Err(anyhow::anyhow!("the config declares no register blocks")),
+        _ => Ok(failed),
     }
 }
 
@@ -456,6 +501,8 @@ pub async fn execute_task(
     let lua_modules = task.lua_modules;
     let context = LdrsExecutionContext::try_new(&name, &handlebars, &handlebars_vars)?;
     let source = resolve_source(task.src, &context, env_params, ldrs_env)?;
+    // Before the load, so a bad connection fails with nothing committed.
+    let registers = resolve_registers(&task.dests, &context, ldrs_env)?;
     let dests = task
         .dests
         .into_iter()
@@ -531,6 +578,11 @@ pub async fn execute_task(
     // Written before any post-load phase runs, and covers failed tasks too.
     results.write(ResultLine::Load(&phase))?;
 
+    let register_failures = run_register(&registers, &phase, results).await;
+    for f in &register_failures {
+        error!(phase = "register", "{f}");
+    }
+
     let finalize_failures =
         run_finalize(&finalize_items, &phase, ldrs_env, &context, &lua_modules).await;
     for f in &finalize_failures {
@@ -545,6 +597,9 @@ pub async fn execute_task(
     let mut summary = Vec::new();
     if !load_failures.is_empty() {
         summary.push(format!("{} load", load_failures.len()));
+    }
+    if !register_failures.is_empty() {
+        summary.push(format!("{} register", register_failures.len()));
     }
     if !finalize_failures.is_empty() {
         summary.push(format!("{} finalize", finalize_failures.len()));

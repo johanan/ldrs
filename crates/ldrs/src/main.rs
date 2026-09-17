@@ -8,7 +8,8 @@ use ldrs::cli_schema;
 use ldrs::error::RunError;
 use ldrs::ldrs_config::config::{find_unknown_block_keys, parse_dest, parse_src, LdrsParsedConfig};
 use ldrs::ldrs_config::{
-    execute_configs, infer_env_type, parse_yaml_config, resolve_delta_targets, DeltaTarget,
+    execute_configs, infer_env_type, parse_yaml_config, register_from_config,
+    resolve_delta_targets, DeltaTarget,
 };
 use ldrs::ldrs_env::{ambient_env, get_all_ldrs_env_vars};
 use ldrs::lua_logic::lua_args::{modules_from_args, LuaArgs, SnowflakeResult, SnowflakeStrategy};
@@ -35,6 +36,8 @@ enum DeltaCommands {
     Maintenance(MaintenanceLdArgs),
     /// Optimize, then vacuum, then checkpoint a single delta table
     MaintenanceTable(MaintenanceTableArgs),
+    /// Ensure every delta destination a config declares a register block for is in its catalog
+    Register(ConfigArgs),
 }
 
 #[derive(Args)]
@@ -483,6 +486,7 @@ fn results_path(destination: &Destination) -> Option<&str> {
             DeltaCommands::Vacuum(args) => &args.config.results,
             DeltaCommands::Optimize(args) => &args.config.results,
             DeltaCommands::Maintenance(args) => &args.config.results,
+            DeltaCommands::Register(args) => &args.results,
             DeltaCommands::VacuumTable(_)
             | DeltaCommands::OptimizeTable(_)
             | DeltaCommands::MaintenanceTable(_) => &None,
@@ -576,6 +580,15 @@ fn run() -> Result<(), RunError> {
                     let targets = vec![target_from_url(&args.url)];
                     run_maintenance(targets, &args.optimize, &args.vacuum, rt.handle(), &results)
                         .await
+                }
+                DeltaCommands::Register(args) => {
+                    let config_string = fs::read_to_string(&args.config)
+                        .with_context(|| format!("Failed to read config file: {}", args.config))?;
+                    let ldrs_env = get_all_ldrs_env_vars();
+                    let configs = parse_yaml_config(&config_string, &ldrs_env)?;
+                    let failed =
+                        register_from_config(configs, args.select, &ldrs_env, &results).await?;
+                    report_failures("register", failed)
                 }
             }
             .map_err(RunError::from),
