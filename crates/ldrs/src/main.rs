@@ -13,6 +13,7 @@ use ldrs::ldrs_env::{ambient_env, get_all_ldrs_env_vars};
 use ldrs::lua_logic::lua_args::{modules_from_args, LuaArgs, SnowflakeResult, SnowflakeStrategy};
 use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
 use ldrs::path_pattern;
+use ldrs::results::Results;
 use ldrs_delta::{execute_plan, plan_optimize, vacuum, OperationConfig, Retention};
 use ldrs_storage::build_store;
 use serde_yaml::{Mapping, Value};
@@ -141,10 +142,9 @@ struct ConfigArgs {
     /// Run only these tables, by 'name', comma-separated (e.g. --select public.users,public.orders). Omit to run every table in the config.
     #[arg(long, value_delimiter = ',')]
     select: Option<Vec<String>>,
-    /// Write a JSONL run report to this path, one task outcome per line
-    /// (the `phase` schema in `ldrs schema finalize`). Written on success and failure.
+    /// Write a JSONL results file to this path. Run `ldrs schema results` for the line shapes.
     #[arg(long)]
-    report: Option<String>,
+    results: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -191,10 +191,9 @@ struct RunArgs {
     #[arg(long = "opt", value_parser = parse_kv)]
     opt: Vec<(String, String)>,
 
-    /// Write a JSONL run report to this path, one task outcome per line
-    /// (the `phase` schema in `ldrs schema finalize`). Written on success and failure.
+    /// Write a JSONL results file to this path. Run `ldrs schema results` for the line shapes.
     #[arg(long)]
-    report: Option<String>,
+    results: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -359,6 +358,7 @@ async fn run_vacuum(
     args: &VacuumArgs,
     dry_run: bool,
     cloud_io: &tokio::runtime::Handle,
+    _results: &Results,
 ) -> Result<(), anyhow::Error> {
     let mut failed = Vec::new();
     for target in targets {
@@ -376,6 +376,7 @@ async fn run_optimize(
     args: &OptimizeArgs,
     dry_run: bool,
     cloud_io: &tokio::runtime::Handle,
+    _results: &Results,
 ) -> Result<(), anyhow::Error> {
     let mut failed = Vec::new();
     for target in targets {
@@ -393,6 +394,7 @@ async fn run_maintenance(
     optimize: &OptimizeArgs,
     vacuum: &VacuumArgs,
     cloud_io: &tokio::runtime::Handle,
+    _results: &Results,
 ) -> Result<(), anyhow::Error> {
     let mut failed = Vec::new();
     for target in targets {
@@ -469,6 +471,24 @@ struct Cli {
     destination: Option<Destination>,
 }
 
+/// The `--results` path a command was given, if that command takes one.
+fn results_path(destination: &Destination) -> Option<&str> {
+    let args = match destination {
+        Destination::Ld(config) => &config.results,
+        Destination::Run(run) => &run.results,
+        Destination::Delta { command } => match command {
+            DeltaCommands::Vacuum(args) => &args.config.results,
+            DeltaCommands::Optimize(args) => &args.config.results,
+            DeltaCommands::Maintenance(args) => &args.config.results,
+            DeltaCommands::VacuumTable(_)
+            | DeltaCommands::OptimizeTable(_)
+            | DeltaCommands::MaintenanceTable(_) => &None,
+        },
+        Destination::Sf { .. } | Destination::Schema { .. } => &None,
+    };
+    args.as_deref()
+}
+
 fn main() -> Result<(), anyhow::Error> {
     let _ = dotenv();
     let cli = Cli::parse();
@@ -506,83 +526,87 @@ fn main() -> Result<(), anyhow::Error> {
         .build()
         .with_context(|| "Unable to create cloud io tokio runtime")?;
 
-    let command_exec =
-        main_rt.block_on(async {
-            match destination {
-                Destination::Ld(args) => {
-                    let config_string = fs::read_to_string(&args.config)
-                        .with_context(|| format!("Failed to read config file: {}", args.config))?;
-                    let ldrs_env = get_all_ldrs_env_vars();
-                    let configs = parse_yaml_config(&config_string, &ldrs_env)?;
-                    execute_configs(configs, args.select, &ldrs_env, rt.handle(), args.report).await
+    let command_exec = main_rt.block_on(async {
+        // Opened before any command runs, so an unwritable path fails with nothing else done yet.
+        let results = Results::create(results_path(&destination))?;
+        match destination {
+            Destination::Ld(args) => {
+                let config_string = fs::read_to_string(&args.config)
+                    .with_context(|| format!("Failed to read config file: {}", args.config))?;
+                let ldrs_env = get_all_ldrs_env_vars();
+                let configs = parse_yaml_config(&config_string, &ldrs_env)?;
+                execute_configs(configs, args.select, &ldrs_env, rt.handle(), &results).await
+            }
+            Destination::Delta { command } => match command {
+                DeltaCommands::Vacuum(args) => {
+                    let targets = targets_from_config(&args.config)?;
+                    run_vacuum(targets, &args.vacuum, args.dry_run, rt.handle(), &results).await
                 }
-                Destination::Delta { command } => match command {
-                    DeltaCommands::Vacuum(args) => {
-                        let targets = targets_from_config(&args.config)?;
-                        run_vacuum(targets, &args.vacuum, args.dry_run, rt.handle()).await
-                    }
-                    DeltaCommands::VacuumTable(args) => {
-                        let targets = vec![target_from_url(&args.url)];
-                        run_vacuum(targets, &args.vacuum, args.dry_run, rt.handle()).await
-                    }
-                    DeltaCommands::Optimize(args) => {
-                        let targets = targets_from_config(&args.config)?;
-                        run_optimize(targets, &args.optimize, args.dry_run, rt.handle()).await
-                    }
-                    DeltaCommands::OptimizeTable(args) => {
-                        let targets = vec![target_from_url(&args.url)];
-                        run_optimize(targets, &args.optimize, args.dry_run, rt.handle()).await
-                    }
-                    DeltaCommands::Maintenance(args) => {
-                        let targets = targets_from_config(&args.config)?;
-                        run_maintenance(targets, &args.optimize, &args.vacuum, rt.handle()).await
-                    }
-                    DeltaCommands::MaintenanceTable(args) => {
-                        let targets = vec![target_from_url(&args.url)];
-                        run_maintenance(targets, &args.optimize, &args.vacuum, rt.handle()).await
-                    }
-                },
-                Destination::Run(args) => {
-                    let ldrs_env = get_all_ldrs_env_vars();
-                    let config = build_run_block(&args)?;
-                    let src_default = infer_env_type("LDRS_SRC", &ldrs_env);
-                    let dest_default = infer_env_type("LDRS_DEST", &ldrs_env);
-                    let src = parse_src(config.clone(), &src_default)?;
-                    let dest = parse_dest(config.clone(), &dest_default)?;
-                    let unknown_keys = find_unknown_block_keys(&config, &src, &dest);
+                DeltaCommands::VacuumTable(args) => {
+                    let targets = vec![target_from_url(&args.url)];
+                    run_vacuum(targets, &args.vacuum, args.dry_run, rt.handle(), &results).await
+                }
+                DeltaCommands::Optimize(args) => {
+                    let targets = targets_from_config(&args.config)?;
+                    run_optimize(targets, &args.optimize, args.dry_run, rt.handle(), &results).await
+                }
+                DeltaCommands::OptimizeTable(args) => {
+                    let targets = vec![target_from_url(&args.url)];
+                    run_optimize(targets, &args.optimize, args.dry_run, rt.handle(), &results).await
+                }
+                DeltaCommands::Maintenance(args) => {
+                    let targets = targets_from_config(&args.config)?;
+                    run_maintenance(targets, &args.optimize, &args.vacuum, rt.handle(), &results)
+                        .await
+                }
+                DeltaCommands::MaintenanceTable(args) => {
+                    let targets = vec![target_from_url(&args.url)];
+                    run_maintenance(targets, &args.optimize, &args.vacuum, rt.handle(), &results)
+                        .await
+                }
+            }
+            Destination::Run(args) => {
+                let ldrs_env = get_all_ldrs_env_vars();
+                let config = build_run_block(&args)?;
+                let src_default = infer_env_type("LDRS_SRC", &ldrs_env);
+                let dest_default = infer_env_type("LDRS_DEST", &ldrs_env);
+                let src = parse_src(config.clone(), &src_default)?;
+                let dest = parse_dest(config.clone(), &dest_default)?;
+                let unknown_keys = find_unknown_block_keys(&config, &src, &dest);
 
-                    execute_configs(
-                        vec![LdrsParsedConfig {
-                            src,
-                            dests: vec![dest],
-                            finalize: Vec::new(),
-                            lua_modules: Vec::new(),
-                            unknown_keys,
-                        }],
-                        None,
-                        &ldrs_env,
-                        rt.handle(),
-                        args.report,
-                    )
-                    .await
+                execute_configs(
+                    vec![LdrsParsedConfig {
+                        src,
+                        dests: vec![dest],
+                        finalize: Vec::new(),
+                        lua_modules: Vec::new(),
+                        unknown_keys,
+                    }],
+                    None,
+                    &ldrs_env,
+                    rt.handle(),
+                    &results,
+                )
+                .await
+            }
+            Destination::Schema { command } => match command {
+                None => {
+                    // bare `ldrs schema` list the subcommands
+                    let mut cmd = Cli::command();
+                    if let Some(sub) = cmd.find_subcommand_mut("schema") {
+                        sub.print_help()?;
+                        println!();
+                    }
+                    Ok(())
                 }
-                Destination::Schema { command } => match command {
-                    None => {
-                        // bare `ldrs schema` list the subcommands
-                        let mut cmd = Cli::command();
-                        if let Some(sub) = cmd.find_subcommand_mut("schema") {
-                            sub.print_help()?;
-                            println!();
-                        }
-                        Ok(())
-                    }
-                    Some(cmd) => {
-                        let output = cli_schema::build(&cmd);
-                        println!("{}", serde_json::to_string_pretty(&output)?);
-                        Ok(())
-                    }
-                },
-                Destination::Sf { command } => match command {
+                Some(cmd) => {
+                    let output = cli_schema::build(&cmd);
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                    Ok(())
+                }
+            },
+            Destination::Sf { command } => {
+                match command {
                     SnowflakeCommands::Ingest {
                         file_url,
                         pattern,
@@ -646,9 +670,10 @@ fn main() -> Result<(), anyhow::Error> {
                         }
                         Err(e) => Err(e),
                     },
-                },
+                }
             }
-        });
+        }
+    });
 
     drop(main_rt);
     drop(rt);
@@ -676,7 +701,7 @@ mod tests {
             name: None,
             sql: None,
             opt: vec![],
-            report: None,
+            results: None,
         }
     }
 

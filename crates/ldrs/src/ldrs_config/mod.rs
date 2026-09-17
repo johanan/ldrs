@@ -2,7 +2,7 @@ pub mod config;
 pub mod field_validation;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 
 use anyhow::Context;
 use deadpool_postgres::Pool;
@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::ldrs_env::{ambient_env, starts_with_ignore_ascii_case};
+use crate::results::{ResultLine, Results};
 use crate::{
     delta::{DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
     finalize::{build_sources, call_finalize, run_sf, FinalizeItem, SfCommand},
@@ -304,25 +305,12 @@ pub async fn execute_configs(
     select: Option<Vec<String>>,
     ldrs_env: &[(String, String)],
     cloud_io_rt: &tokio::runtime::Handle,
-    report: Option<String>,
+    results: &Results,
 ) -> Result<(), anyhow::Error> {
     let filtered_tasks = select_tasks(tasks, select);
     debug!("Tasks to be run {:?}", filtered_tasks);
 
     validate_configs(&filtered_tasks)?;
-
-    // Created before any task runs: an unwritable path fails here, with zero side effects,
-    // and `create` truncates a prior run's report.
-    let report_file = report
-        .as_deref()
-        .map(std::fs::File::create)
-        .transpose()
-        .with_context(|| {
-            format!(
-                "could not create report file '{}'",
-                report.unwrap_or_default()
-            )
-        })?;
 
     let exec_env = ExecutionEnv::create(ldrs_env);
     // One connection pool per Postgres destination URL, shared read-only across every task. Strip
@@ -355,7 +343,7 @@ pub async fn execute_configs(
             &exec_env.typed_params,
             cloud_io_rt,
             &pg_pools,
-            report_file.as_ref(),
+            results,
         )
         .await?;
         let task_end = std::time::Instant::now();
@@ -429,7 +417,7 @@ pub async fn execute_task(
     env_params: &[(String, String, Option<ColumnType>)],
     cloud_io_rt: &tokio::runtime::Handle,
     pg_pools: &HashMap<String, Pool>,
-    report: Option<&std::fs::File>,
+    results: &Results,
 ) -> Result<Option<u64>, anyhow::Error> {
     let name = task.src.name().to_string();
     let finalize_items = task.finalize;
@@ -500,30 +488,27 @@ pub async fn execute_task(
             _ => {}
         }
     }
-    let finalize_failures =
-        run_finalize(&finalize_items, &phase, ldrs_env, &context, &lua_modules).await;
     let load_failures: Vec<String> = phase
         .destinations
         .iter()
         .filter_map(|d| d.status().err().cloned())
         .collect();
-    // Load and finalize are distinct phases. Each
-    // failure is its own structured log line; the returned error is a summary, since the detail
-    // lives in the logs.
     for f in &load_failures {
         error!(phase = "load", "{f}");
     }
+    // Written before any post-load phase runs, and covers failed tasks too.
+    results.write(ResultLine::Load(&phase))?;
+
+    let finalize_failures =
+        run_finalize(&finalize_items, &phase, ldrs_env, &context, &lua_modules).await;
     for f in &finalize_failures {
         error!(phase = "finalize", "{f}");
     }
-    // The report line covers failed tasks too, and flushes before a failure below aborts the
-    // run, so a report from a dead run still inventories what committed.
-    if let Some(mut f) = report {
-        let mut line = serde_json::to_string(&phase)?;
-        line.push('\n');
-        f.write_all(line.as_bytes())
-            .and_then(|_| f.flush())
-            .with_context(|| "could not write report line")?;
+    if !finalize_failures.is_empty() {
+        results.write(ResultLine::Finalize {
+            name: &phase.name,
+            errors: &finalize_failures,
+        })?;
     }
     let mut summary = Vec::new();
     if !load_failures.is_empty() {

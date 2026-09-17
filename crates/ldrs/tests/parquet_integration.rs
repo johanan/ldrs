@@ -11,6 +11,7 @@ use ldrs::{
     },
     ldrs_snowflake::snowflake_source::{SFQuery, SFSource},
     parquet::ParquetDestination,
+    results::Results,
 };
 use ldrs_arrow::{build_arrow_transform_strategy, ColumnType};
 use ldrs_parquet::{builder_from_string, write_parquet, write_parquet_split};
@@ -187,7 +188,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -240,7 +241,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -286,7 +287,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -489,7 +490,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -543,7 +544,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await;
     assert!(
@@ -600,7 +601,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -663,7 +664,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();

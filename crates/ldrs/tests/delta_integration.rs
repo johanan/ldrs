@@ -1,6 +1,7 @@
 use delta_kernel::expressions::Scalar;
 use futures::TryStreamExt;
 use ldrs::ldrs_config::{execute_configs, parse_yaml_config, resolve_delta_targets};
+use ldrs::results::Results;
 use ldrs_delta::{
     delta_stats_to_json, overwrite_delta, parquet_metadata_to_delta_stats, vacuum, OperationConfig,
     Retention,
@@ -485,7 +486,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -588,7 +589,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -630,7 +631,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -1059,7 +1060,7 @@ tables:
         None,
         &ldrs_env,
         &tokio::runtime::Handle::current(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -1223,7 +1224,7 @@ tables:
             None,
             &ldrs_env,
             rt.handle(),
-            None,
+            &Results::default(),
         )
         .await
         .unwrap();
@@ -1289,7 +1290,7 @@ tables:
             None,
             &ldrs_env,
             rt.handle(),
-            None,
+            &Results::default(),
         )
         .await
     };

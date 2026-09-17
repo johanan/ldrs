@@ -1,4 +1,5 @@
 use ldrs::ldrs_config::{execute_configs, parse_yaml_config};
+use ldrs::results::Results;
 use ldrs_postgres::create_connection;
 use ldrs_test_fixtures::data_url;
 
@@ -98,7 +99,7 @@ async fn test_postgres_file_drop() {
             None,
             &ldrs_env,
             rt.handle(),
-            None,
+            &Results::default(),
         )
         .await;
         assert_eq!(ex.is_ok(), true);
@@ -152,7 +153,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await;
     assert!(ex.is_err());
@@ -207,7 +208,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
@@ -335,7 +336,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
@@ -406,7 +407,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await;
     assert!(ex.is_err(), "load should fail on the invalid post_sql");
@@ -464,7 +465,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await;
     assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
@@ -546,7 +547,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();

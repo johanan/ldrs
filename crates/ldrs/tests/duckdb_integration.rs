@@ -11,6 +11,7 @@ use arrow_array::{
 use arrow_schema::{DataType, TimeUnit};
 use futures::TryStreamExt;
 use ldrs::ldrs_config::{execute_configs, parse_yaml_config};
+use ldrs::results::Results;
 use ldrs_parquet::builder_from_string;
 use ldrs_test_fixtures::{data_url, fixture, fixture_url};
 
@@ -34,7 +35,7 @@ async fn run(config: &str, ldrs_env: &[(String, String)]) -> Result<(), anyhow::
         None,
         ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await;
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
