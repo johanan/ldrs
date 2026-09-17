@@ -5,6 +5,7 @@ use anyhow::Context;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use dotenvy::dotenv;
 use ldrs::cli_schema;
+use ldrs::error::RunError;
 use ldrs::ldrs_config::config::{find_unknown_block_keys, parse_dest, parse_src, LdrsParsedConfig};
 use ldrs::ldrs_config::{
     execute_configs, infer_env_type, parse_yaml_config, resolve_delta_targets, DeltaTarget,
@@ -198,7 +199,9 @@ struct RunArgs {
 
 #[derive(Subcommand)]
 enum Destination {
-    /// Load from a config file. All sources and destinations
+    /// Load from a config file. All sources and destinations. Tables run independently and in
+    /// order: a failing table does not stop the ones after it, and list order carries no
+    /// dependency (use separate runs when one table's output feeds another's input).
     Ld(ConfigArgs),
     /// Snowflake destination
     Sf {
@@ -489,7 +492,15 @@ fn results_path(destination: &Destination) -> Option<&str> {
     args.as_deref()
 }
 
-fn main() -> Result<(), anyhow::Error> {
+/// Exits 1 when the task can be re-run, 3 when a destination committed and the retry is a repair.
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => std::process::ExitCode::from(e.code()),
+    }
+}
+
+fn run() -> Result<(), RunError> {
     let _ = dotenv();
     let cli = Cli::parse();
     let builder = fmt::Subscriber::builder()
@@ -504,7 +515,9 @@ fn main() -> Result<(), anyhow::Error> {
     }
 
     let Some(destination) = cli.destination else {
-        Cli::command().print_help()?;
+        Cli::command()
+            .print_help()
+            .with_context(|| "could not print help")?;
         println!();
         return Ok(());
     };
@@ -565,6 +578,7 @@ fn main() -> Result<(), anyhow::Error> {
                         .await
                 }
             }
+            .map_err(RunError::from),
             Destination::Run(args) => {
                 let ldrs_env = get_all_ldrs_env_vars();
                 let config = build_run_block(&args)?;
@@ -594,14 +608,16 @@ fn main() -> Result<(), anyhow::Error> {
                     // bare `ldrs schema` list the subcommands
                     let mut cmd = Cli::command();
                     if let Some(sub) = cmd.find_subcommand_mut("schema") {
-                        sub.print_help()?;
+                        sub.print_help().with_context(|| "could not print help")?;
                         println!();
                     }
                     Ok(())
                 }
                 Some(cmd) => {
                     let output = cli_schema::build(&cmd);
-                    println!("{}", serde_json::to_string_pretty(&output)?);
+                    let json = serde_json::to_string_pretty(&output)
+                        .with_context(|| "could not render the schema")?;
+                    println!("{json}");
                     Ok(())
                 }
             },
@@ -671,6 +687,7 @@ fn main() -> Result<(), anyhow::Error> {
                         Err(e) => Err(e),
                     },
                 }
+                .map_err(RunError::from)
             }
         }
     });

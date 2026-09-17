@@ -1904,6 +1904,7 @@ dependencies = [
  "serde_yaml",
  "strum",
  "test-log",
+ "thiserror",
  "tokio",
  "tokio-postgres",
  "tokio-stream",

@@ -10,6 +10,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, TimeUnit};
 use futures::TryStreamExt;
+use ldrs::error::RunError;
 use ldrs::ldrs_config::{execute_configs, parse_yaml_config};
 use ldrs::results::Results;
 use ldrs_parquet::builder_from_string;
@@ -28,7 +29,7 @@ fn penguins_url() -> String {
     format!("{}duckdb/", data_url())
 }
 
-async fn run(config: &str, ldrs_env: &[(String, String)]) -> Result<(), anyhow::Error> {
+async fn run(config: &str, ldrs_env: &[(String, String)]) -> Result<(), RunError> {
     let rt = cloud_io();
     let result = execute_configs(
         parse_yaml_config(config, ldrs_env).unwrap(),

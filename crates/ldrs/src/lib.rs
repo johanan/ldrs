@@ -3,6 +3,7 @@ pub const ENGINE_INFO: &str = concat!("ldrs/", env!("CARGO_PKG_VERSION"));
 
 pub mod cli_schema;
 pub mod delta;
+pub mod error;
 pub mod file_source;
 pub mod finalize;
 pub mod ldrs_config;

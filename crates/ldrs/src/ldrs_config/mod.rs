@@ -20,6 +20,7 @@ use ldrs_storage::join_into_url;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use crate::error::RunError;
 use crate::ldrs_env::{ambient_env, starts_with_ignore_ascii_case};
 use crate::results::{ResultLine, Results};
 use crate::{
@@ -306,7 +307,7 @@ pub async fn execute_configs(
     ldrs_env: &[(String, String)],
     cloud_io_rt: &tokio::runtime::Handle,
     results: &Results,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), RunError> {
     let filtered_tasks = select_tasks(tasks, select);
     debug!("Tasks to be run {:?}", filtered_tasks);
 
@@ -328,6 +329,7 @@ pub async fn execute_configs(
         .collect::<Result<Vec<_>, _>>()?;
     let pg_pools = build_pools(&pg_urls)?;
     let total_tasks = filtered_tasks.len();
+    let mut outcomes: Vec<(String, Result<Option<u64>, RunError>)> = Vec::new();
     for (i, task) in filtered_tasks.into_iter().enumerate() {
         let task_start = std::time::Instant::now();
         debug!("Task: {:?}", task);
@@ -335,7 +337,7 @@ pub async fn execute_configs(
         let task_name = task.src.name().to_string();
         warn_unknown_keys(&task_name, &task.unknown_keys);
         info!(name = %task_name, "Running task: {}/{}", i + 1, total_tasks);
-        let rows = execute_task(
+        let outcome = execute_task(
             task,
             exec_env.ldrs_env,
             &exec_env.handlebars,
@@ -345,18 +347,48 @@ pub async fn execute_configs(
             &pg_pools,
             results,
         )
-        .await?;
+        .await;
         let task_end = std::time::Instant::now();
-        info!(
-            name = %task_name,
-            rows,
-            // u64: tracing has no u128 Value impl, so u128 would land in JSON as a string
-            elapsed_ms = (task_end - task_start).as_millis() as u64,
-            "Task completed"
-        );
+        // u64: tracing has no u128 Value impl, so u128 would land in JSON as a string
+        let elapsed_ms = (task_end - task_start).as_millis() as u64;
+        match &outcome {
+            Ok(rows) => info!(name = %task_name, rows, elapsed_ms, "Task completed"),
+            Err(e) => error!(name = %task_name, elapsed_ms, "{e}"),
+        }
+        outcomes.push((task_name, outcome));
     }
 
-    Ok(())
+    verdict(total_tasks, &outcomes)
+}
+
+/// The run's outcome from its tasks'. Exit 1 means nothing landed; exit 3 means something did.
+fn verdict(
+    total: usize,
+    outcomes: &[(String, Result<Option<u64>, RunError>)],
+) -> Result<(), RunError> {
+    // `None` rows is a source that produced no schema and wrote nothing.
+    let committed = outcomes.iter().any(|(_, outcome)| match outcome {
+        Ok(rows) => rows.is_some(),
+        Err(e) => matches!(e, RunError::Partial(_)),
+    });
+    let failed: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, outcome)| outcome.is_err())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    match (failed.as_slice(), committed) {
+        ([], _) => Ok(()),
+        (names, true) => Err(RunError::Partial(format!(
+            "{} of {total} task(s) failed: {}",
+            names.len(),
+            names.join(", ")
+        ))),
+        (names, false) => Err(RunError::Fatal(anyhow::anyhow!(
+            "{} of {total} task(s) failed: {}",
+            names.len(),
+            names.join(", ")
+        ))),
+    }
 }
 
 /// Run every finalize item against its resolved target. Items are independent so they run concurrently and their failures are collected, never short-circuited.
@@ -418,7 +450,7 @@ pub async fn execute_task(
     cloud_io_rt: &tokio::runtime::Handle,
     pg_pools: &HashMap<String, Pool>,
     results: &Results,
-) -> Result<Option<u64>, anyhow::Error> {
+) -> Result<Option<u64>, RunError> {
     let name = task.src.name().to_string();
     let finalize_items = task.finalize;
     let lua_modules = task.lua_modules;
@@ -517,14 +549,20 @@ pub async fn execute_task(
     if !finalize_failures.is_empty() {
         summary.push(format!("{} finalize", finalize_failures.len()));
     }
-    if summary.is_empty() {
-        Ok(Some(phase.rows))
-    } else {
-        Err(anyhow::anyhow!(
-            "task '{}' failed (see logs): {} error(s)",
+    // A destination that committed is data a retry would re-apply, so it decides the exit code.
+    let committed = phase.destinations.iter().any(|d| d.succeeded());
+    match (summary.is_empty(), committed) {
+        (true, _) => Ok(Some(phase.rows)),
+        (false, true) => Err(RunError::Partial(format!(
+            "task '{}' committed, then failed (see logs): {}",
             phase.name,
             summary.join(", ")
-        ))
+        ))),
+        (false, false) => Err(RunError::Fatal(anyhow::anyhow!(
+            "task '{}' failed (see logs): {}",
+            phase.name,
+            summary.join(", ")
+        ))),
     }
 }
 
