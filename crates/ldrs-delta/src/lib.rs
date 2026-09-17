@@ -55,12 +55,12 @@ struct DeltaCommitInfo {
 
 impl DeltaCommitInfo {
     /// The commit that creates the table, at version 0.
-    fn for_create(operation: &Operation, now_ms: i64) -> Self {
+    fn for_create(operation: &Operation, caller: &str, now_ms: i64) -> Self {
         DeltaCommitInfo {
             timestamp: now_ms,
             operation: operation.name().to_string(),
             operation_parameters: operation.parameters(),
-            engine_info: engine_info(),
+            engine_info: engine_info(caller),
             operation_metrics: HashMap::new(),
             in_commit_timestamp: Some(now_ms),
         }
@@ -71,21 +71,26 @@ impl DeltaCommitInfo {
         operation: &Operation,
         snapshot: &Snapshot,
         engine: &dyn Engine,
+        caller: &str,
         now_ms: i64,
     ) -> Result<Self, anyhow::Error> {
         Ok(DeltaCommitInfo {
             timestamp: now_ms,
             operation: operation.name().to_string(),
             operation_parameters: operation.parameters(),
-            engine_info: engine_info(),
+            engine_info: engine_info(caller),
             operation_metrics: HashMap::new(),
             in_commit_timestamp: in_commit_timestamp(snapshot, engine, now_ms)?,
         })
     }
 }
 
-fn engine_info() -> String {
-    format!("ldrs-{}", env!("CARGO_PKG_VERSION"))
+/// This crate's own identity, fixed when this crate compiles.
+const LIBRARY_ENGINE_INFO: &str = concat!("ldrs-delta/", env!("CARGO_PKG_VERSION"));
+
+/// `engineInfo` as written: the caller's identity, then this library's.
+fn engine_info(caller: &str) -> String {
+    format!("{caller} {LIBRARY_ENGINE_INFO}")
 }
 
 /// The `inCommitTimestamp` for a commit built on `snapshot`, or `None` when the table does not
@@ -519,13 +524,13 @@ struct Commit {
 
 impl Commit {
     /// The commit that creates the table, at version 0.
-    fn for_create(operation: Operation, now_ms: i64) -> Self {
+    fn for_create(operation: Operation, config: &OperationConfig, now_ms: i64) -> Self {
         let target = DeltaProtocol::none()
             .with_reader_features(operation.reader_features())
             .with_writer_features(operation.writer_features());
         Commit {
             data_change: operation.data_change(),
-            commit_info: DeltaCommitInfo::for_create(&operation, now_ms),
+            commit_info: DeltaCommitInfo::for_create(&operation, &config.caller, now_ms),
             txn: None,
             protocol: protocol_upgrade(DeltaProtocol::none(), target),
             metadata: None,
@@ -539,6 +544,7 @@ impl Commit {
     fn for_maintenance(
         operation: Operation,
         snapshot: &Snapshot,
+        config: &OperationConfig,
         engine: &dyn Engine,
         now_ms: i64,
     ) -> Result<Self, anyhow::Error> {
@@ -549,7 +555,13 @@ impl Commit {
             .with_writer_features(operation.writer_features());
         Ok(Commit {
             data_change: operation.data_change(),
-            commit_info: DeltaCommitInfo::for_commit(&operation, snapshot, engine, now_ms)?,
+            commit_info: DeltaCommitInfo::for_commit(
+                &operation,
+                snapshot,
+                engine,
+                &config.caller,
+                now_ms,
+            )?,
             txn: None,
             protocol: protocol_upgrade(current, target),
             metadata: None,
@@ -563,7 +575,7 @@ impl Commit {
         operation: Operation,
         snapshot: &Snapshot,
         schema: &SchemaRef,
-        table_config: &TableConfig,
+        config: &OperationConfig,
         engine: &dyn Engine,
         now_ms: i64,
     ) -> Result<Self, anyhow::Error> {
@@ -572,16 +584,13 @@ impl Commit {
             .clone()
             .with_reader_features(operation.reader_features())
             .with_writer_features(operation.writer_features())
-            .with_writer_features(table_config.writer_features());
+            .with_writer_features(config.writer_features());
 
         let metadata = snapshot.table_configuration().metadata();
         refuse_partitioned(metadata.partition_columns())?;
 
-        let desired = configuration_with(
-            metadata.configuration(),
-            table_config,
-            operation.configuration(),
-        );
+        let desired =
+            configuration_with(metadata.configuration(), config, operation.configuration());
         let metadata = build_metadata(
             schema,
             Some(metadata.id()),
@@ -592,7 +601,13 @@ impl Commit {
 
         Ok(Commit {
             data_change: operation.data_change(),
-            commit_info: DeltaCommitInfo::for_commit(&operation, snapshot, engine, now_ms)?,
+            commit_info: DeltaCommitInfo::for_commit(
+                &operation,
+                snapshot,
+                engine,
+                &config.caller,
+                now_ms,
+            )?,
             txn: None,
             protocol: protocol_upgrade(current, target),
             metadata: metadata_upgrade(snapshot, metadata),
@@ -670,17 +685,25 @@ fn build_metadata(
     })
 }
 
-/// What a table should be, as far as a caller gets to say. Applied to every commit: entries that
-/// differ from what the table carries are written into `metaData`, and any feature they require is
-/// declared in `protocol` by the same commit.
-///
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TableConfig {
+/// What a caller declares about one operation. A table property that differs from the table's own
+/// goes into `metaData`, and any feature it requires into `protocol`, in the same commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationConfig {
     pub target_file_size: Option<NonZeroU64>,
     pub checkpoint_interval: Option<NonZeroU64>,
+    caller: String,
 }
 
-impl TableConfig {
+impl OperationConfig {
+    /// `caller` is how the caller names itself, e.g. `ldrs/<version>`.
+    pub fn new(caller: &str) -> Self {
+        OperationConfig {
+            target_file_size: None,
+            checkpoint_interval: None,
+            caller: caller.to_string(),
+        }
+    }
+
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), anyhow::Error> {
         let positive = || {
             value
@@ -718,11 +741,11 @@ impl TableConfig {
 
 fn configuration_with(
     current: &HashMap<String, String>,
-    table_config: &TableConfig,
+    config: &OperationConfig,
     ldrs_own: &[(&str, &str)],
 ) -> HashMap<String, String> {
     let mut configuration = current.clone();
-    configuration.extend(table_config.entries());
+    configuration.extend(config.entries());
     configuration.extend(
         ldrs_own
             .iter()
@@ -731,7 +754,11 @@ fn configuration_with(
     configuration
 }
 
-pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), anyhow::Error> {
+pub async fn ensure_table(
+    table_path: &str,
+    schema: &SchemaRef,
+    config: &OperationConfig,
+) -> Result<(), anyhow::Error> {
     refuse_non_micros_timestamps(schema)?;
     let url = base_or_relative_path(table_path)?;
     let (store, base_path, _) = build_store(&url)?;
@@ -743,7 +770,7 @@ pub async fn ensure_table(table_path: &str, schema: &SchemaRef) -> Result<(), an
         "true".to_string(),
     )]);
 
-    let commit_body = Commit::for_create(Operation::CreateTable, now_ms)
+    let commit_body = Commit::for_create(Operation::CreateTable, config, now_ms)
         .with_metadata(build_metadata(
             schema,
             None,
@@ -885,7 +912,7 @@ fn build_overwrite_commit(
     table_state: &TableState,
     schema: &SchemaRef,
     adds: &[DeltaAdd],
-    table_config: &TableConfig,
+    config: &OperationConfig,
     engine: &dyn Engine,
 ) -> Result<(String, Version), anyhow::Error> {
     let next_version = table_state.version + 1;
@@ -902,7 +929,7 @@ fn build_overwrite_commit(
         Operation::Write,
         &table_state.snapshot,
         schema,
-        table_config,
+        config,
         engine,
         now_ms,
     )?
@@ -918,21 +945,15 @@ pub async fn overwrite_delta<S>(
     stream: S,
     max_rows: Option<usize>,
     max_bytes: Option<usize>,
-    table_config: &TableConfig,
+    config: &OperationConfig,
     cloud_io: &Handle,
 ) -> Result<(), anyhow::Error>
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
-    ensure_table(table_path, &schema).await?;
-    let mut sink = DeltaOverwriteSink::new(
-        table_path,
-        schema,
-        max_rows,
-        max_bytes,
-        table_config,
-        cloud_io,
-    )?;
+    ensure_table(table_path, &schema, config).await?;
+    let mut sink =
+        DeltaOverwriteSink::new(table_path, schema, max_rows, max_bytes, config, cloud_io)?;
     let mut stream = std::pin::pin!(stream);
     while let Some(batch) = stream.next().await {
         sink.write_batch(&batch?).await?;
@@ -957,9 +978,9 @@ mod tests {
 
     #[test]
     fn a_property_the_table_lacks_is_added() {
-        let config = TableConfig {
+        let config = OperationConfig {
             target_file_size: Some(nonzero(1024)),
-            ..Default::default()
+            ..OperationConfig::new("ldrs-test")
         };
         let desired = configuration_with(&carrying(&[]), &config, &[]);
         assert_eq!(desired, carrying(&[("delta.targetFileSize", "1024")]));
@@ -967,9 +988,9 @@ mod tests {
 
     #[test]
     fn a_property_whose_value_changed_is_rewritten() {
-        let config = TableConfig {
+        let config = OperationConfig {
             target_file_size: Some(nonzero(2048)),
-            ..Default::default()
+            ..OperationConfig::new("ldrs-test")
         };
         let current = carrying(&[("delta.targetFileSize", "1024")]);
         let desired = configuration_with(&current, &config, &[]);
@@ -979,15 +1000,15 @@ mod tests {
     #[test]
     fn a_property_nobody_names_is_left_alone() {
         let current = carrying(&[("delta.appendOnly", "true")]);
-        let desired = configuration_with(&current, &TableConfig::default(), &[]);
+        let desired = configuration_with(&current, &OperationConfig::new("ldrs-test"), &[]);
         assert_eq!(desired, current, "reconciling never removes");
     }
 
     #[test]
     fn ldrs_has_the_last_word_over_the_caller() {
-        let config = TableConfig {
+        let config = OperationConfig {
             target_file_size: Some(nonzero(1024)),
-            ..Default::default()
+            ..OperationConfig::new("ldrs-test")
         };
         let desired = configuration_with(
             &carrying(&[("delta.enableDeletionVectors", "false")]),
@@ -1000,7 +1021,7 @@ mod tests {
 
     #[test]
     fn a_settable_property_is_parsed_into_its_field() {
-        let mut config = TableConfig::default();
+        let mut config = OperationConfig::new("ldrs-test");
         config.set("delta.targetFileSize", "268435456").unwrap();
         config.set("delta.checkpointInterval", "100").unwrap();
         assert_eq!(config.target_file_size, Some(nonzero(268435456)));
@@ -1009,7 +1030,7 @@ mod tests {
 
     #[test]
     fn a_property_ldrs_manages_is_refused_by_name() {
-        let error = TableConfig::default()
+        let error = OperationConfig::new("ldrs-test")
             .set("delta.enableDeletionVectors", "true")
             .unwrap_err()
             .to_string();
@@ -1018,7 +1039,7 @@ mod tests {
 
     #[test]
     fn a_property_ldrs_does_not_know_is_refused_as_unknown() {
-        let error = TableConfig::default()
+        let error = OperationConfig::new("ldrs-test")
             .set("delta.enableChangeDataFeed", "true")
             .unwrap_err()
             .to_string();
@@ -1032,7 +1053,7 @@ mod tests {
     fn a_value_kernel_would_silently_drop_is_refused_here() {
         for value in ["banana", "0", "-1", "1.5"] {
             assert!(
-                TableConfig::default()
+                OperationConfig::new("ldrs-test")
                     .set("delta.targetFileSize", value)
                     .is_err(),
                 "'{value}' should not be accepted"

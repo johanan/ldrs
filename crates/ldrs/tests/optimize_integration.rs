@@ -1,5 +1,5 @@
 use futures::stream;
-use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, TableConfig, TxnConfig};
+use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, OperationConfig, TxnConfig};
 use ldrs_test_fixtures::delta::{
     cleanup_table, count_actions, delta_table_path, duckdb_count, duckdb_summary, find_action,
     latest_version, make_batch_from_ids, make_source_batch, make_target_batch, read_log_actions,
@@ -37,7 +37,7 @@ async fn test_optimize_compacts_small_files_and_materializes_deletion_vectors() 
             schema.clone(),
             stream::iter(vec![Ok(make_source_batch(ids))]),
             config,
-            &TableConfig::default(),
+            &OperationConfig::new("ldrs-test"),
             &rt,
         )
         .await
@@ -50,7 +50,7 @@ async fn test_optimize_compacts_small_files_and_materializes_deletion_vectors() 
         stream::iter(vec![Ok(make_target_batch(1..101))]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -72,7 +72,9 @@ async fn test_optimize_compacts_small_files_and_materializes_deletion_vectors() 
         "expected the small files to bin together, planned {planned} files"
     );
 
-    let outcome = ldrs_delta::execute_plan(before, &rt).await.unwrap();
+    let outcome = ldrs_delta::execute_plan(before, &OperationConfig::new("ldrs-test"), &rt)
+        .await
+        .unwrap();
     assert!(!outcome.skipped);
     assert_eq!(outcome.files_added, 1, "one bin should mean one file");
     assert_eq!(outcome.files_removed, planned);
@@ -143,7 +145,7 @@ async fn test_optimize_commits_removes_with_no_add_for_an_all_deleted_bin() {
         stream::iter(vec![Ok(make_target_batch(1..101))]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -161,7 +163,7 @@ async fn test_optimize_commits_removes_with_no_add_for_an_all_deleted_bin() {
             txn_config: TxnConfig::None,
             inline_deletion_vectors: false,
         },
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -178,7 +180,9 @@ async fn test_optimize_commits_removes_with_no_add_for_an_all_deleted_bin() {
     assert_eq!(plan.bins().len(), 1);
     assert_eq!(plan.bins()[0].input_files(), 1);
 
-    let outcome = ldrs_delta::execute_plan(plan, &rt).await.unwrap();
+    let outcome = ldrs_delta::execute_plan(plan, &OperationConfig::new("ldrs-test"), &rt)
+        .await
+        .unwrap();
     assert!(!outcome.skipped);
     assert_eq!(outcome.files_added, 0, "every row of the bin was deleted");
     assert_eq!(outcome.files_removed, 1);
@@ -215,7 +219,7 @@ async fn small_file_table(table_path: &str, rt: &tokio::runtime::Handle) -> Stri
         stream::iter(vec![Ok(make_target_batch(1..101))]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         rt,
     )
     .await
@@ -233,7 +237,7 @@ async fn small_file_table(table_path: &str, rt: &tokio::runtime::Handle) -> Stri
                 txn_config: TxnConfig::None,
                 inline_deletion_vectors: false,
             },
-            &TableConfig::default(),
+            &OperationConfig::new("ldrs-test"),
             rt,
         )
         .await
@@ -275,7 +279,7 @@ async fn test_optimize_abandons_when_another_writer_commits_first() {
             txn_config: TxnConfig::None,
             inline_deletion_vectors: false,
         },
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -283,7 +287,7 @@ async fn test_optimize_abandons_when_another_writer_commits_first() {
     assert_eq!(latest_version(&table_path), planned_at + 1);
     let contents = duckdb_summary(&table_path);
 
-    let error = ldrs_delta::execute_plan(plan, &rt)
+    let error = ldrs_delta::execute_plan(plan, &OperationConfig::new("ldrs-test"), &rt)
         .await
         .expect_err("the version optimize planned to write was taken")
         .to_string();
@@ -339,16 +343,15 @@ async fn test_optimize_target_size_prefers_the_flag_then_the_table_property() {
 
     assert_eq!(bins(None).await, (1, 3));
 
+    let mut one_byte_files = OperationConfig::new("ldrs-test");
+    one_byte_files.target_file_size = Some(std::num::NonZeroU64::new(1).unwrap());
     overwrite_delta(
         &table_url,
         test_schema(),
         stream::iter(vec![Ok(make_target_batch(1..101))]),
         None,
         None,
-        &TableConfig {
-            target_file_size: Some(std::num::NonZeroU64::new(1).unwrap()),
-            ..Default::default()
-        },
+        &one_byte_files,
         &rt,
     )
     .await
@@ -366,7 +369,7 @@ async fn test_optimize_target_size_prefers_the_flag_then_the_table_property() {
                 txn_config: TxnConfig::None,
                 inline_deletion_vectors: false,
             },
-            &TableConfig::default(),
+            &OperationConfig::new("ldrs-test"),
             &rt,
         )
         .await
@@ -402,7 +405,7 @@ async fn test_optimize_reads_a_sidecar_dv_through_a_root_without_a_trailing_slas
         stream::iter(vec![Ok(make_target_batch(1..2001))]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -425,7 +428,7 @@ async fn test_optimize_reads_a_sidecar_dv_through_a_root_without_a_trailing_slas
             txn_config: TxnConfig::None,
             inline_deletion_vectors: false,
         },
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -439,7 +442,9 @@ async fn test_optimize_reads_a_sidecar_dv_through_a_root_without_a_trailing_slas
         .unwrap();
     assert!(!plan.is_empty());
 
-    let outcome = ldrs_delta::execute_plan(plan, &rt).await.unwrap();
+    let outcome = ldrs_delta::execute_plan(plan, &OperationConfig::new("ldrs-test"), &rt)
+        .await
+        .unwrap();
     assert_eq!(outcome.deletion_vectors_removed, 1);
     assert_eq!(duckdb_summary(&table_path), contents);
 }

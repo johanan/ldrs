@@ -753,6 +753,7 @@ fn resolve_dest(
                 columns,
                 target: resolved_target,
                 truncate_timestamps,
+                engine_info: crate::ENGINE_INFO.to_string(),
             }))
         }
         LdrsDestination::Arrow(arrow_dest) => {

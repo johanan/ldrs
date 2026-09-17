@@ -28,7 +28,7 @@ use crate::features::{
 use crate::stats::{pick_bound, stats_to_scalars};
 use crate::{
     build_add, build_engine, file_path, partition_values, snapshot_table_state,
-    version_to_log_filename, Commit, DeltaRemove, Operation, TableState,
+    version_to_log_filename, Commit, DeltaRemove, Operation, OperationConfig, TableState,
 };
 
 const FOOTER_CONCURRENCY: usize = 16;
@@ -136,6 +136,7 @@ impl OptimizeOutcome {
 /// Rewrite every bin, then commit the removes and adds as one version.
 pub async fn execute_plan(
     plan: OptimizePlan,
+    config: &OperationConfig,
     cloud_io: &Handle,
 ) -> Result<OptimizeOutcome, anyhow::Error> {
     if plan.bins.is_empty() {
@@ -189,6 +190,7 @@ pub async fn execute_plan(
     let commit_body = Commit::for_maintenance(
         Operation::Optimize,
         &plan.state.snapshot,
+        config,
         engine.as_ref(),
         now,
     )?

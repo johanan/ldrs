@@ -13,7 +13,7 @@ use ldrs::ldrs_env::{ambient_env, get_all_ldrs_env_vars};
 use ldrs::lua_logic::lua_args::{modules_from_args, LuaArgs, SnowflakeResult, SnowflakeStrategy};
 use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
 use ldrs::path_pattern;
-use ldrs_delta::{execute_plan, plan_optimize, vacuum, Retention};
+use ldrs_delta::{execute_plan, plan_optimize, vacuum, OperationConfig, Retention};
 use ldrs_storage::build_store;
 use serde_yaml::{Mapping, Value};
 use tracing::{debug, error, info};
@@ -298,7 +298,8 @@ async fn optimize_target(
         return Ok(());
     }
 
-    let outcome = execute_plan(plan, cloud_io).await?;
+    let config = OperationConfig::new(ldrs::ENGINE_INFO);
+    let outcome = execute_plan(plan, &config, cloud_io).await?;
     info!(
         target = %target.target,
         version = ?outcome.version,

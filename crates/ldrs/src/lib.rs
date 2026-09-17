@@ -1,3 +1,6 @@
+/// How ldrs names itself in a Delta commit's `engineInfo`.
+pub const ENGINE_INFO: &str = concat!("ldrs/", env!("CARGO_PKG_VERSION"));
+
 pub mod cli_schema;
 pub mod delta;
 pub mod file_source;
