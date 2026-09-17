@@ -3,11 +3,39 @@ pub mod snowflake_source;
 use anyhow::Context;
 use ldrs_arrow::ColumnType;
 use ldrs_core::spawn::Spawned;
+use serde::{de::DeserializeOwned, Deserialize};
+use serde_json::{Map, Value};
 use std::{ffi::OsString, path::PathBuf, process::Command};
 use tracing::debug;
 use url::Url;
 
 use crate::ldrs_env::child_env;
+
+#[derive(Debug, Deserialize)]
+pub struct StatementResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+    pub truncated: bool,
+}
+
+impl StatementResult {
+    /// Each row keyed by column name rather than position.
+    pub fn rows_as<T: DeserializeOwned>(&self) -> Result<Vec<T>, anyhow::Error> {
+        self.rows
+            .iter()
+            .map(|row| {
+                let object: Map<String, Value> = self
+                    .columns
+                    .iter()
+                    .cloned()
+                    .zip(row.iter().cloned())
+                    .collect();
+                serde_json::from_value(Value::Object(object))
+                    .with_context(|| "unexpected shape in a Snowflake result set")
+            })
+            .collect()
+    }
+}
 
 #[derive(Clone)]
 pub struct SnowflakeConnection {
@@ -46,16 +74,14 @@ impl SnowflakeConnection {
         });
     }
 
-    /// Execute an ordered list of SQL statements via `ldrs-sf exec` in a single spawn, returning the
-    /// captured stdout JSON (one result set per statement). Statements are passed pre-separated as
-    /// repeated `--sql` flags; ldrs-sf runs them in order and stops at the first driver error.
+    /// Runs the statements in order; an error discards the results of the ones that already ran.
     pub fn exec(
         &self,
         statements: &[String],
         ambient: Vec<(String, OsString)>,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<Vec<StatementResult>, anyhow::Error> {
         if statements.is_empty() {
-            return Ok(String::new());
+            return Ok(Vec::new());
         }
         debug!("Running ldrs-sf exec: {} statement(s)", statements.len());
 
@@ -66,7 +92,8 @@ impl SnowflakeConnection {
                     .flat_map(|sql| ["--sql".to_string(), sql.clone()]),
             )
             .collect();
-        run_capture(self.spawn(args, &[], ambient))
+        let output = run_capture(self.spawn(args, &[], ambient))?;
+        serde_json::from_str(&output).with_context(|| "could not parse ldrs-sf output")
     }
 
     /// First create the auth LDRS_SF_*, then bind the params as LDRS_SF_PARAM_P*.

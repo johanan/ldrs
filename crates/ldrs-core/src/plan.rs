@@ -70,6 +70,8 @@ pub struct DeltaDest {
     pub columns: Vec<ColumnSpec>,
     pub target: String,
     pub truncate_timestamps: bool,
+    /// How the caller names itself in `commitInfo.engineInfo`, e.g. `ldrs/<version>`.
+    pub engine_info: String,
 }
 
 pub enum DeltaMode {

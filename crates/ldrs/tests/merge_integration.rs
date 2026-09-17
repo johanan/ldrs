@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_array::builder::Int64Builder;
 use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use futures::stream;
-use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, TableConfig, TxnConfig};
+use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, OperationConfig, TxnConfig};
 use ldrs_test_fixtures::delta::{
     cleanup_table, count_actions, delta_table_path, duckdb_count, find_action, latest_version,
     make_batch, make_batch_from_ids, make_source_batch, make_target_batch, read_log_actions,
@@ -36,7 +36,7 @@ async fn test_merge_file_based_dv_round_trip() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -60,7 +60,7 @@ async fn test_merge_file_based_dv_round_trip() {
         schema.clone(),
         stream::iter(vec![Ok(source1)]),
         config(),
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -87,7 +87,7 @@ async fn test_merge_file_based_dv_round_trip() {
         schema.clone(),
         stream::iter(vec![Ok(source2)]),
         config(),
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -128,7 +128,7 @@ async fn test_merge_basic_int_key() {
         target_stream,
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -152,7 +152,7 @@ async fn test_merge_basic_int_key() {
         schema.clone(),
         source_stream,
         config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -265,7 +265,7 @@ async fn test_merge_empty_table() {
         schema.clone(),
         source_stream,
         config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -331,7 +331,7 @@ async fn test_merge_all_matches() {
         target_stream,
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -354,7 +354,7 @@ async fn test_merge_all_matches() {
         schema.clone(),
         source_stream,
         config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -418,7 +418,7 @@ async fn test_merge_with_existing_dvs() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -440,7 +440,7 @@ async fn test_merge_with_existing_dvs() {
         schema.clone(),
         stream::iter(vec![Ok(first_source)]),
         config.clone(),
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -456,7 +456,7 @@ async fn test_merge_with_existing_dvs() {
         schema.clone(),
         stream::iter(vec![Ok(second_source)]),
         config.clone(),
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -517,7 +517,7 @@ async fn test_merge_string_key() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -540,7 +540,7 @@ async fn test_merge_string_key() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -592,7 +592,7 @@ async fn test_merge_timestamp_key() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -613,7 +613,7 @@ async fn test_merge_timestamp_key() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -658,7 +658,7 @@ async fn test_merge_composite_key() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -681,7 +681,7 @@ async fn test_merge_composite_key() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -726,7 +726,7 @@ async fn test_merge_txn_watermark_skip() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -751,7 +751,7 @@ async fn test_merge_txn_watermark_skip() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config.clone(),
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -772,7 +772,7 @@ async fn test_merge_txn_watermark_skip() {
         schema.clone(),
         stream::iter(vec![Ok(same_source)]),
         config.clone(),
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -813,7 +813,7 @@ async fn test_merge_txn_processing_time_skip() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -840,7 +840,7 @@ async fn test_merge_txn_processing_time_skip() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config.clone(),
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -864,7 +864,7 @@ async fn test_merge_txn_processing_time_skip() {
         schema.clone(),
         stream::iter(vec![Ok(same_source)]),
         config.clone(),
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -886,7 +886,7 @@ async fn test_merge_txn_processing_time_skip() {
         schema.clone(),
         stream::iter(vec![Ok(different_source)]),
         newer_config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -927,7 +927,7 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -972,7 +972,7 @@ async fn test_merge_null_keys_rejected_and_cleaned_up() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await;
@@ -1012,7 +1012,7 @@ async fn test_a_small_dv_goes_to_a_file_by_default() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -1033,7 +1033,7 @@ async fn test_a_small_dv_goes_to_a_file_by_default() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -1083,7 +1083,7 @@ async fn test_inline_option_stores_a_small_dv_in_the_commit() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -1105,7 +1105,7 @@ async fn test_inline_option_stores_a_small_dv_in_the_commit() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -1174,7 +1174,7 @@ async fn test_inline_option_stores_a_small_dv_in_the_commit() {
         schema.clone(),
         stream::iter(vec![Ok(second_source)]),
         second_config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -1223,7 +1223,7 @@ async fn test_merge_recovers_existing_sidecar_dv() {
         stream::iter(vec![Ok(target)]),
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -1248,7 +1248,7 @@ async fn test_merge_recovers_existing_sidecar_dv() {
         schema.clone(),
         stream::iter(vec![Ok(first_source)]),
         config.clone(),
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -1281,7 +1281,7 @@ async fn test_merge_recovers_existing_sidecar_dv() {
         schema.clone(),
         stream::iter(vec![Ok(second_source)]),
         config.clone(),
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -1346,7 +1346,7 @@ async fn test_the_table_property_sets_the_checkpoint_cadence() {
     let schema = test_schema();
     let table_url = format!("file://{}/", table_path);
 
-    let mut table_config = TableConfig::default();
+    let mut table_config = OperationConfig::new("ldrs-test");
     table_config.set("delta.checkpointInterval", "100").unwrap();
 
     overwrite_delta(
@@ -1421,7 +1421,7 @@ async fn test_merge_writes_checkpoint_past_interval() {
         target_stream,
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -1437,7 +1437,7 @@ async fn test_merge_writes_checkpoint_past_interval() {
             schema.clone(),
             source_stream,
             config(),
-            &TableConfig::default(),
+            &OperationConfig::new("ldrs-test"),
             &rt,
         )
         .await
@@ -1479,7 +1479,7 @@ async fn test_merge_writes_checkpoint_past_interval() {
         schema.clone(),
         source_stream,
         config(),
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await
@@ -1526,7 +1526,7 @@ async fn test_overwrite_after_merge_retires_deletion_vectored_files() {
             stream,
             None,
             None,
-            &TableConfig::default(),
+            &OperationConfig::new("ldrs-test"),
             &rt,
         )
         .await
@@ -1549,7 +1549,7 @@ async fn test_overwrite_after_merge_retires_deletion_vectored_files() {
         schema.clone(),
         stream::iter(vec![Ok(source)]),
         config,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         &rt,
     )
     .await

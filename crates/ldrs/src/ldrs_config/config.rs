@@ -1,5 +1,5 @@
 use crate::{
-    delta::{self, DeltaCommon, DeltaDestination, DeltaMerge},
+    delta::{self, DeltaCommon, DeltaDestination, DeltaMerge, RegisterSpec, SfRegister},
     file_source::FileSource,
     finalize::{FinalizeItem, SfFinalize},
     ldrs_config::field_validation::{extract_props, find_unknown_keys, UnknownKey},
@@ -150,6 +150,36 @@ pub fn destination_known_fields(dest: &LdrsDestination) -> Vec<String> {
     }
 }
 
+/// Keys inside a destination's nested `register:` block, which the block's own walk cannot see.
+pub fn register_unknown_keys(value: &Value, dest: &LdrsDestination) -> Vec<UnknownKey> {
+    let Some(block) = value.get("register") else {
+        return Vec::new();
+    };
+    let fields = match dest {
+        LdrsDestination::Delta(DeltaDestination::Overwrite(DeltaCommon {
+            register: Some(spec),
+            ..
+        }))
+        | LdrsDestination::Delta(DeltaDestination::Merge(DeltaMerge {
+            common:
+                DeltaCommon {
+                    register: Some(spec),
+                    ..
+                },
+            ..
+        })) => match spec {
+            RegisterSpec::Snowflake(_) => extract_props::<SfRegister>(),
+        },
+        _ => return Vec::new(),
+    };
+    let allowed: HashSet<&str> = fields
+        .iter()
+        .map(String::as_str)
+        .chain(["catalog"])
+        .collect();
+    find_unknown_keys(block, &allowed)
+}
+
 /// Walks a raw block against the union of fields declared by the parsed src and
 /// dest variants, plus the block-level structural keys. Returns findings; does
 /// not emit. Caller decides when/how to surface them.
@@ -166,7 +196,9 @@ pub fn find_unknown_block_keys(
         .chain(dest_fields.iter().map(String::as_str))
         .chain(STRUCTURAL_KEYS.iter().copied())
         .collect();
-    find_unknown_keys(value, &allowed)
+    let mut unknown = find_unknown_keys(value, &allowed);
+    unknown.extend(register_unknown_keys(value, dest));
+    unknown
 }
 
 pub fn merge_with_defaults(defaults: &Option<Value>, specific: Value) -> Value {
@@ -416,7 +448,9 @@ fn parse_table_nested(
                 .map(String::as_str)
                 .chain(["dest"])
                 .collect();
-            Ok::<_, anyhow::Error>((dest, find_unknown_keys(&raw_item, &allowed)))
+            let mut unknown = find_unknown_keys(&raw_item, &allowed);
+            unknown.extend(register_unknown_keys(&raw_item, &dest));
+            Ok::<_, anyhow::Error>((dest, unknown))
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -544,6 +578,7 @@ mod tests {
                 max_rows: None,
                 max_bytes: None,
                 truncate_timestamps: false,
+                register: None,
             },
             merge_keys: Vec::new(),
             allow_null_keys: false,
@@ -567,6 +602,7 @@ mod tests {
                 "max_rows",
                 "merge_keys",
                 "name",
+                "register",
                 "target",
                 "truncate_timestamps",
                 "txn_mode",

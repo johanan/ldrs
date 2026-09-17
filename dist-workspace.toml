@@ -7,6 +7,9 @@ members = ["cargo:./crates/ldrs"]
 cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
+# Only tags with this prefix are ours; keeps library tags (ldrs-delta-v*) from
+# triggering a binary release
+tag-namespace = "ldrs-v"
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)

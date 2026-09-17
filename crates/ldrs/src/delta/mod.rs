@@ -27,6 +27,37 @@ pub struct DeltaCommon {
     /// Write nanosecond source timestamps as microseconds accepting the truncation.
     #[serde(default, alias = "delta.truncate_timestamps")]
     pub truncate_timestamps: bool,
+    /// Register the table with a catalog after the load commits.
+    #[serde(default)]
+    pub register: Option<RegisterSpec>,
+}
+
+#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "catalog", rename_all = "snake_case")]
+pub enum RegisterSpec {
+    Snowflake(SfRegister),
+}
+
+#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SfRegister {
+    /// Fully qualified Snowflake table, templated against the load context.
+    pub table: String,
+    /// Existing catalog integration with CATALOG_SOURCE = OBJECT_STORE, TABLE_FORMAT = DELTA.
+    pub integration: String,
+    /// Existing external volume whose storage location contains the delta table.
+    pub external_volume: String,
+    #[serde(default)]
+    pub refresh: Refresh,
+}
+
+#[derive(Eq, PartialEq, Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Refresh {
+    /// Refresh once at the end of each load.
+    #[default]
+    Load,
+    /// Snowflake polls on its own schedule, billing serverless credits by time.
+    Auto,
 }
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -86,6 +117,13 @@ pub enum MergeTxnConfig {
         app_id: String,
         batch_version: Option<String>,
     },
+}
+
+pub(crate) fn delta_target_name(dest: &DeltaDestination) -> &str {
+    match dest {
+        DeltaDestination::Overwrite(c) => c.target.as_deref().unwrap_or(&c.name),
+        DeltaDestination::Merge(m) => m.common.target.as_deref().unwrap_or(&m.common.name),
+    }
 }
 
 /// Whether the resulting configuration is valid, inherited values included.

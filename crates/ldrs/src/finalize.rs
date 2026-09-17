@@ -245,7 +245,7 @@ pub fn run_sf(
     let output = conn
         .exec(&statements, ambient)
         .map_err(|e| format!("{e:#}"))?;
-    info!(phase = "finalize", "sf finalize result: {output}");
+    info!(phase = "finalize", "sf finalize result: {output:?}");
     Ok(())
 }
 
@@ -264,7 +264,7 @@ mod tests {
             rows: 10,
             destinations: vec![DestinationOutcome::Delta {
                 target: "public.users".to_string(),
-                full_url: "az://curated/acme/users".to_string(),
+                url: "az://curated/acme/users".to_string(),
                 columns: vec![
                     ColumnSpec::BigInt {
                         name: "id".to_string(),
@@ -296,7 +296,7 @@ mod tests {
                 local cmds = {}
                 for _, d in ipairs(phase.destinations) do
                     if d.kind == "delta" then
-                        table.insert(cmds, "CREATE EXTERNAL TABLE t LOCATION '" .. d.full_url .. "'")
+                        table.insert(cmds, "CREATE EXTERNAL TABLE t LOCATION '" .. d.url .. "'")
                         table.insert(cmds, "ALTER EXTERNAL TABLE t REFRESH")
                     end
                 end
@@ -371,7 +371,7 @@ mod tests {
             rows: 10,
             destinations: vec![DestinationOutcome::Delta {
                 target: "public.users".to_string(),
-                full_url: "az://curated/acme/users".to_string(),
+                url: "az://curated/acme/users".to_string(),
                 columns: vec![],
                 result: Ok(DeltaCommit::Merge {
                     skipped: true,

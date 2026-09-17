@@ -13,6 +13,7 @@ use crate::{
     ldrs_snowflake::snowflake_source::SFSource,
     parquet::ParquetDestination,
     postgres::postgres_destination::PgDestination,
+    results::ResultLine,
 };
 
 /// Placeholder schema for `columns:` fields. Keeps `ColumnSpec` out of every
@@ -91,6 +92,8 @@ pub enum SchemaCommands {
     Arrow,
     /// Post-load finalize item block (`run:` selects the kind, e.g. sf)
     Finalize,
+    /// JSONL line shapes written by `--results`
+    Results,
     /// Column transform + param type vocabulary (ColumnSpec / ColumnType)
     Columns,
     /// YAML config file envelope (LdrsConfig)
@@ -110,6 +113,7 @@ pub fn build(command: &SchemaCommands) -> Value {
         SchemaCommands::Delta => dest_doc::<DeltaDestination>("delta", Some("delta")),
         SchemaCommands::Arrow => dest_doc::<ArrowDestination>("arrow", None),
         SchemaCommands::Finalize => finalize_doc(),
+        SchemaCommands::Results => results_doc(),
         SchemaCommands::Columns => build_columns(),
         SchemaCommands::Yaml => build_yaml(),
         SchemaCommands::Usage => build_usage(),
@@ -162,9 +166,24 @@ fn finalize_doc() -> Value {
         "finalize": block,
         "phase": phase,
         "ldrs_module": ldrs_module,
-        "handler": "The `lua` file must define `finalize(phase)`: called once per item with the run's output (`phase`, schema below), it returns the command list run against the item's target. Each destination carries its resolved `target`, post-cast `columns`, and (for URL-backed destinations) `full_url`; Parquet lists its written files (each with `full_url`, `path`, `rows`, `size_bytes`); a Delta `result` carries the commit op (`overwrite`/`merge`, with merge stats including `skipped` for an idempotent no-op). There is a ldrs module: `local ldrs = require \"ldrs\"` The functions are listed under `ldrs_module`.",
+        "handler": "The `lua` file must define `finalize(phase)`: called once per item with the run's output (`phase`, schema below), it returns the command list run against the item's target. Each destination carries its resolved `target`, post-cast `columns`, and (for URL-backed destinations) `url`; Parquet lists its written files (each with `full_url`, `path`, `rows`, `size_bytes`); a Delta `result` carries the commit op (`overwrite`/`merge`, with merge stats including `skipped` for an idempotent no-op). There is a ldrs module: `local ldrs = require \"ldrs\"` The functions are listed under `ldrs_module`.",
         "modules": "Run-level `lua_modules:` (top of the config) and per-item `lua_modules:` list Lua files loadable via `require` by file stem; a chunk returning a table is bound module-style. The lists merge, an item's same-stem entry winning; `ldrs` is reserved for the ldrs module.",
-        "execution": "Every returned command runs in order, stopping at the first error; each statement's result set is info-logged under phase=\"finalize\". The same per-task structure (`phase` schema) is what `--report` writes as JSONL, one line per task.",
+        "execution": "Every returned command runs in order, stopping at the first error; each statement's result set is info-logged under phase=\"finalize\". The same per-task structure (`phase` schema) is what `--results` writes as its `load` line; run `ldrs schema results` for every line shape.",
+        "usage_ref": "ldrs schema usage",
+    })
+}
+
+/// The JSONL line shapes `--results` writes (`ResultLine`). `kind` selects the record.
+fn results_doc() -> Value {
+    let mut g = SchemaGenerator::default();
+    let line = g.subschema_for::<ResultLine>();
+    json!({
+        "$defs": g.take_definitions(true),
+        "kind": "results",
+        "result_line": line,
+        "cadence": "A `load` line per task, written before any post-load phase runs, whether the load succeeded or failed. A `register` line per catalog registration that ran, which is one per delta destination that both declares a `register:` block and committed. A `finalize` line per task, only when a finalize item failed. The file is truncated at startup and each line is flushed as it is written, so a run that dies partway still inventories what landed.",
+        "outcomes": "`result` fields are tagged by outcome: `{\"Ok\": ...}` or `{\"Err\": \"...\"}`. This is the shape a `load` line's destinations already carry, so it reads the same everywhere in the file.",
+        "phase_ref": "ldrs schema finalize",
         "usage_ref": "ldrs schema usage",
     })
 }

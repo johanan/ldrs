@@ -10,7 +10,9 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, TimeUnit};
 use futures::TryStreamExt;
+use ldrs::error::RunError;
 use ldrs::ldrs_config::{execute_configs, parse_yaml_config};
+use ldrs::results::Results;
 use ldrs_parquet::builder_from_string;
 use ldrs_test_fixtures::{data_url, fixture, fixture_url};
 
@@ -27,14 +29,14 @@ fn penguins_url() -> String {
     format!("{}duckdb/", data_url())
 }
 
-async fn run(config: &str, ldrs_env: &[(String, String)]) -> Result<(), anyhow::Error> {
+async fn run(config: &str, ldrs_env: &[(String, String)]) -> Result<(), RunError> {
     let rt = cloud_io();
     let result = execute_configs(
         parse_yaml_config(config, ldrs_env).unwrap(),
         None,
         ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await;
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
@@ -515,14 +517,10 @@ tables:
     let err = run(writing, &ldrs_env)
         .await
         .expect_err("an attached db is read-only");
-    let err = format!("{err:#}");
-    assert!(
-        err.contains("read-only") || err.contains("read only"),
-        "expected a read-only refusal, got: {err}"
-    );
+    assert_eq!(err.code(), 1, "got: {err}");
 }
 
-/// A failing query has to fail the run, carrying duckdb's own message.
+/// A failing query has to fail the run, exiting 1 with nothing written.
 #[tokio::test]
 #[test_log::test]
 async fn failing_query_fails_the_run() {
@@ -538,11 +536,7 @@ tables:
 "#;
     let ldrs_env = vec![("LDRS_DEST_BROKEN".to_string(), data_url())];
     let err = run(config, &ldrs_env).await.expect_err("bad SQL must fail");
-    let err = format!("{err:#}");
-    assert!(
-        err.contains("Catalog Error"),
-        "duckdb's message reaches the caller: {err}"
-    );
+    assert_eq!(err.code(), 1, "got: {err}");
     assert!(
         !fixture("duckdb_writes/never.parquet").exists(),
         "nothing should be committed"

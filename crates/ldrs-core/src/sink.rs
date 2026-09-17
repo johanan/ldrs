@@ -159,11 +159,11 @@ pub async fn finish_all(
                         .await
                         .with_context(|| format!("postgres load to {target} failed"))
                         .map_err(|e| format!("{e:#}"));
-                    Some(DestinationOutcome::Pg {
+                    DestinationOutcome::Pg {
                         target,
                         columns,
                         result,
-                    })
+                    }
                 }
                 Sink::Pq(s, (columns, target, base_url)) => {
                     // An empty load still writes, so a stale file cannot outlive a successful run.
@@ -185,28 +185,28 @@ pub async fn finish_all(
                         })
                         .with_context(|| format!("parquet write to {base_url} failed"))
                         .map_err(|e| format!("{e:#}"));
-                    Some(DestinationOutcome::Parquet {
+                    DestinationOutcome::Parquet {
                         target,
-                        full_url: base_url,
+                        url: base_url,
                         columns,
                         result,
-                    })
+                    }
                 }
-                Sink::DeltaOverwrite(s, (columns, target, full_url)) => {
+                Sink::DeltaOverwrite(s, (columns, target, url)) => {
                     let result = s
                         .finish()
                         .await
                         .map(|_| DeltaCommit::Overwrite)
-                        .with_context(|| format!("delta overwrite at {full_url} failed"))
+                        .with_context(|| format!("delta overwrite at {url} failed"))
                         .map_err(|e| format!("{e:#}"));
-                    Some(DestinationOutcome::Delta {
+                    DestinationOutcome::Delta {
                         target,
-                        full_url,
+                        url,
                         columns,
                         result,
-                    })
+                    }
                 }
-                Sink::DeltaMerge(s, (columns, target, full_url)) => {
+                Sink::DeltaMerge(s, (columns, target, url)) => {
                     let result = s
                         .finish()
                         .await
@@ -219,29 +219,26 @@ pub async fn finish_all(
                             files_scanned: st.files_scanned as u64,
                             files_written: st.files_written as u64,
                         })
-                        .with_context(|| format!("delta merge at {full_url} failed"))
+                        .with_context(|| format!("delta merge at {url} failed"))
                         .map_err(|e| format!("{e:#}"));
-                    Some(DestinationOutcome::Delta {
+                    DestinationOutcome::Delta {
                         target,
-                        full_url,
+                        url,
                         columns,
                         result,
-                    })
+                    }
                 }
-                // arrow: terminal, no outcome entry; a finish error (e.g. closed pipe) is logged, not fatal
+                // a finish error (e.g. closed pipe) is logged, not fatal
                 Sink::Arrow(s) => {
                     if let Err(e) = s.finish() {
                         warn!("arrow sink finish failed: {e}");
                     }
-                    None
+                    DestinationOutcome::Arrow
                 }
             }
         }
     }))
-    .await
-    .into_iter()
-    .flatten()
-    .collect();
+    .await;
     Ok(destinations)
 }
 

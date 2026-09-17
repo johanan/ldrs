@@ -2,7 +2,7 @@ pub mod config;
 pub mod field_validation;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 
 use anyhow::Context;
 use deadpool_postgres::Pool;
@@ -20,9 +20,12 @@ use ldrs_storage::join_into_url;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use crate::error::RunError;
 use crate::ldrs_env::{ambient_env, starts_with_ignore_ascii_case};
+use crate::register::{register_sf, resolve_registers, run_register};
+use crate::results::{ResultLine, Results};
 use crate::{
-    delta::{DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
+    delta::{delta_target_name, DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
     finalize::{build_sources, call_finalize, run_sf, FinalizeItem, SfCommand},
     ldrs_config::{
         config::{
@@ -228,13 +231,6 @@ fn warn_unknown_keys(task_name: &str, unknown_keys: &[UnknownKey]) {
     }
 }
 
-fn delta_target_name(dest: &DeltaDestination) -> &str {
-    match dest {
-        DeltaDestination::Overwrite(c) => c.target.as_deref().unwrap_or(&c.name),
-        DeltaDestination::Merge(m) => m.common.target.as_deref().unwrap_or(&m.common.name),
-    }
-}
-
 fn delta_table_path(
     resolved_target: &str,
     ldrs_env: &[(String, String)],
@@ -299,30 +295,68 @@ pub fn resolve_delta_targets(
     }
 }
 
+/// Ensure every register block a config declares, without loading. Returns the targets that failed.
+pub async fn register_from_config(
+    tasks: Vec<LdrsParsedConfig>,
+    select: Option<Vec<String>>,
+    ldrs_env: &[(String, String)],
+    results: &Results,
+) -> Result<Vec<String>, anyhow::Error> {
+    let exec_env = ExecutionEnv::create(ldrs_env);
+    let ambient = ambient_env();
+    let mut declared = 0usize;
+    let mut failed = Vec::new();
+
+    for task in select_tasks(tasks, select) {
+        let name = task.src.name().to_string();
+        warn_unknown_keys(&name, &task.unknown_keys);
+        let context =
+            LdrsExecutionContext::try_new(&name, &exec_env.handlebars, &exec_env.handlebars_vars)?;
+        let registers = resolve_registers(&task.dests, &context, ldrs_env)?;
+
+        for pair in task.dests.iter().zip(registers) {
+            match pair {
+                (LdrsDestination::Delta(delta), Some(register)) => {
+                    declared += 1;
+                    let target = context.render_template(delta_target_name(delta))?;
+                    let table_path = delta_table_path(&target, ldrs_env)?;
+                    let outcome = register_sf(&register, &table_path, ambient.clone()).await;
+                    if let Ok(action) = &outcome {
+                        info!(target = %target, catalog_table = %register.table, action, "registered");
+                    }
+                    results.write(ResultLine::Register {
+                        name: &name,
+                        target: &target,
+                        catalog_table: &register.table,
+                        result: outcome.as_ref().copied().map_err(String::as_str),
+                    })?;
+                    if let Err(e) = outcome {
+                        error!(target = %target, "register failed: {e}");
+                        failed.push(target);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    match declared {
+        0 => Err(anyhow::anyhow!("the config declares no register blocks")),
+        _ => Ok(failed),
+    }
+}
+
 pub async fn execute_configs(
     tasks: Vec<LdrsParsedConfig>,
     select: Option<Vec<String>>,
     ldrs_env: &[(String, String)],
     cloud_io_rt: &tokio::runtime::Handle,
-    report: Option<String>,
-) -> Result<(), anyhow::Error> {
+    results: &Results,
+) -> Result<(), RunError> {
     let filtered_tasks = select_tasks(tasks, select);
     debug!("Tasks to be run {:?}", filtered_tasks);
 
     validate_configs(&filtered_tasks)?;
-
-    // Created before any task runs: an unwritable path fails here, with zero side effects,
-    // and `create` truncates a prior run's report.
-    let report_file = report
-        .as_deref()
-        .map(std::fs::File::create)
-        .transpose()
-        .with_context(|| {
-            format!(
-                "could not create report file '{}'",
-                report.unwrap_or_default()
-            )
-        })?;
 
     let exec_env = ExecutionEnv::create(ldrs_env);
     // One connection pool per Postgres destination URL, shared read-only across every task. Strip
@@ -340,14 +374,15 @@ pub async fn execute_configs(
         .collect::<Result<Vec<_>, _>>()?;
     let pg_pools = build_pools(&pg_urls)?;
     let total_tasks = filtered_tasks.len();
+    let mut outcomes: Vec<(String, Result<Option<u64>, RunError>)> = Vec::new();
     for (i, task) in filtered_tasks.into_iter().enumerate() {
         let task_start = std::time::Instant::now();
         debug!("Task: {:?}", task);
         // owned so it can still name the task in the completion line, after `task` is moved
         let task_name = task.src.name().to_string();
         warn_unknown_keys(&task_name, &task.unknown_keys);
-        info!(table = %task_name, "Running task: {}/{}", i + 1, total_tasks);
-        let rows = execute_task(
+        info!(name = %task_name, "Running task: {}/{}", i + 1, total_tasks);
+        let outcome = execute_task(
             task,
             exec_env.ldrs_env,
             &exec_env.handlebars,
@@ -355,20 +390,50 @@ pub async fn execute_configs(
             &exec_env.typed_params,
             cloud_io_rt,
             &pg_pools,
-            report_file.as_ref(),
+            results,
         )
-        .await?;
+        .await;
         let task_end = std::time::Instant::now();
-        info!(
-            table = %task_name,
-            rows,
-            // u64: tracing has no u128 Value impl, so u128 would land in JSON as a string
-            elapsed_ms = (task_end - task_start).as_millis() as u64,
-            "Task completed"
-        );
+        // u64: tracing has no u128 Value impl, so u128 would land in JSON as a string
+        let elapsed_ms = (task_end - task_start).as_millis() as u64;
+        match &outcome {
+            Ok(rows) => info!(name = %task_name, rows, elapsed_ms, "Task completed"),
+            Err(e) => error!(name = %task_name, elapsed_ms, "{e}"),
+        }
+        outcomes.push((task_name, outcome));
     }
 
-    Ok(())
+    verdict(total_tasks, &outcomes)
+}
+
+/// The run's outcome from its tasks'. Exit 1 means nothing landed; exit 3 means something did.
+fn verdict(
+    total: usize,
+    outcomes: &[(String, Result<Option<u64>, RunError>)],
+) -> Result<(), RunError> {
+    // `None` rows is a source that produced no schema and wrote nothing.
+    let committed = outcomes.iter().any(|(_, outcome)| match outcome {
+        Ok(rows) => rows.is_some(),
+        Err(e) => matches!(e, RunError::Partial(_)),
+    });
+    let failed: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, outcome)| outcome.is_err())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    match (failed.as_slice(), committed) {
+        ([], _) => Ok(()),
+        (names, true) => Err(RunError::Partial(format!(
+            "{} of {total} task(s) failed: {}",
+            names.len(),
+            names.join(", ")
+        ))),
+        (names, false) => Err(RunError::Fatal(anyhow::anyhow!(
+            "{} of {total} task(s) failed: {}",
+            names.len(),
+            names.join(", ")
+        ))),
+    }
 }
 
 /// Run every finalize item against its resolved target. Items are independent so they run concurrently and their failures are collected, never short-circuited.
@@ -429,13 +494,15 @@ pub async fn execute_task(
     env_params: &[(String, String, Option<ColumnType>)],
     cloud_io_rt: &tokio::runtime::Handle,
     pg_pools: &HashMap<String, Pool>,
-    report: Option<&std::fs::File>,
-) -> Result<Option<u64>, anyhow::Error> {
+    results: &Results,
+) -> Result<Option<u64>, RunError> {
     let name = task.src.name().to_string();
     let finalize_items = task.finalize;
     let lua_modules = task.lua_modules;
     let context = LdrsExecutionContext::try_new(&name, &handlebars, &handlebars_vars)?;
     let source = resolve_source(task.src, &context, env_params, ldrs_env)?;
+    // Before the load, so a bad connection fails with nothing committed.
+    let registers = resolve_registers(&task.dests, &context, ldrs_env)?;
     let dests = task
         .dests
         .into_iter()
@@ -459,13 +526,13 @@ pub async fn execute_task(
                 result: Ok(commit),
                 ..
             } => match commit {
-                DeltaCommit::Overwrite => info!(dest = %target, "delta overwrite committed"),
+                DeltaCommit::Overwrite => info!(target = %target, "delta overwrite committed"),
                 DeltaCommit::Merge {
                     skipped: true,
                     skipped_version,
                     ..
                 } => info!(
-                    dest = %target,
+                    target = %target,
                     committed_version = skipped_version,
                     "delta merge skipped: source is not newer than the committed version"
                 ),
@@ -475,7 +542,7 @@ pub async fn execute_task(
                     files_written,
                     ..
                 } => info!(
-                    dest = %target,
+                    target = %target,
                     matched = matched_rows,
                     inserted = inserted_rows,
                     files_written,
@@ -487,7 +554,7 @@ pub async fn execute_task(
                 result: Ok(files),
                 ..
             } => info!(
-                dest = %target,
+                target = %target,
                 files = files.len(),
                 size_bytes = files.iter().map(|f| f.size_bytes).sum::<u64>(),
                 "parquet write committed"
@@ -496,50 +563,61 @@ pub async fn execute_task(
                 target,
                 result: Ok(()),
                 ..
-            } => info!(dest = %target, "postgres load committed"),
+            } => info!(target = %target, "postgres load committed"),
             _ => {}
         }
     }
-    let finalize_failures =
-        run_finalize(&finalize_items, &phase, ldrs_env, &context, &lua_modules).await;
     let load_failures: Vec<String> = phase
         .destinations
         .iter()
         .filter_map(|d| d.status().err().cloned())
         .collect();
-    // Load and finalize are distinct phases. Each
-    // failure is its own structured log line; the returned error is a summary, since the detail
-    // lives in the logs.
     for f in &load_failures {
         error!(phase = "load", "{f}");
     }
+    // Written before any post-load phase runs, and covers failed tasks too.
+    results.write(ResultLine::Load(&phase))?;
+
+    let register_failures = run_register(&registers, &phase, results).await;
+    for f in &register_failures {
+        error!(phase = "register", "{f}");
+    }
+
+    let finalize_failures =
+        run_finalize(&finalize_items, &phase, ldrs_env, &context, &lua_modules).await;
     for f in &finalize_failures {
         error!(phase = "finalize", "{f}");
     }
-    // The report line covers failed tasks too, and flushes before a failure below aborts the
-    // run, so a report from a dead run still inventories what committed.
-    if let Some(mut f) = report {
-        let mut line = serde_json::to_string(&phase)?;
-        line.push('\n');
-        f.write_all(line.as_bytes())
-            .and_then(|_| f.flush())
-            .with_context(|| "could not write report line")?;
+    if !finalize_failures.is_empty() {
+        results.write(ResultLine::Finalize {
+            name: &phase.name,
+            errors: &finalize_failures,
+        })?;
     }
     let mut summary = Vec::new();
     if !load_failures.is_empty() {
         summary.push(format!("{} load", load_failures.len()));
     }
+    if !register_failures.is_empty() {
+        summary.push(format!("{} register", register_failures.len()));
+    }
     if !finalize_failures.is_empty() {
         summary.push(format!("{} finalize", finalize_failures.len()));
     }
-    if summary.is_empty() {
-        Ok(Some(phase.rows))
-    } else {
-        Err(anyhow::anyhow!(
-            "task '{}' failed (see logs): {} error(s)",
+    // A destination that committed is data a retry would re-apply, so it decides the exit code.
+    let committed = phase.destinations.iter().any(|d| d.succeeded());
+    match (summary.is_empty(), committed) {
+        (true, _) => Ok(Some(phase.rows)),
+        (false, true) => Err(RunError::Partial(format!(
+            "task '{}' committed, then failed (see logs): {}",
             phase.name,
             summary.join(", ")
-        ))
+        ))),
+        (false, false) => Err(RunError::Fatal(anyhow::anyhow!(
+            "task '{}' failed (see logs): {}",
+            phase.name,
+            summary.join(", ")
+        ))),
     }
 }
 
@@ -753,6 +831,7 @@ fn resolve_dest(
                 columns,
                 target: resolved_target,
                 truncate_timestamps,
+                engine_info: crate::ENGINE_INFO.to_string(),
             }))
         }
         LdrsDestination::Arrow(arrow_dest) => {

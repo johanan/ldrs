@@ -30,11 +30,9 @@ pub struct FileWritten {
     pub size_bytes: u64,
 }
 
-/// One destination's identity and its outcome (`result`). Identity is known regardless of outcome;
-/// `result` carries the success output or the error. `target` is the resolved logical name
-/// The URL-backed variants carry `full_url` (fully qualified: the Delta table, the
-/// Parquet base directory). `columns` is the post-cast schema that actually landed. Parquet's files
-/// are listed per-entry in `result`.
+/// One destination's identity and its outcome (`result`). `target` is the resolved logical name,
+/// `columns` the post-cast schema that landed. URL-backed variants carry `url`; Parquet also
+/// lists each file it wrote in `result`.
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum DestinationOutcome {
@@ -45,16 +43,18 @@ pub enum DestinationOutcome {
     },
     Delta {
         target: String,
-        full_url: String,
+        url: String,
         columns: Vec<ColumnSpec>,
         result: Result<DeltaCommit, String>,
     },
     Parquet {
         target: String,
-        full_url: String,
+        url: String,
         columns: Vec<ColumnSpec>,
         result: Result<Vec<FileWritten>, String>,
     },
+    /// Stdout. Terminal, so it has nothing to commit and no failure to report.
+    Arrow,
 }
 
 impl DestinationOutcome {
@@ -64,6 +64,7 @@ impl DestinationOutcome {
             DestinationOutcome::Pg { result, .. } => result.as_ref().map(|_| ()),
             DestinationOutcome::Delta { result, .. } => result.as_ref().map(|_| ()),
             DestinationOutcome::Parquet { result, .. } => result.as_ref().map(|_| ()),
+            DestinationOutcome::Arrow => Ok(()),
         }
     }
 

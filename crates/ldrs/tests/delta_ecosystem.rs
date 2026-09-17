@@ -2,6 +2,7 @@
 //!
 //! `scripts/spark/build_fixtures.py` builds the fixtures.
 
+use ldrs_delta::OperationConfig;
 use ldrs_test_fixtures::delta::{
     copy_fixture_table, count_actions, duckdb_csv, find_action, latest_version, read_log_actions,
 };
@@ -43,7 +44,9 @@ async fn test_optimize_compacts_a_spark_written_partitioned_table() {
         assert_eq!(bin.input_files(), 3, "three appends land three files here");
     }
 
-    let outcome = ldrs_delta::execute_plan(plan, &rt).await.unwrap();
+    let outcome = ldrs_delta::execute_plan(plan, &OperationConfig::new("ldrs-test"), &rt)
+        .await
+        .unwrap();
     assert!(!outcome.skipped);
     assert_eq!(outcome.files_added, 3);
     assert_eq!(outcome.files_removed, 9);
@@ -130,7 +133,9 @@ async fn test_optimize_compacts_a_column_mapped_table() {
         .unwrap();
     assert_eq!(plan.bins().len(), 1, "unpartitioned, one schema, one bin");
 
-    let outcome = ldrs_delta::execute_plan(plan, &rt).await.unwrap();
+    let outcome = ldrs_delta::execute_plan(plan, &OperationConfig::new("ldrs-test"), &rt)
+        .await
+        .unwrap();
     assert_eq!(outcome.files_added, 1);
     assert_eq!(outcome.files_removed, 3);
     let version = outcome.version.expect("a commit should have been written");
@@ -199,7 +204,9 @@ async fn test_optimize_packs_a_column_mapped_table_by_its_logical_order_column()
     );
     assert_eq!(plan.bins()[0].input_files(), 2);
 
-    let outcome = ldrs_delta::execute_plan(plan, &rt).await.unwrap();
+    let outcome = ldrs_delta::execute_plan(plan, &OperationConfig::new("ldrs-test"), &rt)
+        .await
+        .unwrap();
     assert_eq!(outcome.files_added, 1);
     assert_eq!(outcome.files_removed, 2);
     let version = outcome.version.expect("a commit should have been written");
@@ -355,7 +362,9 @@ async fn test_optimize_carries_a_foreign_in_commit_timestamp_forward() {
         .unwrap();
     assert_eq!(plan.bins().len(), 1, "two files, one bin");
 
-    let outcome = ldrs_delta::execute_plan(plan, &rt).await.unwrap();
+    let outcome = ldrs_delta::execute_plan(plan, &OperationConfig::new("ldrs-test"), &rt)
+        .await
+        .unwrap();
     assert_eq!(outcome.files_added, 1);
     assert_eq!(outcome.files_removed, 2);
     let version = outcome.version.expect("a commit should have been written");
@@ -402,7 +411,9 @@ async fn test_optimize_preserves_a_null_partition_value() {
     // partitions hold a single file and are left alone.
     assert_eq!(plan.bins().len(), 7);
 
-    let outcome = ldrs_delta::execute_plan(plan, &rt).await.unwrap();
+    let outcome = ldrs_delta::execute_plan(plan, &OperationConfig::new("ldrs-test"), &rt)
+        .await
+        .unwrap();
     assert_eq!(outcome.files_added, 7);
     assert_eq!(outcome.files_removed, 14);
     let version = outcome.version.expect("a commit should have been written");

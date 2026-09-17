@@ -1,9 +1,10 @@
 use delta_kernel::expressions::Scalar;
 use futures::TryStreamExt;
 use ldrs::ldrs_config::{execute_configs, parse_yaml_config, resolve_delta_targets};
+use ldrs::results::Results;
 use ldrs_delta::{
-    delta_stats_to_json, overwrite_delta, parquet_metadata_to_delta_stats, vacuum, Retention,
-    TableConfig,
+    delta_stats_to_json, overwrite_delta, parquet_metadata_to_delta_stats, vacuum, OperationConfig,
+    Retention,
 };
 use ldrs_parquet::builder_from_string;
 use ldrs_test_fixtures::delta::{cleanup_table, delta_table_path, make_target_batch, test_schema};
@@ -308,7 +309,7 @@ async fn test_overwrite_delta() {
         stream,
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         rt.handle(),
     )
     .await
@@ -387,7 +388,7 @@ async fn test_overwrite_delta() {
         stream2,
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         rt.handle(),
     )
     .await
@@ -485,7 +486,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -588,7 +589,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -630,7 +631,7 @@ tables:
         None,
         &ldrs_env,
         rt.handle(),
-        None,
+        &Results::default(),
     )
     .await
     .unwrap();
@@ -708,7 +709,7 @@ async fn test_overwrite_writes_checkpoint_past_interval() {
             stream,
             None,
             None,
-            &TableConfig::default(),
+            &OperationConfig::new("ldrs-test"),
             rt.handle(),
         )
         .await
@@ -747,7 +748,7 @@ async fn test_overwrite_writes_checkpoint_past_interval() {
         stream,
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         rt.handle(),
     )
     .await
@@ -814,7 +815,7 @@ async fn test_vacuum_deletes_orphans_and_keeps_referenced_files() {
             stream,
             None,
             None,
-            &TableConfig::default(),
+            &OperationConfig::new("ldrs-test"),
             rt.handle(),
         )
         .await
@@ -925,7 +926,7 @@ async fn test_vacuum_refuses_retention_under_the_table_floor() {
         stream,
         None,
         None,
-        &TableConfig::default(),
+        &OperationConfig::new("ldrs-test"),
         rt.handle(),
     )
     .await
@@ -979,7 +980,7 @@ async fn test_created_tables_enable_in_commit_timestamps() {
             stream,
             None,
             None,
-            &TableConfig::default(),
+            &OperationConfig::new("ldrs-test"),
             rt.handle(),
         )
         .await
@@ -1030,6 +1031,69 @@ async fn test_created_tables_enable_in_commit_timestamps() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_engine_info_names_the_release_and_the_library() {
+    // Through the config path, so the shell's own version reaches the commit.
+    let config = r#"
+src: file
+dest: delta.overwrite
+tables:
+  - name: public.users
+    filename: public.users/public.users.snappy.parquet
+"#;
+
+    let delta_root = fixture("delta_writes/engine_info_delta_root/")
+        .display()
+        .to_string();
+    let table_path = format!("{delta_root}public.users");
+    let _ = std::fs::remove_dir_all(&table_path);
+
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), data_url()),
+        (
+            "LDRS_DEST".to_string(),
+            fixture_url("delta_writes/engine_info_delta_root/"),
+        ),
+    ];
+
+    execute_configs(
+        parse_yaml_config(config, &ldrs_env).unwrap(),
+        None,
+        &ldrs_env,
+        &tokio::runtime::Handle::current(),
+        &Results::default(),
+    )
+    .await
+    .unwrap();
+
+    // v0 is the create (Commit::for_create), v1 the write (Commit::for_table).
+    for version in [0, 1] {
+        let path = format!("{table_path}/_delta_log/{version:020}.json");
+        let engine_info = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find_map(|v| {
+                v.get("commitInfo")?
+                    .get("engineInfo")?
+                    .as_str()
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| panic!("v{version} should carry an engineInfo"));
+
+        let (caller, library) = engine_info
+            .split_once(' ')
+            .unwrap_or_else(|| panic!("v{version} engineInfo is one component: '{engine_info}'"));
+        assert_eq!(caller, format!("ldrs/{}", env!("CARGO_PKG_VERSION")));
+        assert!(
+            library.starts_with("ldrs-delta/"),
+            "v{version} should append the library: '{library}'"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&table_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_overwrite_refuses_a_commit_missing_its_in_commit_timestamp() {
     let source_path = fixture_url("public.users/public.users.snappy.parquet");
@@ -1061,7 +1125,7 @@ async fn test_overwrite_refuses_a_commit_missing_its_in_commit_timestamp() {
             stream,
             None,
             None,
-            &TableConfig::default(),
+            &OperationConfig::new("ldrs-test"),
             rt.handle(),
         )
         .await
@@ -1160,7 +1224,7 @@ tables:
             None,
             &ldrs_env,
             rt.handle(),
-            None,
+            &Results::default(),
         )
         .await
         .unwrap();
@@ -1226,7 +1290,7 @@ tables:
             None,
             &ldrs_env,
             rt.handle(),
-            None,
+            &Results::default(),
         )
         .await
     };
@@ -1415,7 +1479,7 @@ async fn test_table_properties_are_added_changed_and_never_removed() {
     cleanup_table(&table_path);
     let table_url = format!("file://{}/", table_path);
 
-    let overwrite = async |config: TableConfig| {
+    let overwrite = async |config: OperationConfig| {
         overwrite_delta(
             &table_url,
             test_schema(),
@@ -1436,9 +1500,10 @@ async fn test_table_properties_are_added_changed_and_never_removed() {
             .find_map(|v| v.get("metaData").map(|m| m["configuration"].clone()))
     };
 
-    let sized = |bytes: u64| TableConfig {
-        target_file_size: Some(std::num::NonZeroU64::new(bytes).unwrap()),
-        ..Default::default()
+    let sized = |bytes: u64| {
+        let mut config = OperationConfig::new("ldrs-test");
+        config.target_file_size = Some(std::num::NonZeroU64::new(bytes).unwrap());
+        config
     };
 
     overwrite(sized(1024)).await;
@@ -1461,7 +1526,7 @@ async fn test_table_properties_are_added_changed_and_never_removed() {
         "2048"
     );
 
-    overwrite(TableConfig::default()).await;
+    overwrite(OperationConfig::new("ldrs-test")).await;
     assert!(
         configuration_at(4).is_none(),
         "declaring nothing removes nothing: {:?}",

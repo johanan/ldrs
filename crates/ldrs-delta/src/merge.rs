@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use crate::{
     build_add, build_engine, checkpoint_interval, cleanup_source_files, ensure_table, file_path,
     should_checkpoint, version_to_log_filename, write_checkpoint, Commit, DeltaRemove, DeltaTxn,
-    Operation, TableConfig, MERGE_MAX_RETRIES,
+    Operation, OperationConfig, MERGE_MAX_RETRIES,
 };
 
 use super::dv::{build_dv_file, build_dv_inline, serialize_dv};
@@ -190,14 +190,14 @@ pub async fn merge_delta<S>(
     schema: SchemaRef,
     stream: S,
     merge_config: MergeConfig,
-    table_config: &TableConfig,
+    config: &OperationConfig,
     cloud_io: &Handle,
 ) -> Result<MergeStats, anyhow::Error>
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
-    ensure_table(table_path, &schema).await?;
-    let mut sink = DeltaMergeSink::new(table_path, schema, merge_config, table_config, cloud_io)?;
+    ensure_table(table_path, &schema, config).await?;
+    let mut sink = DeltaMergeSink::new(table_path, schema, merge_config, config, cloud_io)?;
     let mut stream = std::pin::pin!(stream);
     while let Some(batch) = stream.next().await {
         sink.write_batch(&batch?).await?;
@@ -218,7 +218,7 @@ pub struct DeltaMergeSink {
     url: Url,
     schema: SchemaRef,
     merge_config: MergeConfig,
-    table_config: TableConfig,
+    config: OperationConfig,
 }
 
 impl DeltaMergeSink {
@@ -226,7 +226,7 @@ impl DeltaMergeSink {
         table_path: &str,
         schema: SchemaRef,
         merge_config: MergeConfig,
-        table_config: &TableConfig,
+        config: &OperationConfig,
         cloud_io: &Handle,
     ) -> Result<Self, anyhow::Error> {
         crate::refuse_non_micros_timestamps(&schema)?;
@@ -258,7 +258,7 @@ impl DeltaMergeSink {
             url,
             schema,
             merge_config,
-            table_config: table_config.clone(),
+            config: config.clone(),
         })
     }
 
@@ -286,7 +286,7 @@ impl DeltaMergeSink {
             &self.url,
             &self.schema,
             &self.merge_config,
-            &self.table_config,
+            &self.config,
             &source_files,
         )
         .await
@@ -321,7 +321,7 @@ async fn commit_merge(
     url: &Url,
     schema: &SchemaRef,
     merge_config: &MergeConfig,
-    table_config: &TableConfig,
+    config: &OperationConfig,
     source_files: &[(String, ParquetMetaData, u64)],
 ) -> Result<MergeStats, anyhow::Error> {
     if !merge_config.allow_null_keys {
@@ -477,7 +477,7 @@ async fn commit_merge(
             Operation::Merge,
             &snapshot,
             schema,
-            table_config,
+            config,
             engine.as_ref(),
             now,
         )?

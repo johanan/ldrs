@@ -1,24 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CHANGELOG='crates/ldrs/CHANGELOG.md'
+# Tags every artifact whose current version has no tag yet. Keep in step with
+# the ARTIFACTS list in cliff.sh.
+ARTIFACTS=(ldrs ldrs-delta)
 
-VERSION=$(cargo pkgid -p ldrs | sed 's/.*[#@]//')
-TAG="ldrs-v$VERSION"
+for ARTIFACT in "${ARTIFACTS[@]}"; do
+  CHANGELOG="crates/$ARTIFACT/CHANGELOG.md"
+  VERSION=$(cargo pkgid -p "$ARTIFACT" | sed 's/.*[#@]//')
+  TAG="$ARTIFACT-v$VERSION"
 
-if git rev-parse "$TAG" >/dev/null 2>&1; then
-  echo "Tag $TAG already exists at $(git rev-parse --short "$TAG")"
-  exit 0
-fi
+  if git rev-parse "$TAG" >/dev/null 2>&1; then
+    echo "$ARTIFACT: tag $TAG already exists at $(git rev-parse --short "$TAG")"
+    continue
+  fi
 
-NOTES=$(awk "/^## \\[$VERSION\\]/{flag=1; next} /^## \\[/{flag=0} flag" "$CHANGELOG")
+  NOTES=''
+  if [ -f "$CHANGELOG" ]; then
+    NOTES=$(awk "/^## \\[$VERSION\\]/{flag=1; next} /^## \\[/{flag=0} flag" "$CHANGELOG")
+  fi
 
-if [ -z "$NOTES" ]; then
-  echo "Warning: no CHANGELOG section found for $VERSION"
-  git tag -a "$TAG" -m "Release $TAG"
-else
-  git tag -a "$TAG" -m "Release $TAG" -m "$NOTES"
-fi
+  if [ -z "$NOTES" ]; then
+    echo "Warning: no $CHANGELOG section found for $VERSION"
+    git tag -a "$TAG" -m "Release $TAG"
+  else
+    git tag -a "$TAG" -m "Release $TAG" -m "$NOTES"
+  fi
 
-echo "Created tag $TAG at $(git rev-parse --short HEAD)"
-echo "Push with: git push origin $TAG"
+  echo "Created tag $TAG at $(git rev-parse --short HEAD)"
+  echo "Push with: git push origin $TAG"
+done

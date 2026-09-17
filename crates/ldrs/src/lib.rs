@@ -1,5 +1,9 @@
+/// How ldrs names itself in a Delta commit's `engineInfo`.
+pub const ENGINE_INFO: &str = concat!("ldrs/", env!("CARGO_PKG_VERSION"));
+
 pub mod cli_schema;
 pub mod delta;
+pub mod error;
 pub mod file_source;
 pub mod finalize;
 pub mod ldrs_config;
@@ -11,3 +15,5 @@ pub mod lua_logic;
 pub mod parquet;
 pub mod path_pattern;
 pub mod postgres;
+pub mod register;
+pub mod results;

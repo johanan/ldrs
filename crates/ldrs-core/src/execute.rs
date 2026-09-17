@@ -11,7 +11,7 @@ use ldrs_arrow::{
     build_arrow_transform_strategy, build_source_and_target_schema, ArrowColumnTransformStrategy,
     ColumnSpec, TimeUnit,
 };
-use ldrs_delta::{ensure_table, DeltaMergeSink, DeltaOverwriteSink, TableConfig};
+use ldrs_delta::{ensure_table, DeltaMergeSink, DeltaOverwriteSink, OperationConfig};
 use ldrs_parquet::{default_writer_props, with_bloom_filters, ParquetSink};
 use ldrs_postgres::{build_pg_pool, PgLoad, PgSink};
 use tokio::task::JoinHandle;
@@ -193,8 +193,8 @@ async fn build_sink(
             Ok(Sink::Pq(sink, (target_cols, pq.target, pq.url)))
         }
         DestSpec::Delta(delta) => {
-            ensure_table(&delta.table_path, &out_schema).await?;
-            let table_config = TableConfig::default();
+            let table_config = OperationConfig::new(&delta.engine_info);
+            ensure_table(&delta.table_path, &out_schema, &table_config).await?;
             let sink = match delta.mode {
                 DeltaMode::Overwrite {
                     max_rows,
@@ -464,6 +464,7 @@ mod tests {
             columns: vec![],
             target: "t".to_string(),
             truncate_timestamps: false,
+            engine_info: "ldrs-test".to_string(),
         })
     }
 
