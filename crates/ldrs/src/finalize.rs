@@ -245,7 +245,7 @@ pub fn run_sf(
     let output = conn
         .exec(&statements, ambient)
         .map_err(|e| format!("{e:#}"))?;
-    info!(phase = "finalize", "sf finalize result: {output}");
+    info!(phase = "finalize", "sf finalize result: {output:?}");
     Ok(())
 }
 
