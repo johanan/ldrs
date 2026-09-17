@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.24.0] - 2026-09-17
+
+### Bug Fixes
+
+- *(storage)* Resolve azure url
+
+Standardize the way the different azure urls resolve into a base that
+can be compared.
+
+
+### Features
+
+- *(delta)* Register a delta table in snowflake
+
+A delta destination can now register the table in Snowflake.
+
+Can also be ran as register only with ldrs delta register --config
+
+
+### Refactor
+
+- *(core)* Arrow dest has outcome, full_url is url
+
+The Delta and Parquet variants of DestinationOutcome rename full_url to
+url.
+
+- *(cli)* Log fields are target and url
+
+Structured log fields use target for a destination's resolved name, url
+for its
+location, and name for the task, replacing table, dest, and path.
+
+- *(delta)* Name the caller and this library in engineInfo
+
+commitInfo.engineInfo is now written that correctly reflects the version
+of ldrs and ldrs-delta.
+
+- *(sf)* Parse ldrs-sf exec output into result sets
+
+Make the output from ldrs-sf parsable so it can be correctly read.
+
+- *(cli)* --report is --results
+
+Fixing naming.
+
+- *(cli)* Exits 3 when data commits
+
+Runs will now exit 1 when nothing lands (so a total failure). Or exit 3
+if something fails but other steps completed with data landing
+somewhere.
+
+
 ## [0.23.1] - 2026-09-02
 
 ### Bug Fixes
