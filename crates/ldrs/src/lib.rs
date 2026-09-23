@@ -11,7 +11,6 @@ pub mod ldrs_duckdb;
 pub mod ldrs_env;
 pub mod ldrs_schema;
 pub mod ldrs_snowflake;
-pub mod lua_logic;
 pub mod parquet;
 pub mod path_pattern;
 pub mod postgres;

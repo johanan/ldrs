@@ -10,12 +10,11 @@ use std::ffi::OsString;
 
 use crate::ldrs_env::LdrsExecutionContext;
 use crate::ldrs_snowflake::SnowflakeConnection;
-use crate::lua_logic::UrlData;
 use crate::path_pattern::{extracted_segments_to_value, PathPattern};
 use ldrs_core::phase::PhaseOutput;
 use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 use url::Url;
 
@@ -247,6 +246,73 @@ pub fn run_sf(
         .map_err(|e| format!("{e:#}"))?;
     info!(phase = "finalize", "sf finalize result: {output:?}");
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UrlData {
+    pub full_url: String,
+    pub scheme: String,
+    pub host: Option<String>,
+    pub path: String,
+    pub filename: Option<String>,
+    pub extension: Option<String>,
+    pub file_stem: Option<String>,
+    pub full_extension: Option<String>,
+    pub base_name: Option<String>,
+    pub query: Option<String>,
+    pub fragment: Option<String>,
+}
+
+impl From<Url> for UrlData {
+    fn from(url: Url) -> Self {
+        let path = std::path::Path::new(url.path());
+        let filename = path
+            .file_name()
+            .and_then(osstr_to_string)
+            .map(|s| s.to_string());
+        let extension = path
+            .extension()
+            .and_then(osstr_to_string)
+            .map(|s| s.to_string());
+        let file_stem = path
+            .file_stem()
+            .and_then(osstr_to_string)
+            .map(|s| s.to_string());
+        let full_extension = filename
+            .as_ref()
+            .and_then(|f| full_extension(f))
+            .map(|s| s.to_string());
+        let base_name = filename
+            .as_ref()
+            .and_then(|f| base_name(f))
+            .map(|s| s.to_string());
+
+        UrlData {
+            full_url: url.to_string(),
+            scheme: url.scheme().to_string(),
+            host: url.host_str().map(|s| s.to_string()),
+            path: url.path().to_string(),
+            filename,
+            extension,
+            file_stem,
+            full_extension,
+            base_name,
+            query: url.query().map(|s| s.to_string()),
+            fragment: url.fragment().map(|s| s.to_string()),
+        }
+    }
+}
+
+fn osstr_to_string(os_str: &std::ffi::OsStr) -> Option<&str> {
+    os_str.to_str()
+}
+
+fn full_extension(file_name: &str) -> Option<&str> {
+    file_name.find('.').map(|pos| &file_name[pos + 1..])
+}
+
+fn base_name(file_name: &str) -> Option<&str> {
+    file_name.find('.').map(|pos| &file_name[..pos])
 }
 
 #[cfg(test)]

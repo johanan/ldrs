@@ -11,15 +11,11 @@ use ldrs::ldrs_config::{
     execute_configs, infer_env_type, parse_tables, register_from_config, resolve_delta_targets,
     DeltaTarget,
 };
-use ldrs::ldrs_env::{ambient_env, get_all_ldrs_env_vars};
-use ldrs::lua_logic::lua_args::{modules_from_args, LuaArgs, SnowflakeResult, SnowflakeStrategy};
-use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
-use ldrs::path_pattern;
+use ldrs::ldrs_env::get_all_ldrs_env_vars;
 use ldrs::results::Results;
 use ldrs_delta::{execute_plan, plan_optimize, vacuum, OperationConfig, Retention};
-use ldrs_storage::build_store;
 use serde_yaml::{Mapping, Value};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Subcommand)]
@@ -151,27 +147,13 @@ struct ConfigArgs {
     results: Option<String>,
 }
 
-#[derive(Subcommand)]
-pub enum SnowflakeCommands {
-    Ingest {
-        #[arg(long, short)]
-        file_url: String,
-
-        #[arg(long, short)]
-        pattern: String,
-
-        #[clap(flatten)]
-        lua_args: LuaArgs,
-    },
-}
-
 #[derive(Args)]
 #[command(
     after_help = "Tip: run `ldrs schema` to list the available kinds. `ldrs schema <kind>` (e.g. `ldrs schema pq`) dumps one kind's fields; `ldrs schema columns` the column-transform vocabulary; `ldrs schema usage` env vars, templating, and examples."
 )]
 struct RunArgs {
-    /// Base config blob (YAML or JSON). A single table block.
-    /// All other config args will override values in this.
+    /// Base config blob (YAML or JSON). A single table block, as in a config file's `tables:`.
+    /// --src, --name and --sql override the same keys in this.
     #[arg(long)]
     config_inline: Option<String>,
 
@@ -200,11 +182,6 @@ struct RunArgs {
 enum Destination {
     /// Load from a config file. All sources and destinations.
     Ld(ConfigArgs),
-    /// Snowflake destination
-    Sf {
-        #[command(subcommand)]
-        command: SnowflakeCommands,
-    },
     /// Delta table maintenance
     Delta {
         #[command(subcommand)]
@@ -486,7 +463,7 @@ fn results_path(destination: &Destination) -> Option<&str> {
             | DeltaCommands::OptimizeTable(_)
             | DeltaCommands::MaintenanceTable(_) => &None,
         },
-        Destination::Sf { .. } | Destination::Schema { .. } => &None,
+        Destination::Schema { .. } => &None,
     };
     args.as_deref()
 }
@@ -615,74 +592,6 @@ fn run() -> Result<(), RunError> {
                     Ok(())
                 }
             },
-            Destination::Sf { command } => {
-                match command {
-                    SnowflakeCommands::Ingest {
-                        file_url,
-                        pattern,
-                        lua_args,
-                    } => match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
-                        Ok(sf_url) => {
-                            let (pattern, url, modules) =
-                                modules_from_args(lua_args, file_url.as_str(), pattern.as_str())?;
-
-                            let (_, file_path, scheme) = build_store(&url)?;
-                            let url_data: UrlData = url.clone().into();
-                            let storage_data = StorageData::from_parts(&url, &file_path, scheme);
-
-                            let file_path_str = file_path.to_string();
-                            let extracted = pattern.parse_path(&file_path_str)?;
-                            let segments_value =
-                                path_pattern::extracted_segments_to_value(&extracted);
-
-                            let context = serde_json::json!({});
-
-                            let mut loader = LuaFunctionLoader::new().unwrap();
-                            let process_result = loader.call_process::<SnowflakeResult>(
-                                &modules,
-                                &url_data,
-                                &storage_data,
-                                &segments_value,
-                                None,
-                                &context,
-                            )?;
-                            let conn =
-                                ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
-                                    &sf_url,
-                                    None,
-                                    None,
-                                    ldrs::ldrs_snowflake::resolve_inherited_sf_env(
-                                        &get_all_ldrs_env_vars(),
-                                    ),
-                                )?;
-
-                            if matches!(process_result.strategy, SnowflakeStrategy::Ingest) {
-                                Err(anyhow::anyhow!("Ingest is not implemented"))?
-                            }
-
-                            let ambient = ambient_env();
-
-                            let pre_sql = conn.exec(&process_result.pre_sql, ambient.clone())?;
-                            debug!("Pre SQL {:?} executed successfully", pre_sql);
-                            let _sql = match process_result.strategy {
-                                SnowflakeStrategy::Sql(sql) => {
-                                    let sql_result = conn.exec(&sql, ambient.clone())?;
-                                    debug!("SQL {:?} executed successfully", sql_result);
-                                    Ok(())
-                                }
-                                SnowflakeStrategy::Ingest => {
-                                    Err(anyhow::anyhow!("Ingest is not implemented"))
-                                }
-                            }?;
-                            let post_sql = conn.exec(&process_result.post_sql, ambient)?;
-                            debug!("Post SQL {:?} executed successfully", post_sql);
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                    },
-                }
-                .map_err(RunError::from)
-            }
         }
     });
 
