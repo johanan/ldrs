@@ -17,9 +17,9 @@ pub struct ParquetDestination {
     pub columns: Vec<ColumnSpec>,
     #[serde(default)]
     pub bloom_filters: Vec<Vec<String>>,
-    #[serde(default, alias = "pq.max_rows")]
+    #[serde(default)]
     pub max_rows: Option<usize>,
-    #[serde(default, alias = "pq.max_bytes")]
+    #[serde(default)]
     pub max_bytes: Option<usize>,
 }
 
@@ -39,8 +39,7 @@ impl TryFrom<&Value> for ParquetDestination {
             .get("target")
             .and_then(|v| String::deserialize(v).ok());
         let filename = value
-            .get("pq.filename")
-            .or(value.get("filename"))
+            .get("filename")
             .and_then(|f| String::deserialize(f).ok())
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -58,14 +57,12 @@ impl TryFrom<&Value> for ParquetDestination {
             .and_then(|b| Vec::<Vec<String>>::deserialize(b).ok())
             .unwrap_or_default();
         let max_rows = value
-            .get("pq.max_rows")
-            .or(value.get("max_rows"))
+            .get("max_rows")
             .map(usize::deserialize)
             .transpose()
             .context("failed to parse max_rows for kind pq")?;
         let max_bytes = value
-            .get("pq.max_bytes")
-            .or(value.get("max_bytes"))
+            .get("max_bytes")
             .map(usize::deserialize)
             .transpose()
             .context("failed to parse max_bytes for kind pq")?;
@@ -110,11 +107,10 @@ columns:
 
     #[test]
     fn try_from_parses_rotation_limits() {
-        // exercises both the `pq.`-prefixed alias and the bare key
         let yaml = r#"
 name: foo
-pq.filename: "out/{{ name }}_{{ pad index 5 }}.parquet"
-pq.max_rows: 1000
+filename: "out/{{ name }}_{{ pad index 5 }}.parquet"
+max_rows: 1000
 max_bytes: 2000
 "#;
         let value: Value = serde_yaml::from_str(yaml).unwrap();

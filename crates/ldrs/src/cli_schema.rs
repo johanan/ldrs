@@ -39,7 +39,6 @@ fn usage_block() -> Value {
         "yaml_config": "The schemas under `sources` and `destinations` describe the per-table block shape used inside `tables:` in YAML config files. The full YAML envelope is documented under `yaml_config`. Defaults are merged into each table block; later table-level values override.",
         "run_command": "`ldrs run` accepts a single block (one source -> one destination, Arrow-pipeable). Three layers, top wins: first-class flags (--src/--dest/--name/--sql) > --opt key=value pairs > --config-inline YAML. --opt is flat string=string only; complex (nested/list) fields require --config-inline. A block is version-free: `version:`/`destinations:` apply only to multi-table config files (`ldrs ld`). Run `ldrs schema <kind>` to see a block's fields.",
         "ld_command": "`ldrs ld --config <file>` runs a multi-table YAML config: each entry under `tables:` runs in order. Each table's source fans out to the destinations in its `destinations:` list. A top-level `destinations:` list is the shared default for tables that don't declare their own; `src_defaults` merges into each table's source block, and each table's `name`/`columns` are inherited into its destination blocks. `--select t1,t2` (comma-separated) runs only the named tables. A single `LDRS_SRC`/`LDRS_DEST` locates all tables; set `LDRS_SRC_<NAME>`/`LDRS_DEST_<NAME>` to point individual tables elsewhere (see env_vars). A table (or the top level) may also declare a `finalize:` list: post-load Lua handlers that run against a resolved target after the load (see `ldrs schema finalize`).",
-        "namespacing": "If a kind has a `namespace` field, that string is an optional prefix on any of its type-specific fields (e.g., `pg.merge_keys` and `merge_keys` are equivalent for pg). Universal block fields (`name`, `src`, `dest`) are never namespaced. Used to disambiguate when source and destination contribute overlapping field names to the same block.",
         "columns": "The `columns` field, when present on a destination kind, declares column transforms (rename/cast/projection). It is always a destination-side field, sources never accept `columns`. Run `ldrs schema columns` for the variant schema.",
         "param_keys": "Positional column types for a destination's prepared statement (currently pg.delete_insert's DELETE WHERE clause). Values come from `LDRS_PARAM_*` env vars, bound positionally in lexicographic order of the env-var name; the count of types here must match the count of bound values. When present, this overrides the per-position type hint from the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix. Run `ldrs schema columns` for the type variants.",
         "dotenv": "A `.env` file is loaded automatically, the working directory and its parents are searched up to root. Values do not override variables already set in the environment. ldrs only reads variables beginning with `LDRS_`; anything else is ignored.",
@@ -98,20 +97,20 @@ pub enum SchemaCommands {
     Columns,
     /// YAML config file envelope (LdrsConfig)
     Yaml,
-    /// Env vars, templating, namespacing, and worked examples
+    /// Env vars, templating, and worked examples
     Usage,
 }
 
 /// Render the schema document for a single subcommand.
 pub fn build(command: &SchemaCommands) -> Value {
     match command {
-        SchemaCommands::File => source_doc::<FileSource>("file", None),
-        SchemaCommands::Sf => source_doc::<SFSource>("sf", Some("sf")),
-        SchemaCommands::Duckdb => source_doc::<DuckDbSource>("duckdb", Some("duckdb")),
-        SchemaCommands::Pg => dest_doc::<PgDestination>("pg", Some("pg")),
-        SchemaCommands::Pq => dest_doc::<ParquetDestination>("pq", Some("pq")),
-        SchemaCommands::Delta => dest_doc::<DeltaDestination>("delta", Some("delta")),
-        SchemaCommands::Arrow => dest_doc::<ArrowDestination>("arrow", None),
+        SchemaCommands::File => source_doc::<FileSource>("file"),
+        SchemaCommands::Sf => source_doc::<SFSource>("sf"),
+        SchemaCommands::Duckdb => source_doc::<DuckDbSource>("duckdb"),
+        SchemaCommands::Pg => dest_doc::<PgDestination>("pg"),
+        SchemaCommands::Pq => dest_doc::<ParquetDestination>("pq"),
+        SchemaCommands::Delta => dest_doc::<DeltaDestination>("delta"),
+        SchemaCommands::Arrow => dest_doc::<ArrowDestination>("arrow"),
         SchemaCommands::Finalize => finalize_doc(),
         SchemaCommands::Results => results_doc(),
         SchemaCommands::Columns => build_columns(),
@@ -120,32 +119,25 @@ pub fn build(command: &SchemaCommands) -> Value {
     }
 }
 
-fn named_block(schema: Schema, namespace: Option<&str>) -> Value {
-    match namespace {
-        Some(ns) => json!({ "namespace": ns, "schema": schema }),
-        None => json!({ "schema": schema }),
-    }
-}
-
-fn source_doc<T: JsonSchema>(kind: &str, namespace: Option<&str>) -> Value {
+fn source_doc<T: JsonSchema>(kind: &str) -> Value {
     let mut g = SchemaGenerator::default();
-    let block = named_block(g.subschema_for::<T>(), namespace);
+    let schema = g.subschema_for::<T>();
     json!({
         "$defs": g.take_definitions(true),
         "kind": kind,
-        "source": block,
+        "source": { "schema": schema },
         "columns_ref": "ldrs schema columns",
         "usage_ref": "ldrs schema usage",
     })
 }
 
-fn dest_doc<T: JsonSchema>(kind: &str, namespace: Option<&str>) -> Value {
+fn dest_doc<T: JsonSchema>(kind: &str) -> Value {
     let mut g = SchemaGenerator::default();
-    let block = named_block(g.subschema_for::<T>(), namespace);
+    let schema = g.subschema_for::<T>();
     json!({
         "$defs": g.take_definitions(true),
         "kind": kind,
-        "destination": block,
+        "destination": { "schema": schema },
         "columns_ref": "ldrs schema columns",
         "usage_ref": "ldrs schema usage",
     })
@@ -214,7 +206,7 @@ pub fn build_yaml() -> Value {
     })
 }
 
-/// Env vars, templating, namespacing, and worked examples the context that
+/// Env vars, templating, and worked examples the context that
 /// used to ride on every dump.
 pub fn build_usage() -> Value {
     usage_block()

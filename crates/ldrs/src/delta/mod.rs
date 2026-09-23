@@ -17,15 +17,13 @@ pub struct DeltaCommon {
     pub name: String,
     #[serde(default)]
     pub target: Option<String>,
-    #[serde(default, alias = "delta.columns")]
+    #[serde(default)]
     #[schemars(schema_with = "crate::cli_schema::columns_schema")]
     pub columns: Vec<ColumnSpec>,
-    #[serde(alias = "delta.max_rows")]
     pub max_rows: Option<usize>,
-    #[serde(alias = "delta.max_bytes")]
     pub max_bytes: Option<usize>,
     /// Write nanosecond source timestamps as microseconds accepting the truncation.
-    #[serde(default, alias = "delta.truncate_timestamps")]
+    #[serde(default)]
     pub truncate_timestamps: bool,
     /// Register the table with a catalog after the load commits.
     #[serde(default)]
@@ -71,20 +69,16 @@ pub enum TxnMode {
 pub struct DeltaMerge {
     #[serde(flatten)]
     pub common: DeltaCommon,
-    #[serde(alias = "delta.merge_keys")]
     pub merge_keys: Vec<String>,
-    #[serde(default, alias = "delta.allow_null_keys")]
+    #[serde(default)]
     pub allow_null_keys: bool,
-    #[serde(alias = "delta.txn_mode")]
     pub txn_mode: Option<TxnMode>,
-    #[serde(alias = "delta.watermark_column")]
     pub watermark_column: Option<String>,
-    #[serde(alias = "delta.batch_version")]
     pub batch_version: Option<String>,
-    #[serde(default = "default_app_id", alias = "delta.app_id")]
+    #[serde(default = "default_app_id")]
     pub app_id: String,
     /// Store a small deletion vector in the commit instead of a sidecar file.
-    #[serde(default, alias = "delta.inline_deletion_vectors")]
+    #[serde(default)]
     pub inline_deletion_vectors: bool,
 }
 
@@ -229,26 +223,6 @@ name: public.users
     }
 
     #[test]
-    fn overwrite_namespaced_aliases() {
-        let dest = parse_and_validate(
-            r#"
-dest: delta.overwrite
-name: public.users
-delta.max_rows: 1000
-delta.max_bytes: 2000
-"#,
-        )
-        .unwrap();
-        match dest {
-            DeltaDestination::Overwrite(c) => {
-                assert_eq!(c.max_rows, Some(1000));
-                assert_eq!(c.max_bytes, Some(2000));
-            }
-            _ => panic!("expected Overwrite"),
-        }
-    }
-
-    #[test]
     fn merge_bare() {
         let dest = parse_and_validate(
             r#"
@@ -264,26 +238,6 @@ merge_keys: [id]
                 assert_eq!(m.merge_keys, vec!["id".to_string()]);
                 assert!(!m.allow_null_keys);
                 assert!(m.txn_mode.is_none());
-            }
-            _ => panic!("expected Merge"),
-        }
-    }
-
-    #[test]
-    fn merge_namespaced_aliases() {
-        let dest = parse_and_validate(
-            r#"
-dest: delta.merge
-name: public.users
-delta.merge_keys: [id, name]
-delta.allow_null_keys: true
-"#,
-        )
-        .unwrap();
-        match dest {
-            DeltaDestination::Merge(m) => {
-                assert_eq!(m.merge_keys, vec!["id".to_string(), "name".to_string()]);
-                assert!(m.allow_null_keys);
             }
             _ => panic!("expected Merge"),
         }
