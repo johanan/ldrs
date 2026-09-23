@@ -6,20 +6,16 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use dotenvy::dotenv;
 use ldrs::cli_schema;
 use ldrs::error::RunError;
-use ldrs::ldrs_config::config::{find_unknown_block_keys, parse_dest, parse_src, LdrsParsedConfig};
+use ldrs::ldrs_config::config::LdrsConfig;
 use ldrs::ldrs_config::{
-    execute_configs, infer_env_type, parse_yaml_config, register_from_config,
-    resolve_delta_targets, DeltaTarget,
+    execute_configs, infer_env_type, parse_tables, register_from_config, resolve_delta_targets,
+    DeltaTarget,
 };
-use ldrs::ldrs_env::{ambient_env, get_all_ldrs_env_vars};
-use ldrs::lua_logic::lua_args::{modules_from_args, LuaArgs, SnowflakeResult, SnowflakeStrategy};
-use ldrs::lua_logic::{LuaFunctionLoader, StorageData, UrlData};
-use ldrs::path_pattern;
+use ldrs::ldrs_env::get_all_ldrs_env_vars;
 use ldrs::results::Results;
 use ldrs_delta::{execute_plan, plan_optimize, vacuum, OperationConfig, Retention};
-use ldrs_storage::build_store;
 use serde_yaml::{Mapping, Value};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Subcommand)]
@@ -151,27 +147,13 @@ struct ConfigArgs {
     results: Option<String>,
 }
 
-#[derive(Subcommand)]
-pub enum SnowflakeCommands {
-    Ingest {
-        #[arg(long, short)]
-        file_url: String,
-
-        #[arg(long, short)]
-        pattern: String,
-
-        #[clap(flatten)]
-        lua_args: LuaArgs,
-    },
-}
-
 #[derive(Args)]
 #[command(
     after_help = "Tip: run `ldrs schema` to list the available kinds. `ldrs schema <kind>` (e.g. `ldrs schema pq`) dumps one kind's fields; `ldrs schema columns` the column-transform vocabulary; `ldrs schema usage` env vars, templating, and examples."
 )]
 struct RunArgs {
-    /// Base config blob (YAML or JSON). A single table block.
-    /// All other config args will override values in this.
+    /// Base config blob (YAML or JSON). A single table block, as in a config file's `tables:`.
+    /// --src, --name and --sql override the same keys in this.
     #[arg(long)]
     config_inline: Option<String>,
 
@@ -179,21 +161,17 @@ struct RunArgs {
     #[arg(long)]
     src: Option<String>,
 
-    /// Destination kind (pg.merge, pq, delta.overwrite, etc). Optional: can be inferred from LDRS_DEST
-    #[arg(long)]
-    dest: Option<String>,
-
     /// Table identifier.
     #[arg(long)]
     name: Option<String>,
 
-    /// SQL for query-shaped sources. Shortcut for --opt sql=
+    /// SQL for query-shaped sources.
     #[arg(long)]
     sql: Option<String>,
 
-    /// Per-kind options as key=value. Keys may be namespaced (pg.merge_keys, file.partition_cols).
-    #[arg(long = "opt", value_parser = parse_kv)]
-    opt: Vec<(String, String)>,
+    /// Append an Arrow IPC stdout destination to the block's `destinations:`.
+    #[arg(long)]
+    arrow: bool,
 
     /// Write a JSONL results file to this path. Run `ldrs schema results` for the line shapes.
     #[arg(long)]
@@ -202,15 +180,8 @@ struct RunArgs {
 
 #[derive(Subcommand)]
 enum Destination {
-    /// Load from a config file. All sources and destinations. Tables run independently and in
-    /// order: a failing table does not stop the ones after it, and list order carries no
-    /// dependency (use separate runs when one table's output feeds another's input).
+    /// Load from a config file. All sources and destinations.
     Ld(ConfigArgs),
-    /// Snowflake destination
-    Sf {
-        #[command(subcommand)]
-        command: SnowflakeCommands,
-    },
     /// Delta table maintenance
     Delta {
         #[command(subcommand)]
@@ -223,19 +194,6 @@ enum Destination {
         #[command(subcommand)]
         command: Option<cli_schema::SchemaCommands>,
     },
-}
-
-fn parse_kv(s: &str) -> Result<(String, String), String> {
-    s.split_once('=')
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .ok_or_else(|| format!("expected KEY=VALUE, got `{}`", s))
-        .and_then(|(k, v)| {
-            if k.is_empty() {
-                Err(format!("key cannot be empty in `{}`", s))
-            } else {
-                Ok((k, v))
-            }
-        })
 }
 
 /// A single table named on the command line rather than resolved from a config.
@@ -253,7 +211,9 @@ fn targets_from_config(args: &ConfigArgs) -> Result<Vec<DeltaTarget>, anyhow::Er
     let config_string = fs::read_to_string(&args.config)
         .with_context(|| format!("Failed to read config file: {}", args.config))?;
     let ldrs_env = get_all_ldrs_env_vars();
-    let configs = parse_yaml_config(&config_string, &ldrs_env)?;
+    let config: LdrsConfig =
+        serde_yaml::from_str(&config_string).context("Could not parse the config")?;
+    let configs = parse_tables(&config, infer_env_type("LDRS_SRC", &ldrs_env))?;
     resolve_delta_targets(configs, args.select.clone(), &ldrs_env)
 }
 
@@ -425,25 +385,37 @@ fn report_failures(verb: &str, failed: Vec<String>) -> Result<(), anyhow::Error>
     }
 }
 
-fn build_run_block(args: &RunArgs) -> Result<Value, anyhow::Error> {
+/// The one table `run` executes, as a single-table config.
+fn run_config(args: &RunArgs) -> Result<LdrsConfig, anyhow::Error> {
     let mut block: Mapping = match args.config_inline.as_deref() {
         Some(s) => serde_yaml::from_str::<Mapping>(s)?,
         None => Mapping::new(),
     };
-    for (k, v) in &args.opt {
-        block.insert(Value::String(k.clone()), Value::String(v.clone()));
-    }
-    for (k, v) in [
-        ("src", args.src.as_ref()),
-        ("dest", args.dest.as_ref()),
-        ("name", args.name.as_ref()),
-        ("sql", args.sql.as_ref()),
-    ] {
+    for (k, v) in [("src", &args.src), ("name", &args.name), ("sql", &args.sql)] {
         if let Some(v) = v {
-            block.insert(Value::String(k.to_string()), Value::String(v.clone()));
+            block.insert(k.into(), v.as_str().into());
         }
     }
-    Ok(Value::Mapping(block))
+    if args.arrow {
+        let arrow = Value::Mapping(Mapping::from_iter([("dest".into(), "arrow".into())]));
+        match block.get_mut("destinations") {
+            Some(Value::Sequence(destinations)) => destinations.push(arrow),
+            None | Some(Value::Null) => {
+                block.insert("destinations".into(), Value::Sequence(vec![arrow]));
+            }
+            // not a list: left for the parse to reject
+            Some(_) => {}
+        }
+    }
+    Ok(LdrsConfig {
+        src: None,
+        src_defaults: None,
+        version: None,
+        destinations: None,
+        finalize: None,
+        lua_modules: None,
+        tables: vec![Value::Mapping(block)],
+    })
 }
 
 const BANNER: &str = r#"
@@ -491,7 +463,7 @@ fn results_path(destination: &Destination) -> Option<&str> {
             | DeltaCommands::OptimizeTable(_)
             | DeltaCommands::MaintenanceTable(_) => &None,
         },
-        Destination::Sf { .. } | Destination::Schema { .. } => &None,
+        Destination::Schema { .. } => &None,
     };
     args.as_deref()
 }
@@ -551,7 +523,9 @@ fn run() -> Result<(), RunError> {
                 let config_string = fs::read_to_string(&args.config)
                     .with_context(|| format!("Failed to read config file: {}", args.config))?;
                 let ldrs_env = get_all_ldrs_env_vars();
-                let configs = parse_yaml_config(&config_string, &ldrs_env)?;
+                let config: LdrsConfig =
+                    serde_yaml::from_str(&config_string).context("Could not parse the config")?;
+                let configs = parse_tables(&config, infer_env_type("LDRS_SRC", &ldrs_env))?;
                 execute_configs(configs, args.select, &ldrs_env, rt.handle(), &results).await
             }
             Destination::Delta { command } => match command {
@@ -585,7 +559,9 @@ fn run() -> Result<(), RunError> {
                     let config_string = fs::read_to_string(&args.config)
                         .with_context(|| format!("Failed to read config file: {}", args.config))?;
                     let ldrs_env = get_all_ldrs_env_vars();
-                    let configs = parse_yaml_config(&config_string, &ldrs_env)?;
+                    let config: LdrsConfig = serde_yaml::from_str(&config_string)
+                        .context("Could not parse the config")?;
+                    let configs = parse_tables(&config, infer_env_type("LDRS_SRC", &ldrs_env))?;
                     let failed =
                         register_from_config(configs, args.select, &ldrs_env, &results).await?;
                     report_failures("register", failed)
@@ -594,27 +570,9 @@ fn run() -> Result<(), RunError> {
             .map_err(RunError::from),
             Destination::Run(args) => {
                 let ldrs_env = get_all_ldrs_env_vars();
-                let config = build_run_block(&args)?;
-                let src_default = infer_env_type("LDRS_SRC", &ldrs_env);
-                let dest_default = infer_env_type("LDRS_DEST", &ldrs_env);
-                let src = parse_src(config.clone(), &src_default)?;
-                let dest = parse_dest(config.clone(), &dest_default)?;
-                let unknown_keys = find_unknown_block_keys(&config, &src, &dest);
-
-                execute_configs(
-                    vec![LdrsParsedConfig {
-                        src,
-                        dests: vec![dest],
-                        finalize: Vec::new(),
-                        lua_modules: Vec::new(),
-                        unknown_keys,
-                    }],
-                    None,
-                    &ldrs_env,
-                    rt.handle(),
-                    &results,
-                )
-                .await
+                let configs =
+                    parse_tables(&run_config(&args)?, infer_env_type("LDRS_SRC", &ldrs_env))?;
+                execute_configs(configs, None, &ldrs_env, rt.handle(), &results).await
             }
             Destination::Schema { command } => match command {
                 None => {
@@ -634,74 +592,6 @@ fn run() -> Result<(), RunError> {
                     Ok(())
                 }
             },
-            Destination::Sf { command } => {
-                match command {
-                    SnowflakeCommands::Ingest {
-                        file_url,
-                        pattern,
-                        lua_args,
-                    } => match std::env::var("LDRS_URL").with_context(|| "LDRS_URL not set") {
-                        Ok(sf_url) => {
-                            let (pattern, url, modules) =
-                                modules_from_args(lua_args, file_url.as_str(), pattern.as_str())?;
-
-                            let (_, file_path, scheme) = build_store(&url)?;
-                            let url_data: UrlData = url.clone().into();
-                            let storage_data = StorageData::from_parts(&url, &file_path, scheme);
-
-                            let file_path_str = file_path.to_string();
-                            let extracted = pattern.parse_path(&file_path_str)?;
-                            let segments_value =
-                                path_pattern::extracted_segments_to_value(&extracted);
-
-                            let context = serde_json::json!({});
-
-                            let mut loader = LuaFunctionLoader::new().unwrap();
-                            let process_result = loader.call_process::<SnowflakeResult>(
-                                &modules,
-                                &url_data,
-                                &storage_data,
-                                &segments_value,
-                                None,
-                                &context,
-                            )?;
-                            let conn =
-                                ldrs::ldrs_snowflake::SnowflakeConnection::create_connection(
-                                    &sf_url,
-                                    None,
-                                    None,
-                                    ldrs::ldrs_snowflake::resolve_inherited_sf_env(
-                                        &get_all_ldrs_env_vars(),
-                                    ),
-                                )?;
-
-                            if matches!(process_result.strategy, SnowflakeStrategy::Ingest) {
-                                Err(anyhow::anyhow!("Ingest is not implemented"))?
-                            }
-
-                            let ambient = ambient_env();
-
-                            let pre_sql = conn.exec(&process_result.pre_sql, ambient.clone())?;
-                            debug!("Pre SQL {:?} executed successfully", pre_sql);
-                            let _sql = match process_result.strategy {
-                                SnowflakeStrategy::Sql(sql) => {
-                                    let sql_result = conn.exec(&sql, ambient.clone())?;
-                                    debug!("SQL {:?} executed successfully", sql_result);
-                                    Ok(())
-                                }
-                                SnowflakeStrategy::Ingest => {
-                                    Err(anyhow::anyhow!("Ingest is not implemented"))
-                                }
-                            }?;
-                            let post_sql = conn.exec(&process_result.post_sql, ambient)?;
-                            debug!("Post SQL {:?} executed successfully", post_sql);
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                    },
-                }
-                .map_err(RunError::from)
-            }
         }
     });
 
@@ -727,106 +617,90 @@ mod tests {
         RunArgs {
             config_inline: None,
             src: None,
-            dest: None,
             name: None,
             sql: None,
-            opt: vec![],
+            arrow: false,
             results: None,
         }
+    }
+
+    /// The single table block `run_config` builds.
+    fn run_block(args: &RunArgs) -> Value {
+        let config = run_config(args).unwrap();
+        assert_eq!(config.tables.len(), 1);
+        config.tables[0].clone()
     }
 
     fn get_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
         v.get(key).and_then(|x| x.as_str())
     }
 
-    #[test]
-    fn parse_kv_simple() {
-        assert_eq!(parse_kv("k=v").unwrap(), ("k".to_string(), "v".to_string()));
+    fn dests(v: &Value) -> Vec<&str> {
+        v.get("destinations")
+            .and_then(Value::as_sequence)
+            .map(|seq| seq.iter().filter_map(|d| get_str(d, "dest")).collect())
+            .unwrap_or_default()
     }
 
     #[test]
-    fn parse_kv_empty_key_rejected() {
-        assert!(parse_kv("=v").is_err());
-    }
-
-    #[test]
-    fn parse_kv_no_equals_rejected() {
-        assert!(parse_kv("kv").is_err());
-    }
-
-    #[test]
-    fn parse_kv_splits_on_first_equals() {
-        assert_eq!(
-            parse_kv("k=v=v2").unwrap(),
-            ("k".to_string(), "v=v2".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_kv_empty_value_allowed() {
-        assert_eq!(parse_kv("k=").unwrap(), ("k".to_string(), "".to_string()));
-    }
-
-    #[test]
-    fn build_run_block_inline_only() {
+    fn run_config_inline_only() {
         let args = RunArgs {
             config_inline: Some("src: file".to_string()),
             ..empty_args()
         };
-        let v = build_run_block(&args).unwrap();
-        assert_eq!(get_str(&v, "src"), Some("file"));
+        assert_eq!(get_str(&run_block(&args), "src"), Some("file"));
     }
 
     #[test]
-    fn build_run_block_flag_only() {
+    fn run_config_flag_only() {
         let args = RunArgs {
             src: Some("sf".to_string()),
             ..empty_args()
         };
-        let v = build_run_block(&args).unwrap();
-        assert_eq!(get_str(&v, "src"), Some("sf"));
+        assert_eq!(get_str(&run_block(&args), "src"), Some("sf"));
     }
 
     #[test]
-    fn build_run_block_opt_only() {
-        let args = RunArgs {
-            opt: vec![("merge_keys".to_string(), "id".to_string())],
-            ..empty_args()
-        };
-        let v = build_run_block(&args).unwrap();
-        assert_eq!(get_str(&v, "merge_keys"), Some("id"));
-    }
-
-    #[test]
-    fn build_run_block_flag_beats_inline() {
+    fn run_config_flag_beats_inline() {
         let args = RunArgs {
             config_inline: Some("src: file".to_string()),
             src: Some("sf".to_string()),
             ..empty_args()
         };
-        let v = build_run_block(&args).unwrap();
-        assert_eq!(get_str(&v, "src"), Some("sf"));
+        assert_eq!(get_str(&run_block(&args), "src"), Some("sf"));
     }
 
     #[test]
-    fn build_run_block_opt_beats_inline() {
-        let args = RunArgs {
-            config_inline: Some("src: file".to_string()),
-            opt: vec![("src".to_string(), "sf".to_string())],
-            ..empty_args()
-        };
-        let v = build_run_block(&args).unwrap();
-        assert_eq!(get_str(&v, "src"), Some("sf"));
+    fn run_config_without_arrow_adds_no_destination() {
+        assert!(run_block(&empty_args()).get("destinations").is_none());
     }
 
     #[test]
-    fn build_run_block_flag_beats_opt() {
+    fn arrow_is_the_only_destination_when_the_block_has_none() {
         let args = RunArgs {
-            opt: vec![("src".to_string(), "file".to_string())],
-            src: Some("sf".to_string()),
+            arrow: true,
             ..empty_args()
         };
-        let v = build_run_block(&args).unwrap();
-        assert_eq!(get_str(&v, "src"), Some("sf"));
+        assert_eq!(dests(&run_block(&args)), vec!["arrow"]);
+    }
+
+    #[test]
+    fn arrow_fills_an_empty_destinations_key() {
+        let args = RunArgs {
+            config_inline: Some("destinations:".to_string()),
+            arrow: true,
+            ..empty_args()
+        };
+        assert_eq!(dests(&run_block(&args)), vec!["arrow"]);
+    }
+
+    #[test]
+    fn arrow_appends_to_the_block_destinations() {
+        let args = RunArgs {
+            config_inline: Some("destinations: [{dest: pq, filename: out.parquet}]".to_string()),
+            arrow: true,
+            ..empty_args()
+        };
+        assert_eq!(dests(&run_block(&args)), vec!["pq", "arrow"]);
     }
 }

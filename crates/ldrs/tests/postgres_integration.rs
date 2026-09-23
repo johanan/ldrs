@@ -1,68 +1,75 @@
-use ldrs::ldrs_config::{execute_configs, parse_yaml_config};
+use ldrs::ldrs_config::{execute_configs, infer_env_type, parse_tables};
 use ldrs::results::Results;
 use ldrs_postgres::create_connection;
 use ldrs_test_fixtures::data_url;
 
 const TEST_CASES: &[&str] = &[
     "
-dest: pg.drop_replace
 src: file
+destinations:
+  - dest: pg.drop_replace
+    post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
 
 tables:
   - name: public_test.users
     filename: public.users/public.users.snappy.parquet
-    post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
 ",
     // test the defaults
     "
-dest: pg.drop_replace
 src: file
 src_defaults:
   filename: public.users/public.{{ table_of name }}.snappy.parquet
+destinations:
+  - dest: pg.drop_replace
+    post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
 
 tables:
 - name: public_test.users
-  post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
 ",
-    // test without src or dest to see if the defaults work
+    // test without a top-level src or destinations to see if the defaults work
     "
 tables:
   - name: public_test.users
-    dest: pg.drop_replace
     filename: public.users/public.users.snappy.parquet
-    post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
+    destinations:
+      - dest: pg.drop_replace
+        post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
 ",
     // now test truncate insert
     "
 tables:
   - name: public_test.users
-    dest: pg.truncate_insert
     filename: public.users/public.users.snappy.parquet
-    post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
+    destinations:
+      - dest: pg.truncate_insert
+        post_sql: create unique index if not exists unique_id_idx on {{ name }} (unique_id);
 ",
     // delete_insert against a table-scoped param
     "
 tables:
   - name: public_test.users
-    dest: pg.delete_insert
     filename: public.users/public.users.snappy.parquet
-    delete_keys: [created]
+    destinations:
+      - dest: pg.delete_insert
+        delete_keys: [created]
 ",
     // test the general LDRS_PARAM_<COL> fallback: `name` has no table-scoped var set,
     // only LDRS_PARAM_NAME, so resolution falls through to the general form.
     "
 tables:
   - name: public_test.users
-    dest: pg.delete_insert
     filename: public.users/public.users.snappy.parquet
-    delete_keys: [name]
+    destinations:
+      - dest: pg.delete_insert
+        delete_keys: [name]
 ",
     "
 tables:
   - name: public_test.users
-    dest: pg.merge
     filename: public.users/public.users.snappy.parquet
-    merge_keys: [unique_id]
+    destinations:
+      - dest: pg.merge
+        merge_keys: [unique_id]
 ",
 ];
 
@@ -95,7 +102,11 @@ async fn test_postgres_file_drop() {
             .batch_execute("DROP SCHEMA IF EXISTS public_test CASCADE")
             .await;
         let ex = execute_configs(
-            parse_yaml_config(&config, &ldrs_env).unwrap(),
+            parse_tables(
+                &serde_yaml::from_str(&config).unwrap(),
+                infer_env_type("LDRS_SRC", &ldrs_env),
+            )
+            .unwrap(),
             None,
             &ldrs_env,
             rt.handle(),
@@ -127,7 +138,8 @@ async fn test_postgres_file_drop() {
 async fn test_postgres_env_role() {
     let config = "
 src: file
-dest: pg.drop_replace
+destinations:
+  - dest: pg.drop_replace
 tables:
   - name: public_test.users
     filename: public.users/public.users.snappy.parquet
@@ -149,7 +161,11 @@ tables:
         .build()
         .unwrap();
     let ex = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -172,13 +188,16 @@ async fn test_postgres_all_parquets() {
     ];
 
     let config = "
-dest: pg.drop_replace
 src: file
+destinations:
+  - dest: pg.drop_replace
 
 tables:
   - name: public_test_all.users
-    target: public_test_all.renamed
     filename: public.users/public.users.snappy.parquet
+    destinations:
+      - dest: pg.drop_replace
+        target: public_test_all.renamed
   - name: public_test_all.strings
     filename: public.string_values/public.strings.snappy.parquet
   - name: public_test_all.numbers
@@ -198,7 +217,11 @@ tables:
     let _ = client.batch_execute("CREATE SCHEMA public_test_all").await;
 
     let ex = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -305,8 +328,9 @@ async fn test_postgres_numeric_edge_cases() {
     ];
 
     let config = "
-dest: pg.drop_replace
 src: file
+destinations:
+  - dest: pg.drop_replace
 
 tables:
   - name: public_test_edge.numbers_edge
@@ -326,7 +350,11 @@ tables:
     let _ = client.batch_execute("CREATE SCHEMA public_test_edge").await;
 
     let ex = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -376,13 +404,14 @@ async fn test_postgres_rollback_on_post_sql_failure() {
     ];
 
     let config = "
-dest: pg.drop_replace
 src: file
 
 tables:
   - name: public_test_fail.users
     filename: public.users/public.users.snappy.parquet
-    post_sql: this is not valid sql;
+    destinations:
+      - dest: pg.drop_replace
+        post_sql: this is not valid sql;
 ";
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -397,7 +426,11 @@ tables:
         .await;
 
     let ex = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -434,13 +467,14 @@ async fn test_postgres_templated_target() {
     ];
 
     let config = "
-dest: pg.drop_replace
 src: file
 
 tables:
   - name: public_test_tenant.users
-    target: \"public_test_tenant.{{ tenant }}_{{ table_of name }}\"
     filename: public.users/public.users.snappy.parquet
+    destinations:
+      - dest: pg.drop_replace
+        target: \"public_test_tenant.{{ tenant }}_{{ table_of name }}\"
 ";
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -455,7 +489,11 @@ tables:
         .await;
 
     let ex = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -518,8 +556,9 @@ async fn a_role_in_libpq_options_owns_what_the_load_creates() {
         ("LDRS_DEST".to_string(), dest.to_string()),
     ];
     let config = "
-dest: pg.drop_replace
 src: file
+destinations:
+  - dest: pg.drop_replace
 
 tables:
   - name: public_test_role.users
@@ -537,7 +576,11 @@ tables:
         .build()
         .unwrap();
     execute_configs(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -562,5 +605,88 @@ tables:
 
     let _ = client
         .batch_execute("DROP SCHEMA IF EXISTS public_test_role CASCADE")
+        .await;
+}
+
+#[tokio::test]
+#[test_log::test]
+async fn date_and_small_int_columns_round_trip() {
+    let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+    let ldrs_env = vec![("LDRS_DEST".to_string(), pg_url.to_string())];
+    let config = "
+src: duckdb.query
+destinations:
+  - dest: pg.drop_replace
+
+tables:
+  - name: public_test_dates.dated
+    sql: |
+      SELECT
+        i::INTEGER AS id,
+        CASE i WHEN 0 THEN DATE '2024-06-01' WHEN 1 THEN DATE '1969-12-31' END AS c_date,
+        CASE i WHEN 0 THEN 32767::SMALLINT WHEN 1 THEN (-32768)::SMALLINT END AS c_smallint,
+        CASE i WHEN 0 THEN 127::TINYINT WHEN 1 THEN (-128)::TINYINT END AS c_tinyint
+      FROM range(3) t(i)
+      ORDER BY i
+";
+
+    let client = create_connection(pg_url).await.unwrap();
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_dates CASCADE")
+        .await;
+    let _ = client
+        .batch_execute("CREATE SCHEMA public_test_dates")
+        .await;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let ex = execute_configs(
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
+        None,
+        &ldrs_env,
+        rt.handle(),
+        &Results::default(),
+    )
+    .await;
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+    assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
+
+    let rows = client
+        .query(
+            "SELECT c_date, c_smallint, c_tinyint FROM public_test_dates.dated ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<(Option<chrono::NaiveDate>, Option<i16>, Option<i16>)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                chrono::NaiveDate::from_ymd_opt(2024, 6, 1),
+                Some(32767),
+                Some(127)
+            ),
+            (
+                chrono::NaiveDate::from_ymd_opt(1969, 12, 31),
+                Some(-32768),
+                Some(-128)
+            ),
+            (None, None, None),
+        ]
+    );
+
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_dates CASCADE")
         .await;
 }

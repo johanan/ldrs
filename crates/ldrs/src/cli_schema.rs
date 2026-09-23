@@ -37,9 +37,8 @@ pub fn param_keys_schema(_: &mut SchemaGenerator) -> Schema {
 fn usage_block() -> Value {
     json!({
         "yaml_config": "The schemas under `sources` and `destinations` describe the per-table block shape used inside `tables:` in YAML config files. The full YAML envelope is documented under `yaml_config`. Defaults are merged into each table block; later table-level values override.",
-        "run_command": "`ldrs run` accepts a single block (one source -> one destination, Arrow-pipeable). Three layers, top wins: first-class flags (--src/--dest/--name/--sql) > --opt key=value pairs > --config-inline YAML. --opt is flat string=string only; complex (nested/list) fields require --config-inline. A block is version-free: `version:`/`destinations:` apply only to multi-table config files (`ldrs ld`). Run `ldrs schema <kind>` to see a block's fields.",
-        "ld_command": "`ldrs ld --config <file>` runs a multi-table YAML config: each entry under `tables:` runs in order. Use `version: 2` for the nested `destinations:` form: one source fans out to many destinations. A top-level `destinations:` list is the shared default for tables that don't declare their own; `src_defaults` merges into each table's source block, and each table's `name`/`columns` are inherited into its destination blocks. `--select t1,t2` (comma-separated) runs only the named tables. A single `LDRS_SRC`/`LDRS_DEST` locates all tables; set `LDRS_SRC_<NAME>`/`LDRS_DEST_<NAME>` to point individual tables elsewhere (see env_vars). A table (or the top level) may also declare a `finalize:` list: post-load Lua handlers that run against a resolved target after the load (v2/nested only; see `ldrs schema finalize`). The flat single-`dest:` form (version 1) is deprecated.",
-        "namespacing": "If a kind has a `namespace` field, that string is an optional prefix on any of its type-specific fields (e.g., `pg.merge_keys` and `merge_keys` are equivalent for pg). Universal block fields (`name`, `src`, `dest`) are never namespaced. Used to disambiguate when source and destination contribute overlapping field names to the same block.",
+        "run_command": "`ldrs run` runs a single table block, parsed exactly like one entry under a config file's `tables:`. `--config-inline` is that block (YAML or JSON); `--src`/`--name`/`--sql` override the same keys in it. `--arrow` appends an Arrow IPC stdout destination to the block's `destinations:`; any other destination is declared in the block's `destinations:` list. Run `ldrs schema <kind>` to see a block's fields.",
+        "ld_command": "`ldrs ld --config <file>` runs a multi-table YAML config: each entry under `tables:` runs in order. Each table's source fans out to the destinations in its `destinations:` list. A top-level `destinations:` list is the shared default for tables that don't declare their own; `src_defaults` merges into each table's source block, and each table's `name`/`columns` are inherited into its destination blocks. `--select t1,t2` (comma-separated) runs only the named tables. A single `LDRS_SRC`/`LDRS_DEST` locates all tables; set `LDRS_SRC_<NAME>`/`LDRS_DEST_<NAME>` to point individual tables elsewhere (see env_vars). A table (or the top level) may also declare a `finalize:` list: post-load Lua handlers that run against a resolved target after the load (see `ldrs schema finalize`).",
         "columns": "The `columns` field, when present on a destination kind, declares column transforms (rename/cast/projection). It is always a destination-side field, sources never accept `columns`. Run `ldrs schema columns` for the variant schema.",
         "param_keys": "Positional column types for a destination's prepared statement (currently pg.delete_insert's DELETE WHERE clause). Values come from `LDRS_PARAM_*` env vars, bound positionally in lexicographic order of the env-var name; the count of types here must match the count of bound values. When present, this overrides the per-position type hint from the `LDRS_PARAM_<NAME>_<TYPE>` env-var suffix. Run `ldrs schema columns` for the type variants.",
         "dotenv": "A `.env` file is loaded automatically, the working directory and its parents are searched up to root. Values do not override variables already set in the environment. ldrs only reads variables beginning with `LDRS_`; anything else is ignored.",
@@ -59,14 +58,14 @@ fn usage_block() -> Value {
         "per_table_overrides": "SRC, DEST, TEMPL, and PARAM env vars can be scoped to one table by inserting the block's `name` (uppercased, `.` becomes `_`) after the prefix: `LDRS_TEMPL_PUBLIC_USERS_BUCKET` overrides `LDRS_TEMPL_BUCKET` only for the table named `public.users`. The unscoped variable is the default for all tables.",
         "templating": "String fields can contain handlebars templates rendered against the execution context. `{{ name }}` expands to the name property; custom variables come from `LDRS_TEMPL_<NAME>` env vars. Common use: `filename: \"{{ name }}/{{ name }}.snappy.parquet\"` builds a per-table path. Helpers are registered too: `{{ now_timestamp }}` emits Unix epoch **seconds**, so two runs in the same second render the same value; use `{{ now_timestamp_ms }}` where a filename has to stay distinct at a faster cadence. Rendering is strict, and a failed render names every bound variable and every registered helper in the error.",
         "examples": {
-            "snowflake_to_local_parquet": "LDRS_DEST=file:///tmp/probe ldrs run --src sf.query --dest pq --name probe --sql 'SELECT 1 AS x' --opt filename=probe.snappy.parquet",
-            "pipe_arrow_to_duckdb": "ldrs run --src sf.query --dest arrow --name probe --sql 'SELECT 1 AS x' | duckdb -c \"INSTALL nanoarrow FROM community; LOAD nanoarrow; FROM read_arrow('/dev/stdin')\"",
-            "pipe_arrow_to_pyarrow": "ldrs run --src sf.query --dest arrow --name probe --sql 'SELECT 1' | python3 -c 'import pyarrow.ipc, sys; print(pyarrow.ipc.open_stream(sys.stdin.buffer).read_all())'",
-            "parameterized_sf_query": "LDRS_PARAM_P1=42 LDRS_PARAM_P2=2026-01-01 ldrs run --src sf.query --dest pq --name probe --sql 'SELECT * FROM t WHERE org_id = ? AND created_at >= ?' --config-inline 'param_keys: [P1, P2]' --opt filename=probe.parquet Note: values bind in the order listed in param_keys; without param_keys they fall back to lexicographic order of the env-var name",
-            "duckdb_csv_to_parquet": "LDRS_SRC=s3://lake/events/ LDRS_DEST=file:///tmp/out ldrs run --src duckdb.query --dest pq --name events --sql \"SELECT * FROM read_csv('{{ src_url }}*.csv')\" --opt filename=events.parquet Note: needs `duckdb` on PATH with the `nanoarrow` community extension installed; the src URL binds as {{ src_url }} and derives the object-store credentials",
-            "duckdb_postgres_to_parquet": "LDRS_SRC=postgres://reader@db.internal/app LDRS_DEST=file:///tmp/out ldrs run --src duckdb.query --dest pq --name public.orders --sql 'SELECT * FROM pg.{{ name }}' --opt filename=orders.parquet Note: the connection is attached read-only as `pg` and its values travel in the child environment, so no credential reaches the SQL",
-            "duckdb_param_by_name": "LDRS_PARAM_SINCE=2026-01-01 ldrs run --src duckdb.query --dest arrow --name events --sql \"SELECT * FROM read_parquet('{{ src_url }}*.parquet') WHERE day >= getenv('LDRS_PARAM_SINCE')\"",
-            "duckdb_raw_preconfigured": "LDRS_DEST=file:///tmp/out ldrs run --src duckdb.raw --dest pq --name events --sql \"SELECT * FROM read_csv('az://lake/events/*.csv')\" --opt filename=events.parquet Note: raw runs against your duckdb as configured, with ldrs adding only nanoarrow and the Arrow wrapper."
+            "snowflake_to_local_parquet": "LDRS_DEST=file:///tmp/probe ldrs run --src sf.query --name probe --sql 'SELECT 1 AS x' --config-inline 'destinations: [{dest: pq, filename: probe.snappy.parquet}]'",
+            "pipe_arrow_to_duckdb": "ldrs run --src sf.query --arrow --name probe --sql 'SELECT 1 AS x' | duckdb -c \"INSTALL nanoarrow FROM community; LOAD nanoarrow; FROM read_arrow('/dev/stdin')\"",
+            "pipe_arrow_to_pyarrow": "ldrs run --src sf.query --arrow --name probe --sql 'SELECT 1' | python3 -c 'import pyarrow.ipc, sys; print(pyarrow.ipc.open_stream(sys.stdin.buffer).read_all())'",
+            "parameterized_sf_query": "LDRS_PARAM_P1=42 LDRS_PARAM_P2=2026-01-01 ldrs run --src sf.query --name probe --sql 'SELECT * FROM t WHERE org_id = ? AND created_at >= ?' --config-inline '{param_keys: [P1, P2], destinations: [{dest: pq, filename: probe.parquet}]}' Note: values bind in the order listed in param_keys; without param_keys they fall back to lexicographic order of the env-var name",
+            "duckdb_csv_to_parquet": "LDRS_SRC=s3://lake/events/ LDRS_DEST=file:///tmp/out ldrs run --src duckdb.query --name events --sql \"SELECT * FROM read_csv('{{ src_url }}*.csv')\" --config-inline 'destinations: [{dest: pq, filename: events.parquet}]' Note: needs `duckdb` on PATH with the `nanoarrow` community extension installed; the src URL binds as {{ src_url }} and derives the object-store credentials",
+            "duckdb_postgres_to_parquet": "LDRS_SRC=postgres://reader@db.internal/app LDRS_DEST=file:///tmp/out ldrs run --src duckdb.query --name public.orders --sql 'SELECT * FROM pg.{{ name }}' --config-inline 'destinations: [{dest: pq, filename: orders.parquet}]' Note: the connection is attached read-only as `pg` and its values travel in the child environment, so no credential reaches the SQL",
+            "duckdb_param_by_name": "LDRS_PARAM_SINCE=2026-01-01 ldrs run --src duckdb.query --arrow --name events --sql \"SELECT * FROM read_parquet('{{ src_url }}*.parquet') WHERE day >= getenv('LDRS_PARAM_SINCE')\"",
+            "duckdb_raw_preconfigured": "LDRS_DEST=file:///tmp/out ldrs run --src duckdb.raw --name events --sql \"SELECT * FROM read_csv('az://lake/events/*.csv')\" --config-inline 'destinations: [{dest: pq, filename: events.parquet}]' Note: raw runs against your duckdb as configured, with ldrs adding only nanoarrow and the Arrow wrapper."
         }
     })
 }
@@ -98,20 +97,20 @@ pub enum SchemaCommands {
     Columns,
     /// YAML config file envelope (LdrsConfig)
     Yaml,
-    /// Env vars, templating, namespacing, and worked examples
+    /// Env vars, templating, and worked examples
     Usage,
 }
 
 /// Render the schema document for a single subcommand.
 pub fn build(command: &SchemaCommands) -> Value {
     match command {
-        SchemaCommands::File => source_doc::<FileSource>("file", None),
-        SchemaCommands::Sf => source_doc::<SFSource>("sf", Some("sf")),
-        SchemaCommands::Duckdb => source_doc::<DuckDbSource>("duckdb", Some("duckdb")),
-        SchemaCommands::Pg => dest_doc::<PgDestination>("pg", Some("pg")),
-        SchemaCommands::Pq => dest_doc::<ParquetDestination>("pq", Some("pq")),
-        SchemaCommands::Delta => dest_doc::<DeltaDestination>("delta", Some("delta")),
-        SchemaCommands::Arrow => dest_doc::<ArrowDestination>("arrow", None),
+        SchemaCommands::File => source_doc::<FileSource>("file"),
+        SchemaCommands::Sf => source_doc::<SFSource>("sf"),
+        SchemaCommands::Duckdb => source_doc::<DuckDbSource>("duckdb"),
+        SchemaCommands::Pg => dest_doc::<PgDestination>("pg"),
+        SchemaCommands::Pq => dest_doc::<ParquetDestination>("pq"),
+        SchemaCommands::Delta => dest_doc::<DeltaDestination>("delta"),
+        SchemaCommands::Arrow => dest_doc::<ArrowDestination>("arrow"),
         SchemaCommands::Finalize => finalize_doc(),
         SchemaCommands::Results => results_doc(),
         SchemaCommands::Columns => build_columns(),
@@ -120,39 +119,32 @@ pub fn build(command: &SchemaCommands) -> Value {
     }
 }
 
-fn named_block(schema: Schema, namespace: Option<&str>) -> Value {
-    match namespace {
-        Some(ns) => json!({ "namespace": ns, "schema": schema }),
-        None => json!({ "schema": schema }),
-    }
-}
-
-fn source_doc<T: JsonSchema>(kind: &str, namespace: Option<&str>) -> Value {
+fn source_doc<T: JsonSchema>(kind: &str) -> Value {
     let mut g = SchemaGenerator::default();
-    let block = named_block(g.subschema_for::<T>(), namespace);
+    let schema = g.subschema_for::<T>();
     json!({
         "$defs": g.take_definitions(true),
         "kind": kind,
-        "source": block,
+        "source": { "schema": schema },
         "columns_ref": "ldrs schema columns",
         "usage_ref": "ldrs schema usage",
     })
 }
 
-fn dest_doc<T: JsonSchema>(kind: &str, namespace: Option<&str>) -> Value {
+fn dest_doc<T: JsonSchema>(kind: &str) -> Value {
     let mut g = SchemaGenerator::default();
-    let block = named_block(g.subschema_for::<T>(), namespace);
+    let schema = g.subschema_for::<T>();
     json!({
         "$defs": g.take_definitions(true),
         "kind": kind,
-        "destination": block,
+        "destination": { "schema": schema },
         "columns_ref": "ldrs schema columns",
         "usage_ref": "ldrs schema usage",
     })
 }
 
 /// The post-load finalize item block (`FinalizeItem`). `run:` selects the kind;
-/// the remaining fields are that kind's config. A v2/nested-only feature.
+/// the remaining fields are that kind's config.
 fn finalize_doc() -> Value {
     let mut g = SchemaGenerator::default();
     let block = g.subschema_for::<FinalizeItem>();
@@ -214,7 +206,7 @@ pub fn build_yaml() -> Value {
     })
 }
 
-/// Env vars, templating, namespacing, and worked examples the context that
+/// Env vars, templating, and worked examples the context that
 /// used to ride on every dump.
 pub fn build_usage() -> Value {
     usage_block()

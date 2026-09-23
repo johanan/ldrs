@@ -74,17 +74,10 @@ impl SFSource {
 }
 
 pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<SFSource, anyhow::Error> {
-    let name = yaml
-        .get("sf.name")
-        .or(yaml.get("name"))
-        .and_then(|v| v.as_str());
-    let sql = yaml
-        .get("sf.sql")
-        .or(yaml.get("sql"))
-        .and_then(|v| v.as_str());
+    let name = yaml.get("name").and_then(|v| v.as_str());
+    let sql = yaml.get("sql").and_then(|v| v.as_str());
     let param_keys = yaml
-        .get("sf.param_keys")
-        .or(yaml.get("param_keys"))
+        .get("param_keys")
         .and_then(|v| Vec::<String>::deserialize(v).ok());
 
     match (name, sql) {
@@ -149,12 +142,12 @@ name: recent_users
     }
 
     #[test]
-    fn test_snowflake_serde_parse_ns() {
-        let ns_table_yaml = r#"
-sf.name: my_table
+    fn test_snowflake_kind_inferred_from_sql() {
+        let table_yaml = r#"
+name: my_table
 "#;
 
-        let table_value: Value = serde_yaml::from_str(ns_table_yaml).unwrap();
+        let table_value: Value = serde_yaml::from_str(table_yaml).unwrap();
         let table = from_serde_yaml(&table_value, Some("sf.table")).unwrap();
         let table_infer = from_serde_yaml(&table_value, None).unwrap();
 
@@ -164,12 +157,12 @@ sf.name: my_table
         assert_eq!(table, table_struct);
         assert_eq!(table_infer, table_struct);
 
-        let ns_query_yaml = r#"
-sf.sql: "SELECT * FROM users WHERE created_at > '2024-01-01'"
-sf.name: recent_users
+        let query_yaml = r#"
+sql: "SELECT * FROM users WHERE created_at > '2024-01-01'"
+name: recent_users
 "#;
 
-        let query_value: Value = serde_yaml::from_str(ns_query_yaml).unwrap();
+        let query_value: Value = serde_yaml::from_str(query_yaml).unwrap();
         let query = from_serde_yaml(&query_value, Some("sf.query")).unwrap();
         let query_infer = from_serde_yaml(&query_value, None).unwrap();
 

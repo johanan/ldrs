@@ -4,19 +4,12 @@ use arrow_array::{Int32Array, Int8Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use ldrs::{
-    file_source::FileSource,
-    ldrs_config::{
-        config::{parse_dest, parse_src, LdrsDestination, LdrsParsedConfig, LdrsSource},
-        execute_configs, parse_yaml_config,
-    },
-    ldrs_snowflake::snowflake_source::{SFQuery, SFSource},
-    parquet::ParquetDestination,
+    ldrs_config::{execute_configs, infer_env_type, parse_tables},
     results::Results,
 };
 use ldrs_arrow::{build_arrow_transform_strategy, ColumnType};
 use ldrs_parquet::{builder_from_string, write_parquet, write_parquet_split};
 use ldrs_test_fixtures::{data_url, fixture, fixture_str, fixture_url};
-use serde_yaml::Value;
 use tracing::info;
 
 const TEST_CASES: &[(&str, &str)] = &[
@@ -67,99 +60,25 @@ async fn test_parquet() {
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
-/// filename for destination will need to use the pq namespace to make sure that the src does not parse it
-#[test_log::test]
-fn test_parquet_file_src_and_dest() {
-    let test_yaml = r#"
-name: public.users
-pq.filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
-"#;
-
-    let test_value: Value = serde_yaml::from_str(test_yaml).unwrap();
-    let src = parse_src(test_value.clone(), &Some("file".into())).unwrap();
-    let dest = parse_dest(test_value, &Some("pq".into())).unwrap();
-    let config = LdrsParsedConfig {
-        src,
-        dests: vec![dest],
-        finalize: Vec::new(),
-        lua_modules: Vec::new(),
-        unknown_keys: Vec::new(),
-    };
-    let expected_config = LdrsParsedConfig {
-        src: LdrsSource::File(FileSource {
-            name: "public.users".into(),
-            filename: None,
-        }),
-        dests: vec![LdrsDestination::Pq(ParquetDestination {
-            name: "public.users".into(),
-            target: None,
-            filename: "tests/test_data/parquet_writes/public.users.written.snappy.parquet".into(),
-            columns: Vec::new(),
-            bloom_filters: Vec::new(),
-            max_rows: None,
-            max_bytes: None,
-        })],
-        finalize: Vec::new(),
-        lua_modules: Vec::new(),
-        unknown_keys: Vec::new(),
-    };
-    assert_eq!(config, expected_config);
-
-    // when the source is not a file we can use filename
-    let sf_yaml = r#"
-name: public.users
-sql: select * from users
-filename: tests/test_data/parquet_writes/public.users.written.snappy.parquet
-"#;
-
-    let test_value: Value = serde_yaml::from_str(sf_yaml).unwrap();
-    let src = parse_src(test_value.clone(), &Some("sf".into())).unwrap();
-    let dest = parse_dest(test_value, &Some("pq".into())).unwrap();
-    let config = LdrsParsedConfig {
-        src,
-        dests: vec![dest],
-        finalize: Vec::new(),
-        lua_modules: Vec::new(),
-        unknown_keys: Vec::new(),
-    };
-    let expected_config = LdrsParsedConfig {
-        src: LdrsSource::SF(SFSource::Query(SFQuery {
-            name: "public.users".into(),
-            sql: "select * from users".into(),
-            param_keys: None,
-        })),
-        dests: vec![LdrsDestination::Pq(ParquetDestination {
-            name: "public.users".into(),
-            target: None,
-            filename: "tests/test_data/parquet_writes/public.users.written.snappy.parquet".into(),
-            columns: Vec::new(),
-            bloom_filters: Vec::new(),
-            max_rows: None,
-            max_bytes: None,
-        })],
-        finalize: Vec::new(),
-        lua_modules: Vec::new(),
-        unknown_keys: Vec::new(),
-    };
-    assert_eq!(config, expected_config);
-}
-
 #[tokio::test]
 #[test_log::test]
 async fn test_parquet_full_round_trip() {
     let config = r#"
 src: file
-dest: pq
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
-dest_defaults:
-  pq.filename: parquet_writes/{{ target }}_roundtrip.snappy.parquet
+destinations:
+  - dest: pq
+    filename: parquet_writes/{{ target }}_roundtrip.snappy.parquet
 
 tables:
   - name: public.users
-    target: public.users_renamed
-    bloom_filters: [[unique_id]]
     columns: [ { name: created, type: timestamptz, time_unit: Micros }]
+    destinations:
+      - dest: pq
+        target: public.users_renamed
+        filename: parquet_writes/{{ target }}_roundtrip.snappy.parquet
+        bloom_filters: [[unique_id]]
   - name: public.numbers
 "#;
 
@@ -184,7 +103,11 @@ tables:
         let _ = std::fs::remove_file(file);
     }
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -211,11 +134,11 @@ tables:
 async fn test_parquet_relative_file_dest() {
     let config = r#"
 src: file
-dest: pq
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
-dest_defaults:
-  pq.filename: tests/test_data/parquet_writes/{{ name }}_relative.snappy.parquet
+destinations:
+  - dest: pq
+    filename: tests/test_data/parquet_writes/{{ name }}_relative.snappy.parquet
 
 tables:
   - name: public.users
@@ -237,7 +160,11 @@ tables:
         .join("tests/test_data/parquet_writes/public.users_relative.snappy.parquet");
     let _ = std::fs::remove_file(&expected);
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -253,19 +180,19 @@ tables:
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
-/// `pq.max_rows` + a `{{ pad index N }}` filename through `execute_configs`: the run succeeds
+/// `max_rows` + a `{{ pad index N }}` filename through `execute_configs`: the run succeeds
 /// and the first rotated file is written with the zero-padded index.
 #[tokio::test]
 #[test_log::test]
 async fn test_parquet_rotation_namer_wired() {
     let config = r#"
 src: file
-dest: pq
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
-dest_defaults:
-  pq.filename: parquet_writes/{{ name }}_rot_{{ pad index 5 }}.snappy.parquet
-  pq.max_rows: 1
+destinations:
+  - dest: pq
+    filename: parquet_writes/{{ name }}_rot_{{ pad index 5 }}.snappy.parquet
+    max_rows: 1
 
 tables:
   - name: public.users
@@ -283,7 +210,11 @@ tables:
     let expected = fixture_str("parquet_writes/public.users_rot_00000.snappy.parquet");
     let _ = std::fs::remove_file(&expected);
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -486,7 +417,11 @@ tables:
         let _ = std::fs::remove_file(f);
     }
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -540,7 +475,11 @@ tables:
         let _ = std::fs::remove_file(f);
     }
     let result = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -597,7 +536,11 @@ tables:
         let _ = std::fs::remove_file(fixture_str(f));
     }
     execute_configs(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -660,7 +603,11 @@ tables:
     let _ = std::fs::remove_file(fixture_str(file_a));
     let _ = std::fs::remove_file(fixture_str(file_b));
     execute_configs(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),

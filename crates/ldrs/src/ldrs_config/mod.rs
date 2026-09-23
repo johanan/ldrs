@@ -4,7 +4,6 @@ pub mod field_validation;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal};
 
-use anyhow::Context;
 use deadpool_postgres::Pool;
 use futures::future::join_all;
 use ldrs_arrow::ColumnType;
@@ -176,23 +175,16 @@ fn resolve_txn_config(
     }
 }
 
-pub fn parse_yaml_config(
-    config_string: &str,
-    ldrs_env: &[(String, String)],
+pub fn parse_tables(
+    config: &LdrsConfig,
+    env_src: Option<String>,
 ) -> Result<Vec<LdrsParsedConfig>, anyhow::Error> {
-    let config: LdrsConfig =
-        serde_yaml::from_str(config_string).with_context(|| "Could not parse the config")?;
-
-    let src_default = config.src.clone().or(infer_env_type("LDRS_SRC", ldrs_env));
-    let dest_default = config
-        .dest
-        .clone()
-        .or(infer_env_type("LDRS_DEST", ldrs_env));
+    let src_default = config.src.clone().or(env_src);
 
     config
         .tables
         .iter()
-        .map(|t| parse_table(t.clone(), &config, &src_default, &dest_default))
+        .map(|t| parse_table(t.clone(), config, &src_default))
         .collect::<Result<Vec<_>, anyhow::Error>>()
 }
 

@@ -1,11 +1,13 @@
 use delta_kernel::expressions::Scalar;
 use futures::TryStreamExt;
-use ldrs::ldrs_config::{execute_configs, parse_yaml_config, resolve_delta_targets};
+use ldrs::ldrs_config::{execute_configs, infer_env_type, parse_tables, resolve_delta_targets};
 use ldrs::results::Results;
 use ldrs_delta::{
-    delta_stats_to_json, overwrite_delta, parquet_metadata_to_delta_stats, vacuum, OperationConfig,
-    Retention,
+    delta_stats_to_json, parquet_metadata_to_delta_stats, vacuum, OperationConfig, Retention,
 };
+
+mod common;
+use common::overwrite_delta;
 use ldrs_parquet::builder_from_string;
 use ldrs_test_fixtures::delta::{cleanup_table, delta_table_path, make_target_batch, test_schema};
 use ldrs_test_fixtures::{data_url, fixture, fixture_url};
@@ -440,13 +442,16 @@ async fn test_overwrite_delta() {
 async fn test_delta_overwrite_with_config() {
     let config = r#"
 src: file
-dest: delta.overwrite
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.overwrite
 
 tables:
   - name: public.users
-    target: public.users_curated
+    destinations:
+      - dest: delta.overwrite
+        target: public.users_curated
   - name: public.numbers
   - name: public.string_values
     filename: public.string_values/public.strings.snappy.parquet
@@ -482,7 +487,11 @@ tables:
         .unwrap();
 
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -553,13 +562,14 @@ async fn test_delta_merge_with_config() {
     //   2nd run: merge finds same keys in target, writes DVs + new adds at v2
     let config = r#"
 src: file
-dest: delta.merge
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.merge
+    merge_keys: [bigint_value]
 
 tables:
   - name: public.numbers
-    delta.merge_keys: [bigint_value]
 "#;
 
     let src_url = data_url();
@@ -585,7 +595,11 @@ tables:
 
     // First run: creates the table (v0) and commits the initial merge (v1)
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -627,7 +641,11 @@ tables:
 
     // Second run: same source, same keys, so all rows match → DV path
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -1035,7 +1053,8 @@ async fn test_engine_info_names_the_release_and_the_library() {
     // Through the config path, so the shell's own version reaches the commit.
     let config = r#"
 src: file
-dest: delta.overwrite
+destinations:
+  - dest: delta.overwrite
 tables:
   - name: public.users
     filename: public.users/public.users.snappy.parquet
@@ -1056,7 +1075,11 @@ tables:
     ];
 
     execute_configs(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         &tokio::runtime::Handle::current(),
@@ -1182,19 +1205,21 @@ async fn test_overwrite_preserves_table_properties() {
     // rewrites `metaData`, and has to carry that configuration forward rather than replace it.
     let merge_config = r#"
 src: file
-dest: delta.merge
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.merge
+    merge_keys: [bigint_value]
 
 tables:
   - name: public.numbers
-    delta.merge_keys: [bigint_value]
 "#;
     let overwrite_config = r#"
 src: file
-dest: delta.overwrite
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.overwrite
 
 tables:
   - name: public.numbers
@@ -1220,7 +1245,11 @@ tables:
 
     for config in [merge_config, overwrite_config] {
         execute_configs(
-            parse_yaml_config(config, &ldrs_env).unwrap(),
+            parse_tables(
+                &serde_yaml::from_str(config).unwrap(),
+                infer_env_type("LDRS_SRC", &ldrs_env),
+            )
+            .unwrap(),
             None,
             &ldrs_env,
             rt.handle(),
@@ -1258,9 +1287,10 @@ tables:
 async fn test_overwrite_refuses_a_partitioned_table() {
     let config = r#"
 src: file
-dest: delta.overwrite
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.overwrite
 
 tables:
   - name: public.numbers
@@ -1286,7 +1316,11 @@ tables:
 
     let run = async || {
         execute_configs(
-            parse_yaml_config(config, &ldrs_env).unwrap(),
+            parse_tables(
+                &serde_yaml::from_str(config).unwrap(),
+                infer_env_type("LDRS_SRC", &ldrs_env),
+            )
+            .unwrap(),
             None,
             &ldrs_env,
             rt.handle(),
@@ -1382,7 +1416,11 @@ tables:
     ];
 
     let targets = resolve_delta_targets(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
     )
@@ -1398,7 +1436,11 @@ tables:
     );
 
     let selected = resolve_delta_targets(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         Some(vec!["public.users".to_string()]),
         &ldrs_env,
     )
@@ -1411,13 +1453,14 @@ tables:
 fn test_resolve_delta_targets_errors_without_a_delta_destination() {
     let config = r#"
 src: file
-dest: pq
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: pq
+    filename: "out.parquet"
 
 tables:
   - name: public.numbers
-    filename: "out.parquet"
 "#;
     let ldrs_env = vec![
         ("LDRS_SRC".to_string(), data_url()),
@@ -1425,7 +1468,11 @@ tables:
     ];
 
     let err = resolve_delta_targets(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
     )
@@ -1440,15 +1487,16 @@ fn test_resolve_delta_targets_ignores_load_only_fields() {
     // band without it, and never reads the field, so resolution must not touch it.
     let config = r#"
 src: file
-dest: delta.merge
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.merge
+    merge_keys: [bigint_value]
+    txn_mode: processing_time
+    batch_version: "{{ run_id }}"
 
 tables:
   - name: public.numbers
-    delta.merge_keys: [bigint_value]
-    delta.txn_mode: processing_time
-    delta.batch_version: "{{ run_id }}"
 "#;
     let ldrs_env = vec![
         ("LDRS_SRC".to_string(), data_url()),
@@ -1459,7 +1507,11 @@ tables:
     ];
 
     let targets = resolve_delta_targets(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
     )

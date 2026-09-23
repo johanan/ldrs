@@ -5,7 +5,7 @@ use anyhow::Context;
 use arrow::row::{RowConverter, SortField};
 use arrow_array::{cast::AsArray, types::Int64Type, ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use ldrs_parquet::{
     default_writer_props, read_parquet_metadata, stream_projected_parquet, with_bloom_filters,
     FileNamer, ParquetSink, ROW_NUMBER_COLUMN,
@@ -21,7 +21,7 @@ use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::{
-    build_add, build_engine, checkpoint_interval, cleanup_source_files, ensure_table, file_path,
+    build_add, build_engine, checkpoint_interval, cleanup_source_files, file_path,
     should_checkpoint, version_to_log_filename, write_checkpoint, Commit, DeltaRemove, DeltaTxn,
     Operation, OperationConfig, MERGE_MAX_RETRIES,
 };
@@ -183,26 +183,6 @@ pub(crate) fn validate_no_null_keys(
         anyhow::bail!("merge key '{}' contains {} null values", col, count);
     }
     Ok(())
-}
-
-pub async fn merge_delta<S>(
-    table_path: &str,
-    schema: SchemaRef,
-    stream: S,
-    merge_config: MergeConfig,
-    config: &OperationConfig,
-    cloud_io: &Handle,
-) -> Result<MergeStats, anyhow::Error>
-where
-    S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
-{
-    ensure_table(table_path, &schema, config).await?;
-    let mut sink = DeltaMergeSink::new(table_path, schema, merge_config, config, cloud_io)?;
-    let mut stream = std::pin::pin!(stream);
-    while let Some(batch) = stream.next().await {
-        sink.write_batch(&batch?).await?;
-    }
-    sink.finish().await
 }
 
 /// Streaming Delta merge. Writes data files through an embedded [`ParquetSink`]

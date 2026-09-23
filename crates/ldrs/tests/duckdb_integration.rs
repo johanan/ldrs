@@ -11,7 +11,7 @@ use arrow_array::{
 use arrow_schema::{DataType, TimeUnit};
 use futures::TryStreamExt;
 use ldrs::error::RunError;
-use ldrs::ldrs_config::{execute_configs, parse_yaml_config};
+use ldrs::ldrs_config::{execute_configs, infer_env_type, parse_tables};
 use ldrs::results::Results;
 use ldrs_parquet::builder_from_string;
 use ldrs_test_fixtures::{data_url, fixture, fixture_url};
@@ -32,7 +32,11 @@ fn penguins_url() -> String {
 async fn run(config: &str, ldrs_env: &[(String, String)]) -> Result<(), RunError> {
     let rt = cloud_io();
     let result = execute_configs(
-        parse_yaml_config(config, ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", ldrs_env),
+        )
+        .unwrap(),
         None,
         ldrs_env,
         rt.handle(),

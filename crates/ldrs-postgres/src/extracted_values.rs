@@ -1,5 +1,5 @@
 use bytes::BufMut;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use ldrs_arrow::{ColumnSpec, TypedColumnAccessor};
 use postgres_types::{to_sql_checked, ToSql, Type};
 
@@ -10,11 +10,13 @@ pub enum ExtractedValue<'a> {
     Boolean(Option<bool>),
     Int64(Option<i64>),
     Int32(Option<i32>),
+    Int16(Option<i16>),
     Double(Option<f64>),
     Real(Option<f32>),
     Decimal(Option<PgFixedNumeric>),
     Uuid(Option<uuid::Uuid>),
     Utf8(Option<&'a str>),
+    Date(Option<NaiveDate>),
     TimestampSeconds(Option<NaiveDateTime>),
     TimestampMillis(Option<NaiveDateTime>),
     TimestampMicros(Option<NaiveDateTime>),
@@ -32,6 +34,7 @@ enum ExtractionStrategy {
     Boolean,
     BigInt,
     Integer,
+    SmallInt,
     Double,
     Real,
     Text,
@@ -39,6 +42,7 @@ enum ExtractionStrategy {
     Uuid,
     Jsonb,
     Bytea,
+    Date,
     TimestampSeconds,
     TimestampMillis,
     TimestampMicros,
@@ -63,12 +67,13 @@ impl<'a> ColumnConverter<'a> {
         let strategy = match col_spec {
             ColumnSpec::Boolean { .. } => ExtractionStrategy::Boolean,
             ColumnSpec::BigInt { .. } => ExtractionStrategy::BigInt,
-            ColumnSpec::SmallInt { .. } => ExtractionStrategy::Integer,
+            ColumnSpec::SmallInt { .. } => ExtractionStrategy::SmallInt,
             ColumnSpec::Integer { .. } => ExtractionStrategy::Integer,
             ColumnSpec::Double { .. } => ExtractionStrategy::Double,
             ColumnSpec::Real { .. } => ExtractionStrategy::Real,
             ColumnSpec::Text { .. } | ColumnSpec::Varchar { .. } => ExtractionStrategy::Text,
             ColumnSpec::Numeric { scale, .. } => ExtractionStrategy::Numeric { scale: *scale },
+            ColumnSpec::Date { .. } => ExtractionStrategy::Date,
             ColumnSpec::Timestamp {
                 time_unit: ldrs_arrow::TimeUnit::Second,
                 ..
@@ -122,6 +127,9 @@ impl<'a> ColumnConverter<'a> {
             ExtractionStrategy::Integer => unsafe {
                 ExtractedValue::Int32(self.accessor.Int32(row_idx))
             },
+            ExtractionStrategy::SmallInt => unsafe {
+                ExtractedValue::Int16(self.accessor.Int16(row_idx))
+            },
             ExtractionStrategy::Double => unsafe {
                 ExtractedValue::Double(self.accessor.Float64(row_idx))
             },
@@ -142,6 +150,14 @@ impl<'a> ColumnConverter<'a> {
             },
             ExtractionStrategy::Jsonb => unsafe {
                 ExtractedValue::Jsonb(self.accessor.Utf8(row_idx))
+            },
+            // Date32 counts days from 1970-01-01, which is day 719_163 of the common era
+            ExtractionStrategy::Date => unsafe {
+                ExtractedValue::Date(
+                    self.accessor
+                        .Date32(row_idx)
+                        .and_then(|days| NaiveDate::from_num_days_from_ce_opt(days + 719_163)),
+                )
             },
             ExtractionStrategy::TimestampMillis => {
                 ExtractedValue::TimestampMillis(self.accessor.as_chrono_naive(row_idx))
@@ -177,8 +193,10 @@ impl<'a> ToSql for ExtractedValue<'a> {
             ExtractedValue::Boolean(v) => v.to_sql(ty, out),
             ExtractedValue::Int64(v) => v.to_sql(ty, out),
             ExtractedValue::Int32(v) => v.to_sql(ty, out),
+            ExtractedValue::Int16(v) => v.to_sql(ty, out),
             ExtractedValue::Double(v) => v.to_sql(ty, out),
             ExtractedValue::Uuid(v) => v.to_sql(ty, out),
+            ExtractedValue::Date(v) => v.to_sql(ty, out),
             ExtractedValue::TimestampSeconds(v) => v.to_sql(ty, out),
             ExtractedValue::TimestampMillis(v) => v.to_sql(ty, out),
             ExtractedValue::TimestampMicros(v) => v.to_sql(ty, out),
@@ -206,5 +224,52 @@ impl<'a> ToSql for ExtractedValue<'a> {
 
     fn accepts(_ty: &Type) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Date32Array};
+    use bytes::BytesMut;
+    use chrono::NaiveDate;
+    use postgres_types::IsNull;
+    use std::sync::Arc;
+
+    /// Encodes the same bytes chrono's `NaiveDate` does, across both epochs: arrow counts days from
+    /// 1970-01-01, postgres from 2000-01-01.
+    #[test]
+    fn a_date_column_encodes_as_a_postgres_date() {
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let dates = [
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            Some(NaiveDate::from_ymd_opt(1969, 12, 31).unwrap()),
+            None,
+        ];
+        let array: ArrayRef = Arc::new(Date32Array::from(
+            dates
+                .iter()
+                .map(|d| d.map(|d| (d - epoch).num_days() as i32))
+                .collect::<Vec<_>>(),
+        ));
+        let accessor = TypedColumnAccessor::new(&array);
+        let converter =
+            ColumnConverter::new(&accessor, &ColumnSpec::Date { name: "d".into() }).unwrap();
+
+        for (row, expected) in dates.iter().enumerate() {
+            let mut got = BytesMut::new();
+            let mut want = BytesMut::new();
+            let got_null = converter
+                .extract_value(row)
+                .to_sql(&Type::DATE, &mut got)
+                .unwrap();
+            let want_null = expected.to_sql(&Type::DATE, &mut want).unwrap();
+            assert_eq!(
+                matches!(got_null, IsNull::Yes),
+                matches!(want_null, IsNull::Yes),
+                "row {row} nullness"
+            );
+            assert_eq!(got, want, "row {row} bytes");
+        }
     }
 }

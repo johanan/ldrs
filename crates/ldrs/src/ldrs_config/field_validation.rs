@@ -10,8 +10,6 @@ pub struct UnknownKey {
 }
 
 /// Walk a YAML Mapping's top-level keys and return any that aren't in `allowed`.
-/// Keys like `pq.filename` are stripped to their final segment before comparison;
-/// the original full key is preserved in `UnknownKey::key` for display.
 /// Non-Mapping inputs yield an empty vec.
 pub fn find_unknown_keys(value: &Value, allowed: &HashSet<&str>) -> Vec<UnknownKey> {
     let Value::Mapping(map) = value else {
@@ -19,20 +17,16 @@ pub fn find_unknown_keys(value: &Value, allowed: &HashSet<&str>) -> Vec<UnknownK
     };
     let mut out = Vec::new();
     for (k, _) in map {
-        let Some(full) = k.as_str() else { continue };
-        let bare = full
-            .rsplit_once('.')
-            .map(|(_, suffix)| suffix)
-            .unwrap_or(full);
-        if allowed.contains(bare) {
+        let Some(key) = k.as_str() else { continue };
+        if allowed.contains(key) {
             continue;
         }
-        let suggestions = close_matches(bare, allowed)
+        let suggestions = close_matches(key, allowed)
             .into_iter()
             .map(String::from)
             .collect();
         out.push(UnknownKey {
-            key: full.to_string(),
+            key: key.to_string(),
             suggestions,
         });
     }
@@ -183,33 +177,6 @@ mod tests {
             vec![UnknownKey {
                 key: "xyzzy".to_string(),
                 suggestions: vec![],
-            }],
-        );
-    }
-
-    #[test]
-    fn find_unknown_keys_strips_prefix_before_check() {
-        let allowed: HashSet<&str> = ["filename"].into_iter().collect();
-        let value: Value = serde_yaml::from_str("pq.filename: x").unwrap();
-        assert!(find_unknown_keys(&value, &allowed).is_empty());
-    }
-
-    #[test]
-    fn find_unknown_keys_strips_only_last_segment() {
-        let allowed: HashSet<&str> = ["merge_keys"].into_iter().collect();
-        let value: Value = serde_yaml::from_str("delta.merge.merge_keys: [id]").unwrap();
-        assert!(find_unknown_keys(&value, &allowed).is_empty());
-    }
-
-    #[test]
-    fn find_unknown_keys_preserves_full_key_in_finding() {
-        let allowed: HashSet<&str> = ["filename"].into_iter().collect();
-        let value: Value = serde_yaml::from_str("pq.fileanme: x").unwrap();
-        assert_eq!(
-            find_unknown_keys(&value, &allowed),
-            vec![UnknownKey {
-                key: "pq.fileanme".to_string(),
-                suggestions: vec!["filename".to_string()],
             }],
         );
     }
