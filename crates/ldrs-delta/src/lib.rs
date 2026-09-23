@@ -3,7 +3,6 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use anyhow::Context;
-use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{DataType as DeltaDataType, StructField, StructType};
@@ -12,7 +11,6 @@ use delta_kernel::table_features::TableFeature;
 use delta_kernel::{Engine, Snapshot, SnapshotRef, Version};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngineBuilder;
-use futures::{Stream, StreamExt};
 use ldrs_storage::{
     base_or_relative_path, build_store, join_store_path, kernel_url, store_path_from_uri,
 };
@@ -937,28 +935,6 @@ fn build_overwrite_commit(
     .with_adds(adds.to_vec())
     .to_jsonl()?;
     Ok((commit_body, next_version))
-}
-
-pub async fn overwrite_delta<S>(
-    table_path: &str,
-    schema: SchemaRef,
-    stream: S,
-    max_rows: Option<usize>,
-    max_bytes: Option<usize>,
-    config: &OperationConfig,
-    cloud_io: &Handle,
-) -> Result<(), anyhow::Error>
-where
-    S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
-{
-    ensure_table(table_path, &schema, config).await?;
-    let mut sink =
-        DeltaOverwriteSink::new(table_path, schema, max_rows, max_bytes, config, cloud_io)?;
-    let mut stream = std::pin::pin!(stream);
-    while let Some(batch) = stream.next().await {
-        sink.write_batch(&batch?).await?;
-    }
-    sink.finish().await
 }
 
 #[cfg(test)]

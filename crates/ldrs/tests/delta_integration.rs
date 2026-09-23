@@ -3,9 +3,11 @@ use futures::TryStreamExt;
 use ldrs::ldrs_config::{execute_configs, parse_yaml_config, resolve_delta_targets};
 use ldrs::results::Results;
 use ldrs_delta::{
-    delta_stats_to_json, overwrite_delta, parquet_metadata_to_delta_stats, vacuum, OperationConfig,
-    Retention,
+    delta_stats_to_json, parquet_metadata_to_delta_stats, vacuum, OperationConfig, Retention,
 };
+
+mod common;
+use common::overwrite_delta;
 use ldrs_parquet::builder_from_string;
 use ldrs_test_fixtures::delta::{cleanup_table, delta_table_path, make_target_batch, test_schema};
 use ldrs_test_fixtures::{data_url, fixture, fixture_url};

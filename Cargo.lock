@@ -944,9 +944,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel"
-version = "0.27.1"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc7e8eed9c45dacf1a844abbe78b86d0806df22e4ac4402a387f5de16528ea00"
+checksum = "00ba53f3a73c154d023528e9448028ec81f04724fb93bfde37d04f6d69f5115f"
 dependencies = [
  "arrow",
  "bytes",
@@ -975,9 +975,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_default_engine"
-version = "0.27.1"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "359fc97a5e6859d1c2592c4600e39ee0dc2e4f9f27f88720c7195e44a858dab2"
+checksum = "375180c738f998f72ab12b3ee94e5cfadb406f8d2a7c2d2039a6b168f1cdf93d"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -996,9 +996,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.27.1"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b25ae700f43ea9506a97bf93c54a1fde5a0d64ad0e19b3e0ebbe91761cdeeddc"
+checksum = "949d8d89c6acad114297d0ffaa35abd593bd87a974472240c6a0400394f71e83"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4095,6 +4095,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

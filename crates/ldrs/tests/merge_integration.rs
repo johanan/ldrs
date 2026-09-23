@@ -4,7 +4,10 @@ use std::sync::Arc;
 use arrow_array::builder::Int64Builder;
 use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use futures::stream;
-use ldrs_delta::{merge_delta, overwrite_delta, MergeConfig, OperationConfig, TxnConfig};
+use ldrs_delta::{MergeConfig, OperationConfig, TxnConfig};
+
+mod common;
+use common::{merge_delta, overwrite_delta};
 use ldrs_test_fixtures::delta::{
     cleanup_table, count_actions, delta_table_path, duckdb_count, find_action, latest_version,
     make_batch, make_batch_from_ids, make_source_batch, make_target_batch, read_log_actions,
