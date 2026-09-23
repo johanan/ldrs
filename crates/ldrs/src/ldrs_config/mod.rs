@@ -184,15 +184,11 @@ pub fn parse_yaml_config(
         serde_yaml::from_str(config_string).with_context(|| "Could not parse the config")?;
 
     let src_default = config.src.clone().or(infer_env_type("LDRS_SRC", ldrs_env));
-    let dest_default = config
-        .dest
-        .clone()
-        .or(infer_env_type("LDRS_DEST", ldrs_env));
 
     config
         .tables
         .iter()
-        .map(|t| parse_table(t.clone(), &config, &src_default, &dest_default))
+        .map(|t| parse_table(t.clone(), &config, &src_default))
         .collect::<Result<Vec<_>, anyhow::Error>>()
 }
 

@@ -202,9 +202,7 @@ struct RunArgs {
 
 #[derive(Subcommand)]
 enum Destination {
-    /// Load from a config file. All sources and destinations. Tables run independently and in
-    /// order: a failing table does not stop the ones after it, and list order carries no
-    /// dependency (use separate runs when one table's output feeds another's input).
+    /// Load from a config file. All sources and destinations.
     Ld(ConfigArgs),
     /// Snowflake destination
     Sf {

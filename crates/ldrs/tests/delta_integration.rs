@@ -442,13 +442,16 @@ async fn test_overwrite_delta() {
 async fn test_delta_overwrite_with_config() {
     let config = r#"
 src: file
-dest: delta.overwrite
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.overwrite
 
 tables:
   - name: public.users
-    target: public.users_curated
+    destinations:
+      - dest: delta.overwrite
+        target: public.users_curated
   - name: public.numbers
   - name: public.string_values
     filename: public.string_values/public.strings.snappy.parquet
@@ -555,13 +558,14 @@ async fn test_delta_merge_with_config() {
     //   2nd run: merge finds same keys in target, writes DVs + new adds at v2
     let config = r#"
 src: file
-dest: delta.merge
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.merge
+    merge_keys: [bigint_value]
 
 tables:
   - name: public.numbers
-    delta.merge_keys: [bigint_value]
 "#;
 
     let src_url = data_url();
@@ -1037,7 +1041,8 @@ async fn test_engine_info_names_the_release_and_the_library() {
     // Through the config path, so the shell's own version reaches the commit.
     let config = r#"
 src: file
-dest: delta.overwrite
+destinations:
+  - dest: delta.overwrite
 tables:
   - name: public.users
     filename: public.users/public.users.snappy.parquet
@@ -1184,19 +1189,21 @@ async fn test_overwrite_preserves_table_properties() {
     // rewrites `metaData`, and has to carry that configuration forward rather than replace it.
     let merge_config = r#"
 src: file
-dest: delta.merge
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.merge
+    merge_keys: [bigint_value]
 
 tables:
   - name: public.numbers
-    delta.merge_keys: [bigint_value]
 "#;
     let overwrite_config = r#"
 src: file
-dest: delta.overwrite
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.overwrite
 
 tables:
   - name: public.numbers
@@ -1260,9 +1267,10 @@ tables:
 async fn test_overwrite_refuses_a_partitioned_table() {
     let config = r#"
 src: file
-dest: delta.overwrite
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.overwrite
 
 tables:
   - name: public.numbers
@@ -1413,13 +1421,14 @@ tables:
 fn test_resolve_delta_targets_errors_without_a_delta_destination() {
     let config = r#"
 src: file
-dest: pq
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: pq
+    filename: "out.parquet"
 
 tables:
   - name: public.numbers
-    filename: "out.parquet"
 "#;
     let ldrs_env = vec![
         ("LDRS_SRC".to_string(), data_url()),
@@ -1442,15 +1451,16 @@ fn test_resolve_delta_targets_ignores_load_only_fields() {
     // band without it, and never reads the field, so resolution must not touch it.
     let config = r#"
 src: file
-dest: delta.merge
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: delta.merge
+    merge_keys: [bigint_value]
+    txn_mode: processing_time
+    batch_version: "{{ run_id }}"
 
 tables:
   - name: public.numbers
-    delta.merge_keys: [bigint_value]
-    delta.txn_mode: processing_time
-    delta.batch_version: "{{ run_id }}"
 "#;
     let ldrs_env = vec![
         ("LDRS_SRC".to_string(), data_url()),

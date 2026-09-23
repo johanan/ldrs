@@ -26,16 +26,7 @@ pub struct LdrsConfig {
     pub src: Option<String>,
     #[schemars(with = "Option<serde_json::Value>")]
     pub src_defaults: Option<Value>,
-    // dest / dest_defaults are the deprecated flat (v1) single-destination form; still parsed,
-    // but `#[schemars(skip)]` keeps them out of `ldrs schema yaml` so discovery points at v2.
-    #[serde(default)]
-    #[schemars(skip)]
-    pub dest: Option<String>,
-    #[schemars(skip)]
-    pub dest_defaults: Option<Value>,
-    /// Config format version. `2` selects the nested `destinations:` form (one source → many
-    /// destinations). Authoritative when set; otherwise the form is inferred from whether a
-    /// `destinations:` list is present. Version 1 (flat, single `dest:`) is deprecated.
+    /// Config format version. `2` selects the nested `destinations:` form
     #[serde(default)]
     pub version: Option<u32>,
     /// Fan-out destination list: each entry is a destination block with its own `dest:` kind
@@ -345,69 +336,9 @@ fn parse_finalize(
     Ok((items, unknown_keys))
 }
 
-/// Parse one table block into its source and destination(s): the flat (v1) form or the
-/// nested (v2) `destinations:` form (dispatched by [`is_nested`]). Finalize is a v2/nested-only feature
+/// The table block is the source; each `destinations:` entry is its own destination, inheriting
+/// the table's `name` and `columns`.
 pub fn parse_table(
-    table: Value,
-    config: &LdrsConfig,
-    src_default: &Option<String>,
-    dest_default: &Option<String>,
-) -> Result<LdrsParsedConfig, anyhow::Error> {
-    if is_nested(&table, config)? {
-        parse_table_nested(table, config, src_default)
-    } else {
-        parse_table_flat(table, config, src_default, dest_default)
-    }
-}
-
-/// Decide flat vs. nested. `version:` is authoritative and errors on a content mismatch;
-/// absent, the presence of a `destinations:` list (table-level or top-level) decides.
-fn is_nested(table: &Value, config: &LdrsConfig) -> Result<bool, anyhow::Error> {
-    let has_destinations = table.get("destinations").is_some() || config.destinations.is_some();
-    match (config.version, has_destinations) {
-        (Some(1), true) => {
-            anyhow::bail!("version: 1 is the flat form, but a `destinations:` list is present")
-        }
-        (Some(2), false) => {
-            anyhow::bail!("version: 2 is the nested form, but no `destinations:` list was found")
-        }
-        (Some(1), false) => Ok(false),
-        (Some(2), true) => Ok(true),
-        (Some(v), _) => anyhow::bail!("unsupported config version: {} (use 1 or 2)", v),
-        (None, has) => Ok(has),
-    }
-}
-
-/// Flat (v1) form: the table block is both the source and the single destination.
-fn parse_table_flat(
-    table: Value,
-    config: &LdrsConfig,
-    src_default: &Option<String>,
-    dest_default: &Option<String>,
-) -> Result<LdrsParsedConfig, anyhow::Error> {
-    let raw_block = table.clone();
-    let src = parse_src(
-        merge_with_defaults(&config.src_defaults, table.clone()),
-        src_default,
-    )?;
-    let dest = parse_dest(
-        merge_with_defaults(&config.dest_defaults, table),
-        dest_default,
-    )?;
-    let unknown_keys = find_unknown_block_keys(&raw_block, &src, &dest);
-    Ok(LdrsParsedConfig {
-        src,
-        dests: vec![dest],
-        finalize: Vec::new(),
-        // finalize is nested-only, so the flat form has no consumer for modules
-        lua_modules: Vec::new(),
-        unknown_keys,
-    })
-}
-
-/// Nested (v2) form: the table block is the source; each `destinations:` entry is its own
-/// destination, inheriting the table's `name` and `columns`.
-fn parse_table_nested(
     table: Value,
     config: &LdrsConfig,
     src_default: &Option<String>,
@@ -513,7 +444,7 @@ fn warn_module_collisions(run_modules: &[String], items: &[FinalizeItem]) {
     }
 }
 
-/// A nested table's `destinations:`, or the top-level default if the table has none.
+/// A table's `destinations:`, or the top-level default if the table has none.
 fn resolve_dest_blocks(table: &Value, config: &LdrsConfig) -> Result<Vec<Value>, anyhow::Error> {
     match table.get("destinations") {
         Some(Value::Sequence(seq)) => Ok(seq.clone()),
@@ -521,7 +452,7 @@ fn resolve_dest_blocks(table: &Value, config: &LdrsConfig) -> Result<Vec<Value>,
         None => config
             .destinations
             .clone()
-            .ok_or_else(|| anyhow::Error::msg("nested table has no destinations")),
+            .ok_or_else(|| anyhow::Error::msg("table has no destinations")),
     }
 }
 
@@ -889,37 +820,22 @@ tables:
     columns:
       - { type: uuid, name: id }
 "#;
-        let err = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap_err();
+        let err = crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None)
+            .unwrap_err();
         assert!(err.to_string().contains("dest"), "got: {}", err);
     }
 
     #[test]
-    fn version_2_without_destinations_is_an_error() {
+    fn a_table_without_destinations_is_an_error() {
         let yaml = r#"
-version: 2
 src: file
-dest: pq
 tables:
   - name: users
     filename: "out.parquet"
 "#;
-        let err = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap_err();
-        assert!(err.to_string().contains("version: 2"), "got: {}", err);
-    }
-
-    #[test]
-    fn version_1_with_destinations_is_an_error() {
-        let yaml = r#"
-version: 1
-src: file
-destinations:
-  - dest: pq
-    filename: "out/{{ name }}.parquet"
-tables:
-  - name: users
-"#;
-        let err = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap_err();
-        assert!(err.to_string().contains("version: 1"), "got: {}", err);
+        let err = crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("no destinations"), "got: {}", err);
     }
 
     #[test]
@@ -935,27 +851,10 @@ tables:
     columns:
       - { type: uuid, name: id }
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         assert_eq!(configs[0].dests.len(), 1);
         assert!(matches!(configs[0].dests[0], LdrsDestination::Pq(_)));
-    }
-
-    #[test]
-    fn unsupported_version_is_an_error() {
-        let yaml = r#"
-version: 3
-src: file
-dest: pq
-tables:
-  - name: users
-    filename: "out.parquet"
-"#;
-        let err = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap_err();
-        assert!(
-            err.to_string().contains("unsupported config version"),
-            "got: {}",
-            err
-        );
     }
 
     #[test]
@@ -1016,13 +915,15 @@ tables:
     fn validate_configs_rejects_arrow_across_tasks() {
         let yaml = r#"
 src: file
-dest: arrow
+destinations:
+  - dest: arrow
 tables:
   - name: users
   - name: orders
 "#;
-        // two flat tasks, each an arrow dest → two stdout streams across the run
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        // two tasks, each an arrow dest → two stdout streams across the run
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         assert!(validate_configs(&configs).is_err());
     }
 
@@ -1173,23 +1074,5 @@ tables:
             "expected targett flagged, got: {:?}",
             flagged
         );
-    }
-
-    #[test]
-    fn v1_flat_silently_ignores_finalize() {
-        // finalize is a v2/nested-only feature.
-        let yaml = r#"
-version: 1
-src: file
-dest: pq
-finalize:
-  - run: sf
-    lua: x.lua
-tables:
-  - name: users
-    filename: "out.parquet"
-"#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
-        assert!(configs[0].finalize.is_empty());
     }
 }

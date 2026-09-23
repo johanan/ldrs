@@ -211,11 +211,11 @@ tables:
 async fn test_parquet_relative_file_dest() {
     let config = r#"
 src: file
-dest: pq
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
-dest_defaults:
-  pq.filename: tests/test_data/parquet_writes/{{ name }}_relative.snappy.parquet
+destinations:
+  - dest: pq
+    filename: tests/test_data/parquet_writes/{{ name }}_relative.snappy.parquet
 
 tables:
   - name: public.users
@@ -253,19 +253,19 @@ tables:
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
-/// `pq.max_rows` + a `{{ pad index N }}` filename through `execute_configs`: the run succeeds
+/// `max_rows` + a `{{ pad index N }}` filename through `execute_configs`: the run succeeds
 /// and the first rotated file is written with the zero-padded index.
 #[tokio::test]
 #[test_log::test]
 async fn test_parquet_rotation_namer_wired() {
     let config = r#"
 src: file
-dest: pq
 src_defaults:
   filename: "{{ name }}/{{ name }}.snappy.parquet"
-dest_defaults:
-  pq.filename: parquet_writes/{{ name }}_rot_{{ pad index 5 }}.snappy.parquet
-  pq.max_rows: 1
+destinations:
+  - dest: pq
+    filename: parquet_writes/{{ name }}_rot_{{ pad index 5 }}.snappy.parquet
+    max_rows: 1
 
 tables:
   - name: public.users
