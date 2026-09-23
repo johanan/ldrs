@@ -564,3 +564,86 @@ tables:
         .batch_execute("DROP SCHEMA IF EXISTS public_test_role CASCADE")
         .await;
 }
+
+#[tokio::test]
+#[test_log::test]
+async fn date_and_small_int_columns_round_trip() {
+    let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+    let ldrs_env = vec![("LDRS_DEST".to_string(), pg_url.to_string())];
+    let config = "
+src: duckdb.query
+destinations:
+  - dest: pg.drop_replace
+
+tables:
+  - name: public_test_dates.dated
+    sql: |
+      SELECT
+        i::INTEGER AS id,
+        CASE i WHEN 0 THEN DATE '2024-06-01' WHEN 1 THEN DATE '1969-12-31' END AS c_date,
+        CASE i WHEN 0 THEN 32767::SMALLINT WHEN 1 THEN (-32768)::SMALLINT END AS c_smallint,
+        CASE i WHEN 0 THEN 127::TINYINT WHEN 1 THEN (-128)::TINYINT END AS c_tinyint
+      FROM range(3) t(i)
+      ORDER BY i
+";
+
+    let client = create_connection(pg_url).await.unwrap();
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_dates CASCADE")
+        .await;
+    let _ = client
+        .batch_execute("CREATE SCHEMA public_test_dates")
+        .await;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let ex = execute_configs(
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
+        None,
+        &ldrs_env,
+        rt.handle(),
+        &Results::default(),
+    )
+    .await;
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+    assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
+
+    let rows = client
+        .query(
+            "SELECT c_date, c_smallint, c_tinyint FROM public_test_dates.dated ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<(Option<chrono::NaiveDate>, Option<i16>, Option<i16>)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                chrono::NaiveDate::from_ymd_opt(2024, 6, 1),
+                Some(32767),
+                Some(127)
+            ),
+            (
+                chrono::NaiveDate::from_ymd_opt(1969, 12, 31),
+                Some(-32768),
+                Some(-128)
+            ),
+            (None, None, None),
+        ]
+    );
+
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_dates CASCADE")
+        .await;
+}
