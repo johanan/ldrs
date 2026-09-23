@@ -103,7 +103,11 @@ tables:
         let _ = std::fs::remove_file(file);
     }
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -156,7 +160,11 @@ tables:
         .join("tests/test_data/parquet_writes/public.users_relative.snappy.parquet");
     let _ = std::fs::remove_file(&expected);
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -202,7 +210,11 @@ tables:
     let expected = fixture_str("parquet_writes/public.users_rot_00000.snappy.parquet");
     let _ = std::fs::remove_file(&expected);
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -405,7 +417,11 @@ tables:
         let _ = std::fs::remove_file(f);
     }
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -459,7 +475,11 @@ tables:
         let _ = std::fs::remove_file(f);
     }
     let result = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -516,7 +536,11 @@ tables:
         let _ = std::fs::remove_file(fixture_str(f));
     }
     execute_configs(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -579,7 +603,11 @@ tables:
     let _ = std::fs::remove_file(fixture_str(file_a));
     let _ = std::fs::remove_file(fixture_str(file_b));
     execute_configs(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),

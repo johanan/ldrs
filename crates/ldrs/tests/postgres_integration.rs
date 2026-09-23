@@ -1,4 +1,4 @@
-use ldrs::ldrs_config::{execute_configs, parse_yaml_config};
+use ldrs::ldrs_config::{execute_configs, infer_env_type, parse_tables};
 use ldrs::results::Results;
 use ldrs_postgres::create_connection;
 use ldrs_test_fixtures::data_url;
@@ -102,7 +102,11 @@ async fn test_postgres_file_drop() {
             .batch_execute("DROP SCHEMA IF EXISTS public_test CASCADE")
             .await;
         let ex = execute_configs(
-            parse_yaml_config(&config, &ldrs_env).unwrap(),
+            parse_tables(
+                &serde_yaml::from_str(&config).unwrap(),
+                infer_env_type("LDRS_SRC", &ldrs_env),
+            )
+            .unwrap(),
             None,
             &ldrs_env,
             rt.handle(),
@@ -157,7 +161,11 @@ tables:
         .build()
         .unwrap();
     let ex = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -209,7 +217,11 @@ tables:
     let _ = client.batch_execute("CREATE SCHEMA public_test_all").await;
 
     let ex = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -338,7 +350,11 @@ tables:
     let _ = client.batch_execute("CREATE SCHEMA public_test_edge").await;
 
     let ex = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -410,7 +426,11 @@ tables:
         .await;
 
     let ex = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -469,7 +489,11 @@ tables:
         .await;
 
     let ex = execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -552,7 +576,11 @@ tables:
         .build()
         .unwrap();
     execute_configs(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),

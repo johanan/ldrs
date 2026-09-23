@@ -1,6 +1,6 @@
 use delta_kernel::expressions::Scalar;
 use futures::TryStreamExt;
-use ldrs::ldrs_config::{execute_configs, parse_yaml_config, resolve_delta_targets};
+use ldrs::ldrs_config::{execute_configs, infer_env_type, parse_tables, resolve_delta_targets};
 use ldrs::results::Results;
 use ldrs_delta::{
     delta_stats_to_json, parquet_metadata_to_delta_stats, vacuum, OperationConfig, Retention,
@@ -487,7 +487,11 @@ tables:
         .unwrap();
 
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -591,7 +595,11 @@ tables:
 
     // First run: creates the table (v0) and commits the initial merge (v1)
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -633,7 +641,11 @@ tables:
 
     // Second run: same source, same keys, so all rows match → DV path
     execute_configs(
-        parse_yaml_config(&config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         rt.handle(),
@@ -1063,7 +1075,11 @@ tables:
     ];
 
     execute_configs(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
         &tokio::runtime::Handle::current(),
@@ -1229,7 +1245,11 @@ tables:
 
     for config in [merge_config, overwrite_config] {
         execute_configs(
-            parse_yaml_config(config, &ldrs_env).unwrap(),
+            parse_tables(
+                &serde_yaml::from_str(config).unwrap(),
+                infer_env_type("LDRS_SRC", &ldrs_env),
+            )
+            .unwrap(),
             None,
             &ldrs_env,
             rt.handle(),
@@ -1296,7 +1316,11 @@ tables:
 
     let run = async || {
         execute_configs(
-            parse_yaml_config(config, &ldrs_env).unwrap(),
+            parse_tables(
+                &serde_yaml::from_str(config).unwrap(),
+                infer_env_type("LDRS_SRC", &ldrs_env),
+            )
+            .unwrap(),
             None,
             &ldrs_env,
             rt.handle(),
@@ -1392,7 +1416,11 @@ tables:
     ];
 
     let targets = resolve_delta_targets(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
     )
@@ -1408,7 +1436,11 @@ tables:
     );
 
     let selected = resolve_delta_targets(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         Some(vec!["public.users".to_string()]),
         &ldrs_env,
     )
@@ -1436,7 +1468,11 @@ tables:
     ];
 
     let err = resolve_delta_targets(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
     )
@@ -1471,7 +1507,11 @@ tables:
     ];
 
     let targets = resolve_delta_targets(
-        parse_yaml_config(config, &ldrs_env).unwrap(),
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
         None,
         &ldrs_env,
     )

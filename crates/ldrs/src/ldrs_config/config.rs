@@ -112,11 +112,6 @@ pub struct LdrsParsedConfig {
     pub unknown_keys: Vec<UnknownKey>,
 }
 
-/// Block-level keys that the parser injects or expects but that are not declared
-/// on any kind's struct (the `src` and `dest` tags are pulled out before parsing
-/// the inner variant).
-pub const STRUCTURAL_KEYS: &[&str] = &["src", "dest"];
-
 /// Field names allowed by the parsed source variant.
 pub fn source_known_fields(src: &LdrsSource) -> Vec<String> {
     match src {
@@ -169,27 +164,6 @@ pub fn register_unknown_keys(value: &Value, dest: &LdrsDestination) -> Vec<Unkno
         .chain(["catalog"])
         .collect();
     find_unknown_keys(block, &allowed)
-}
-
-/// Walks a raw block against the union of fields declared by the parsed src and
-/// dest variants, plus the block-level structural keys. Returns findings; does
-/// not emit. Caller decides when/how to surface them.
-pub fn find_unknown_block_keys(
-    value: &Value,
-    src: &LdrsSource,
-    dest: &LdrsDestination,
-) -> Vec<UnknownKey> {
-    let src_fields = source_known_fields(src);
-    let dest_fields = destination_known_fields(dest);
-    let allowed: HashSet<&str> = src_fields
-        .iter()
-        .map(String::as_str)
-        .chain(dest_fields.iter().map(String::as_str))
-        .chain(STRUCTURAL_KEYS.iter().copied())
-        .collect();
-    let mut unknown = find_unknown_keys(value, &allowed);
-    unknown.extend(register_unknown_keys(value, dest));
-    unknown
 }
 
 pub fn merge_with_defaults(defaults: &Option<Value>, specific: Value) -> Value {
@@ -259,16 +233,12 @@ pub fn parse_src(value: Value, src_default: &Option<String>) -> Result<LdrsSourc
 }
 
 /// Parses the dest block of the config. The value here should already have defaults merged in.
-pub fn parse_dest(
-    value: Value,
-    dest_default: &Option<String>,
-) -> Result<LdrsDestination, anyhow::Error> {
+pub fn parse_dest(value: Value) -> Result<LdrsDestination, anyhow::Error> {
     let dest = value
         .get("dest")
         .map(|v| String::deserialize(v))
         .transpose()
-        .map_err(|_| anyhow::Error::msg("dest is not correctly set in the table block"))?
-        .or(dest_default.clone())
+        .map_err(|_| anyhow::Error::msg("dest is not correctly set in the destination block"))?
         .ok_or_else(|| anyhow::Error::msg("dest is not set"))?;
 
     let dest_prefix = dest.split('.').next().unwrap_or(&dest);
@@ -370,8 +340,7 @@ pub fn parse_table(
                 anyhow::bail!("a destination must not set `name`; it is inherited from the table");
             }
             let block = merge_with_defaults(&inherited, raw_item.clone());
-            // `&None`: each entry must carry its own `dest:` tag.
-            let dest = parse_dest(block, &None)?;
+            let dest = parse_dest(block)?;
             // unknown keys against this dest kind's fields + its own `dest:` tag (not `src`).
             let dest_fields = destination_known_fields(&dest);
             let allowed: HashSet<&str> = dest_fields
@@ -556,7 +525,8 @@ tables:
       - { type: uuid, name: id }
       - { type: text, name: email }
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         assert_eq!(configs.len(), 1);
         let dests = &configs[0].dests;
         assert_eq!(dests.len(), 2);
@@ -587,7 +557,8 @@ tables:
     columns:
       - { type: uuid, name: id }
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].dests.len(), 1);
         match &configs[0].dests[0] {
@@ -608,7 +579,8 @@ tables:
     columns:
       - { type: uuid, name: id }
 "#;
-        let err = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap_err();
+        let err = crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None)
+            .unwrap_err();
         assert!(
             err.to_string().contains("inherited"),
             "expected a name-is-inherited error, got: {}",
@@ -633,7 +605,8 @@ tables:
       - { type: text, name: email }
       - { type: integer, name: age }
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         let dests = &configs[0].dests;
         // delta declared its own 1-column set: whole replace, NOT merged with the table's 3
         match &dests[0] {
@@ -661,7 +634,8 @@ tables:
   - name: users
     merge_keys: [id]
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         let dests = &configs[0].dests;
         match &dests[0] {
             LdrsDestination::Delta(DeltaDestination::Merge(m)) => {
@@ -683,7 +657,8 @@ tables:
   - name: users
     merge_keys: [id]
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         match &configs[0].dests[0] {
             LdrsDestination::Delta(DeltaDestination::Merge(m)) => {
                 assert_eq!(m.merge_keys, vec!["account_id".to_string()])
@@ -705,7 +680,8 @@ tables:
   - name: users
     merge_keys: [id]
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         let dests = &configs[0].dests;
         assert!(matches!(
             &dests[0],
@@ -731,7 +707,8 @@ tables:
   - name: users
     merge_keys: [id]
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         assert!(
             configs[0].unknown_keys.is_empty(),
             "got {:?}",
@@ -753,7 +730,8 @@ tables:
       - { type: uuid, name: id }
       - { type: text, name: email }
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         // explicit empty list is "present", so inheritance does not fill it
         match &configs[0].dests[0] {
             LdrsDestination::Pq(p) => assert!(p.columns.is_empty()),
@@ -774,7 +752,8 @@ tables:
     columns:
       - { type: uuid, name: id }
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         // `merge_keys` is not a pq field; the per-block check validates against pq's kind only
         let flagged: Vec<&str> = configs[0]
             .unknown_keys
@@ -800,7 +779,8 @@ tables:
       - dest: pq
         filename: "out/{{ name }}.parquet"
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         // table-level `columns` and `destinations` are not source fields, but both are allowed
         assert!(
             configs[0].unknown_keys.is_empty(),
@@ -875,7 +855,8 @@ tables:
       - dest: pq
         filename: "audit/{{ name }}.parquet"
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         assert_eq!(configs.len(), 2);
         // `users` inherits the top-level pair
         assert_eq!(configs[0].dests.len(), 2);
@@ -897,7 +878,8 @@ tables:
     columns:
       - { type: uuid, name: id }
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         // `src` is meaningless on a destination block
         let flagged: Vec<&str> = configs[0]
             .unknown_keys
@@ -937,7 +919,8 @@ destinations:
 tables:
   - name: users
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         assert!(validate_configs(&configs).is_err());
     }
 
@@ -952,7 +935,8 @@ destinations:
 tables:
   - name: users
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         assert!(validate_configs(&configs).is_ok());
     }
 
@@ -971,7 +955,8 @@ tables:
     columns:
       - { type: uuid, name: id }
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         assert_eq!(configs[0].finalize.len(), 1);
         match &configs[0].finalize[0] {
             FinalizeItem::Sf(sf) => {
@@ -1000,7 +985,8 @@ tables:
         target: "custom.{{ table_of name }}"
         lua: custom.lua
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         assert_eq!(configs[0].finalize.len(), 1);
         match &configs[0].finalize[0] {
             FinalizeItem::Sf(sf) => {
@@ -1025,7 +1011,8 @@ tables:
     columns:
       - { type: uuid, name: id }
 "#;
-        let err = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap_err();
+        let err = crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None)
+            .unwrap_err();
         assert!(err.to_string().contains("finalize item"), "got: {}", err);
     }
 
@@ -1043,7 +1030,8 @@ tables:
     columns:
       - { type: uuid, name: id }
 "#;
-        let err = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap_err();
+        let err = crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None)
+            .unwrap_err();
         assert!(err.to_string().contains("finalize item"), "got: {}", err);
     }
 
@@ -1063,7 +1051,8 @@ tables:
     columns:
       - { type: uuid, name: id }
 "#;
-        let configs = crate::ldrs_config::parse_yaml_config(yaml, &[]).unwrap();
+        let configs =
+            crate::ldrs_config::parse_tables(&serde_yaml::from_str(yaml).unwrap(), None).unwrap();
         let flagged: Vec<&str> = configs[0]
             .unknown_keys
             .iter()
