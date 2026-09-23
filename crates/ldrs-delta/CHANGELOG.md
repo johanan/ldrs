@@ -2,7 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-## [delta-v0.1.1] - 2026-09-17
+## [0.1.2] - 2026-09-23
+
+### Dependencies
+
+- *(deps)* Bump delta-kernel to 0.28
+
+delta_kernel and delta_kernel_default_engine move to 0.28.0.
+
+
+## [0.1.1] - 2026-09-17
 
 ### Bug Fixes
 

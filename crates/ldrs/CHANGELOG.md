@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.0] - 2026-09-23
+
+### Bug Fixes
+
+- *(postgres)* Write date and smallint columns
+
+Fixed the extracts date and smallint. These failed previously.
+
+
+### Dependencies
+
+- *(deps)* Bump delta-kernel to 0.28
+
+delta_kernel and delta_kernel_default_engine move to 0.28.0.
+
+
+### Refactor
+
+- [**breaking**] *(config)* Configs are v2 only
+
+The flat dest: keys are removed. Every table takes destinations.
+
+- [**breaking**] *(config)* Remove namespaced keys
+
+Namespaced keys only mattered when the config was v1. No way to mix keys
+so these are now removed.
+
+- [**breaking**] *(cli)* Run takes a table block
+
+Changed this command to now just be one table execution. This changed
+the args it takes.
+
+- [**breaking**] *(cli)* Remove sf ingest
+
+Removed this command.
+
+
 ## [0.24.0] - 2026-09-17
 
 ### Bug Fixes
