@@ -190,7 +190,7 @@ impl PgDestination {
                     PgDestCommand::CreateTable("{{ load_table }}".to_string()),
                     PgDestCommand::Load("{{ load_table }}".to_string()),
                     PgDestCommand::Sql(
-                        r#"DROP TABLE IF EXISTS {{ name }};
+                        r#"DROP TABLE IF EXISTS {{ target }};
                         SET search_path TO {{ schema }};
                         ALTER TABLE {{ load_table }} RENAME TO {{ table }};"#
                             .to_string(),
@@ -201,9 +201,9 @@ impl PgDestination {
             PgDestination::TruncateInsert(_) => start
                 .chain([
                     PgDestCommand::Sql("CREATE SCHEMA IF NOT EXISTS {{ schema }};".to_string()),
-                    PgDestCommand::CreateTable("{{ name }}".to_string()),
-                    PgDestCommand::Sql("TRUNCATE TABLE {{ name }};".to_string()),
-                    PgDestCommand::Load("{{ name }}".to_string()),
+                    PgDestCommand::CreateTable("{{ target }}".to_string()),
+                    PgDestCommand::Sql("TRUNCATE TABLE {{ target }};".to_string()),
+                    PgDestCommand::Load("{{ target }}".to_string()),
                 ])
                 .chain(post_sql.into_iter())
                 .collect::<Vec<PgDestCommand>>(),
@@ -215,18 +215,18 @@ impl PgDestination {
                     .map(|(i, k)| format!("{} = ${}", k, i + 1))
                     .collect::<Vec<String>>();
 
-                let mut del_stmt = "DELETE FROM {{ name }} ".to_string();
+                let mut del_stmt = "DELETE FROM {{ target }} ".to_string();
                 del_stmt.push_str(&format!("WHERE {}", keys.join(" AND ")));
 
                 start
                     .chain([
                         PgDestCommand::Sql("CREATE SCHEMA IF NOT EXISTS {{ schema }};".to_string()),
-                        PgDestCommand::CreateTable("{{ name }}".to_string()),
+                        PgDestCommand::CreateTable("{{ target }}".to_string()),
                         PgDestCommand::Prepared(PgPreparedStmt {
                             stmt: del_stmt,
                             keys: del.delete_keys.clone(),
                         }),
-                        PgDestCommand::Load("{{ name }}".to_string()),
+                        PgDestCommand::Load("{{ target }}".to_string()),
                     ])
                     .chain(post_sql.into_iter())
                     .collect::<Vec<PgDestCommand>>()
@@ -234,11 +234,11 @@ impl PgDestination {
             PgDestination::Merge(merge) => start
                 .chain([
                     PgDestCommand::Sql("CREATE SCHEMA IF NOT EXISTS {{ schema }};".to_string()),
-                    PgDestCommand::CreateTable("{{ name }}".to_string()),
+                    PgDestCommand::CreateTable("{{ target }}".to_string()),
                     PgDestCommand::CreateTempTable("{{ load_table_name }}".to_string()),
                     PgDestCommand::Load("{{ load_table_name }}".to_string()),
                     PgDestCommand::Merge(PgMergeConfig {
-                        target: "{{ name }}".to_string(),
+                        target: "{{ target }}".to_string(),
                         source: "{{ load_table_name }}".to_string(),
                         keys: merge.merge_keys.clone(),
                     }),

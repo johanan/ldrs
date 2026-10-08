@@ -9,7 +9,7 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal32Array,
     Decimal64Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array,
     Int64Array, Int8Array, StringArray, StructArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -23,6 +23,7 @@ macro_rules! define_column_accessor {
             )*
 
             // Complex types added manually
+            TimestampSecond(&'a TimestampSecondArray, bool),
             TimestampMillisecond(&'a TimestampMillisecondArray, bool),
             TimestampMicrosecond(&'a TimestampMicrosecondArray, bool),
             TimestampNanosecond(&'a TimestampNanosecondArray, bool),
@@ -41,6 +42,8 @@ macro_rules! define_column_accessor {
                     )*
 
                     // Complex types handled explicitly
+                    DataType::Timestamp(TimeUnit::Second, tz) =>
+                        Self::TimestampSecond(array.as_primitive(), tz.is_some()),
                     DataType::Timestamp(TimeUnit::Millisecond, tz) =>
                         Self::TimestampMillisecond(array.as_primitive(), tz.is_some()),
                     DataType::Timestamp(TimeUnit::Microsecond, tz) =>
@@ -121,6 +124,13 @@ impl<'a> TypedColumnAccessor<'a> {
 
     pub fn as_chrono_naive(&self, row: usize) -> Option<NaiveDateTime> {
         match self {
+            Self::TimestampSecond(arr, _) => {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    arr.value_as_datetime(row)
+                }
+            }
             Self::TimestampMillisecond(arr, _) => {
                 if arr.is_null(row) {
                     None
@@ -148,6 +158,14 @@ impl<'a> TypedColumnAccessor<'a> {
 
     pub unsafe fn as_chrono_tz(&self, row: usize) -> Option<chrono::DateTime<chrono::Utc>> {
         match self {
+            Self::TimestampSecond(arr, _) => {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    let ts = arr.value_unchecked(row);
+                    DateTime::<Utc>::from_timestamp(ts, 0)
+                }
+            }
             Self::TimestampMillisecond(arr, _) => {
                 if arr.is_null(row) {
                     None
