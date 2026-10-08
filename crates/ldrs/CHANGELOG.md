@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.1] - 2026-10-08
+
+### Bug Fixes
+
+- *(delta)* Columns lookup by name
+
+Previously ldrs looked up by index which could be wrong if there was a
+nested column.
+
+Readded stats are now correct when a DV is added.
+
+Merge keys and the watermark columns are checked before anything is
+written or created.
+
+- *(config)* Handlebars properly renders templates
+
+Handlebars was doing HTML escaping but this is not HTML.
+
+- *(postgres)* Many small pg fixes
+
+Postgres now properly uses the target value.
+
+Postgres will properly bind non-typed strings (or loosely typed param
+strings).
+
+Postgres will hand second precision timestamps.
+
+
 ## [0.25.0] - 2026-09-23
 
 ### Bug Fixes

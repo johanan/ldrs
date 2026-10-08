@@ -235,6 +235,7 @@ pub fn setup_handlebars(handle_bars: &mut handlebars::Handlebars) -> () {
         handle_bars.register_helper(name, def);
     }
     handle_bars.set_strict_mode(true);
+    handle_bars.register_escape_fn(handlebars::no_escape);
 }
 
 #[cfg(test)]
@@ -251,6 +252,25 @@ mod helper_tests {
         };
         assert_eq!(render("az://lake/events"), "az://lake/events/x.csv");
         assert_eq!(render("az://lake/events/"), "az://lake/events/x.csv");
+    }
+
+    #[test]
+    fn values_render_unescaped() {
+        let mut hb = handlebars::Handlebars::new();
+        setup_handlebars(&mut hb);
+        let rendered = hb
+            .render_template(
+                "SELECT * FROM read_parquet('{{ url }}') WHERE {{ filter }}",
+                &json!({
+                    "url": "s3://lake/date=2026-01-01/?sv=1&sig=x",
+                    "filter": "\"Name\" = 'a' AND n < 3",
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "SELECT * FROM read_parquet('s3://lake/date=2026-01-01/?sv=1&sig=x') WHERE \"Name\" = 'a' AND n < 3"
+        );
     }
 }
 

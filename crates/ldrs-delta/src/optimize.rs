@@ -10,7 +10,6 @@ use arrow_array::BooleanArray;
 use arrow_schema::{DataType, SchemaRef};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::scan::state::{DvInfo, ScanFile};
-use delta_kernel::schema::{ColumnMetadataKey, MetadataValue};
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::{Engine, Snapshot, Version};
 use futures::{stream, StreamExt, TryStreamExt};
@@ -25,9 +24,9 @@ use uuid::Uuid;
 use crate::features::{
     check_writer_version, files_are_enumerable, rewrite_is_supported, writer_features,
 };
-use crate::stats::{pick_bound, stats_to_scalars};
+use crate::stats::{column_statistics, pick_bound, stats_to_scalars};
 use crate::{
-    build_add, build_engine, file_path, partition_values, snapshot_table_state,
+    build_add, build_engine, file_path, partition_values, physical_name, snapshot_table_state,
     version_to_log_filename, Commit, DeltaRemove, Operation, OperationConfig, TableState,
 };
 
@@ -60,7 +59,10 @@ pub async fn plan_optimize(
 
     // `min_of` searches a file by the name the column is written under, so resolve once here.
     let physical_order = order_column
-        .map(|column| physical_name(&state.snapshot, column))
+        .map(|column| {
+            physical_name(&state.snapshot, column)
+                .with_context(|| format!("cannot order by '{column}'"))
+        })
         .transpose()?;
 
     let files = candidates(std::mem::take(&mut state.active_files), target_size);
@@ -322,37 +324,12 @@ async fn read_candidates(
         .await
 }
 
-/// The name the table's files write `column` under, which column mapping makes a different string
-/// from the one in the schema. Errors when the table has no such column.
-fn physical_name(snapshot: &Snapshot, column: &str) -> Result<String, anyhow::Error> {
-    let schema = snapshot.schema();
-    let field = schema.field(column).ok_or_else(|| {
-        anyhow::anyhow!("cannot order by '{column}': the table has no such column")
-    })?;
-
-    match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
-        Some(MetadataValue::String(physical)) => Ok(physical.clone()),
-        _ => Ok(column.to_string()),
-    }
-}
-
 /// The smallest value of `column` across the file's row groups. `None` when the file does not hold
 /// the column, the writer tracked no statistics for it, or the minimum is a NaN.
 fn min_of(metadata: &ParquetMetaData, column: &str) -> Option<Scalar> {
-    let index = metadata
-        .file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .position(|descriptor| descriptor.name() == column)?;
-
-    let min = metadata
-        .row_groups()
-        .iter()
-        .filter_map(|group| group.column(index).statistics())
-        .fold(None, |min, statistics| {
-            pick_bound(min, stats_to_scalars(statistics).0, Ordering::Less)
-        })?;
+    let min = column_statistics(metadata, column).fold(None, |min, statistics| {
+        pick_bound(min, stats_to_scalars(statistics).0, Ordering::Less)
+    })?;
 
     // Parquet excludes NaN from min/max
     match min {

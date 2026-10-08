@@ -159,6 +159,9 @@ impl<'a> ColumnConverter<'a> {
                         .and_then(|days| NaiveDate::from_num_days_from_ce_opt(days + 719_163)),
                 )
             },
+            ExtractionStrategy::TimestampSeconds => {
+                ExtractedValue::TimestampSeconds(self.accessor.as_chrono_naive(row_idx))
+            }
             ExtractionStrategy::TimestampMillis => {
                 ExtractedValue::TimestampMillis(self.accessor.as_chrono_naive(row_idx))
             }
@@ -168,6 +171,9 @@ impl<'a> ColumnConverter<'a> {
             ExtractionStrategy::TimestampNanos => {
                 ExtractedValue::TimestampNanos(self.accessor.as_chrono_naive(row_idx))
             }
+            ExtractionStrategy::TimestampTzSeconds => unsafe {
+                ExtractedValue::TimestampTzSeconds(self.accessor.as_chrono_tz(row_idx))
+            },
             ExtractionStrategy::TimestampTzMillis => unsafe {
                 ExtractedValue::TimestampTzMillis(self.accessor.as_chrono_tz(row_idx))
             },
@@ -177,7 +183,6 @@ impl<'a> ColumnConverter<'a> {
             ExtractionStrategy::TimestampTzNanos => unsafe {
                 ExtractedValue::TimestampTzNanos(self.accessor.as_chrono_tz(row_idx))
             },
-            _ => panic!("Unsupported conversion strategy: {:?}", self.strategy),
         }
     }
 }

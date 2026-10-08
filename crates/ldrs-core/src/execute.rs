@@ -194,32 +194,34 @@ async fn build_sink(
         }
         DestSpec::Delta(delta) => {
             let table_config = OperationConfig::new(&delta.engine_info);
-            ensure_table(&delta.table_path, &out_schema, &table_config).await?;
+            // each sink is constructed first so it rejects its config before the table is created
             let sink = match delta.mode {
                 DeltaMode::Overwrite {
                     max_rows,
                     max_bytes,
-                } => Sink::DeltaOverwrite(
-                    DeltaOverwriteSink::new(
+                } => {
+                    let sink = DeltaOverwriteSink::new(
                         &delta.table_path,
-                        out_schema,
+                        out_schema.clone(),
                         max_rows,
                         max_bytes,
                         &table_config,
                         cloud_io,
-                    )?,
-                    (target_cols, delta.target, delta.table_path),
-                ),
-                DeltaMode::Merge(merge_config) => Sink::DeltaMerge(
-                    DeltaMergeSink::new(
+                    )?;
+                    ensure_table(&delta.table_path, &out_schema, &table_config).await?;
+                    Sink::DeltaOverwrite(sink, (target_cols, delta.target, delta.table_path))
+                }
+                DeltaMode::Merge(merge_config) => {
+                    let sink = DeltaMergeSink::new(
                         &delta.table_path,
-                        out_schema,
+                        out_schema.clone(),
                         merge_config,
                         &table_config,
                         cloud_io,
-                    )?,
-                    (target_cols, delta.target, delta.table_path),
-                ),
+                    )?;
+                    ensure_table(&delta.table_path, &out_schema, &table_config).await?;
+                    Sink::DeltaMerge(sink, (target_cols, delta.target, delta.table_path))
+                }
             };
             Ok(sink)
         }

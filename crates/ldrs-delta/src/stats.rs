@@ -1,6 +1,12 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
+use anyhow::Context;
+use arrow::array::AsArray;
+use arrow_array::Array;
 use arrow_schema::{DataType, SchemaRef};
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::Scalar;
 use parquet::data_type::AsBytes;
 use parquet::file::metadata::ParquetMetaData;
@@ -17,6 +23,52 @@ pub struct DeltaStats {
     pub num_records: i64,
     pub tight_bounds: bool,
     pub columns: Vec<(String, ColumnStats)>,
+}
+
+/// The logged `add.stats` JSON of every selected file in one scan-output batch, keyed by path.
+pub(crate) fn read_add_stats(
+    scan_files: &FilteredEngineData,
+) -> Result<HashMap<String, Option<String>>, anyhow::Error> {
+    let batch = scan_files
+        .data()
+        .any_ref()
+        .downcast_ref::<ArrowEngineData>()
+        .ok_or_else(|| anyhow::anyhow!("scan output was not ArrowEngineData"))?
+        .record_batch();
+    let selection = scan_files.selection_vector();
+
+    let paths = batch
+        .column_by_name("path")
+        .map(|c| c.as_string::<i32>())
+        .ok_or_else(|| anyhow::anyhow!("scan row schema has no path column"))?;
+    let stats = batch
+        .column_by_name("stats")
+        .map(|c| c.as_string::<i32>())
+        .ok_or_else(|| anyhow::anyhow!("scan row schema has no stats column"))?;
+
+    let mut out = HashMap::new();
+    for row in 0..batch.num_rows() {
+        // selection vector may be shorter than the batch; a missing tail entry means selected
+        if !selection.get(row).copied().unwrap_or(true) {
+            continue;
+        }
+        out.insert(
+            paths.value(row).to_string(),
+            (!stats.is_null(row)).then(|| stats.value(row).to_string()),
+        );
+    }
+    Ok(out)
+}
+
+pub(crate) fn widen_stats(logged: &str, num_records: i64) -> Result<String, anyhow::Error> {
+    let mut stats: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(logged).with_context(|| "logged add.stats is not a JSON object")?;
+    stats.insert(
+        "numRecords".to_string(),
+        serde_json::Value::from(num_records),
+    );
+    stats.insert("tightBounds".to_string(), serde_json::Value::Bool(false));
+    Ok(serde_json::to_string(&stats)?)
 }
 
 pub(crate) fn stats_to_scalars(stats: &Statistics) -> (Option<Scalar>, Option<Scalar>) {
@@ -243,14 +295,10 @@ fn scalar_to_i64(scalar: &Scalar) -> Result<i64, anyhow::Error> {
 pub(crate) fn max_stat_as_i64(
     source_files: &[(String, ParquetMetaData, u64)],
     col_name: &str,
-    schema: &SchemaRef,
 ) -> Result<i64, anyhow::Error> {
-    let col_idx = schema.index_of(col_name)?;
-
     let max_scalar = source_files
         .iter()
-        .flat_map(|(_, m, _)| m.row_groups())
-        .filter_map(|rg| rg.column(col_idx).statistics())
+        .flat_map(|(_, m, _)| column_statistics(m, col_name))
         .fold(None, |acc, stats| {
             let (_, new_max) = stats_to_scalars(stats);
             pick_bound(acc, new_max, Ordering::Greater)
@@ -265,13 +313,11 @@ pub(crate) fn key_bounds_as_scalars(
     key_col_name: &str,
     schema: &SchemaRef,
 ) -> Option<(Scalar, Scalar)> {
-    let col_idx = schema.index_of(key_col_name).ok()?;
-    let data_type = schema.field(col_idx).data_type();
+    let data_type = schema.field_with_name(key_col_name).ok()?.data_type();
 
     let (min, max) = source_files
         .iter()
-        .flat_map(|(_, m, _)| m.row_groups())
-        .filter_map(|rg| rg.column(col_idx).statistics())
+        .flat_map(|(_, m, _)| column_statistics(m, key_col_name))
         .fold(None, |acc, stats| {
             let (new_min, new_max) = stats_to_scalars(stats);
             match acc {
@@ -289,16 +335,39 @@ pub(crate) fn key_bounds_as_scalars(
     ))
 }
 
+/// Position of top-level `column` among the file's leaf columns
+pub(crate) fn leaf_index(metadata: &ParquetMetaData, column: &str) -> Option<usize> {
+    metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|descriptor| descriptor.path().parts() == [column])
+}
+
+/// The statistics each row group recorded for top-level `column`
+pub(crate) fn column_statistics<'a>(
+    metadata: &'a ParquetMetaData,
+    column: &str,
+) -> impl Iterator<Item = &'a Statistics> + 'a {
+    let index = leaf_index(metadata, column);
+    metadata
+        .row_groups()
+        .iter()
+        .filter_map(move |rg| index.and_then(|i| rg.column(i).statistics()))
+}
+
+/// Row groups whose stats on `column` overlap the key range.
+/// A file that does not hold the column keeps every row group.
 pub(crate) fn select_row_groups_by_scalars(
     metadata: &ParquetMetaData,
-    key_col_name: &str,
-    schema: &SchemaRef,
+    column: &str,
     min_key: &Scalar,
     max_key: &Scalar,
 ) -> Vec<usize> {
-    let col_idx = match schema.index_of(key_col_name) {
-        Ok(idx) => idx,
-        Err(_) => return (0..metadata.num_row_groups()).collect(),
+    let col_idx = match leaf_index(metadata, column) {
+        Some(idx) => idx,
+        None => return (0..metadata.num_row_groups()).collect(),
     };
 
     metadata
@@ -333,31 +402,29 @@ pub fn parquet_metadata_to_delta_stats(
 ) -> DeltaStats {
     let num_records: i64 = metadata.row_groups().iter().map(|rg| rg.num_rows()).sum();
 
-    let columns: Vec<(String, ColumnStats)> = (0..schema.fields().len())
-        .map(|col_idx| {
-            let col_name = schema.field(col_idx).name().clone();
+    let columns: Vec<(String, ColumnStats)> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let col_name = field.name().clone();
 
-            let stats = metadata
-                .row_groups()
-                .iter()
-                .filter_map(|rg| rg.column(col_idx).statistics())
-                .fold(
+            let stats = column_statistics(metadata, &col_name).fold(
+                ColumnStats {
+                    null_count: 0,
+                    min: None,
+                    max: None,
+                    tight_bounds: true,
+                },
+                |acc, s| {
+                    let (new_min, new_max) = stats_to_scalars(s);
                     ColumnStats {
-                        null_count: 0,
-                        min: None,
-                        max: None,
-                        tight_bounds: true,
-                    },
-                    |acc, s| {
-                        let (new_min, new_max) = stats_to_scalars(s);
-                        ColumnStats {
-                            null_count: acc.null_count + s.null_count_opt().unwrap_or(0) as i64,
-                            min: pick_bound(acc.min, new_min, Ordering::Less),
-                            max: pick_bound(acc.max, new_max, Ordering::Greater),
-                            tight_bounds: acc.tight_bounds && s.min_is_exact() && s.max_is_exact(),
-                        }
-                    },
-                );
+                        null_count: acc.null_count + s.null_count_opt().unwrap_or(0) as i64,
+                        min: pick_bound(acc.min, new_min, Ordering::Less),
+                        max: pick_bound(acc.max, new_max, Ordering::Greater),
+                        tight_bounds: acc.tight_bounds && s.min_is_exact() && s.max_is_exact(),
+                    }
+                },
+            );
 
             (col_name, stats)
         })
@@ -458,6 +525,80 @@ mod tests {
         assert_eq!(
             scalar_to_json_value(&Scalar::Integer(42), &DataType::Float64),
             None
+        );
+    }
+
+    fn metadata_from_batch(batch: &arrow_array::RecordBatch) -> ParquetMetaData {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&bytes::Bytes::from(buf))
+            .unwrap()
+    }
+
+    #[test]
+    fn leaf_index_counts_the_leaves_of_a_struct_before_the_column() {
+        use arrow_array::{ArrayRef, Int64Array, StructArray};
+        use arrow_schema::{Field, Fields, Schema};
+        use std::sync::Arc;
+
+        // `nested` has two leaves, so top-level `id` is field 1 but leaf 2
+        let inner = Fields::from(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]);
+        let nested = StructArray::new(
+            inner.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+            ],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("nested", DataType::Struct(inner), true),
+            Field::new("id", DataType::Int64, true),
+        ]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(nested), Arc::new(Int64Array::from(vec![3]))],
+        )
+        .unwrap();
+        let metadata = metadata_from_batch(&batch);
+
+        // the nested `nested.id` leaf does not answer for top-level `id`
+        assert_eq!(leaf_index(&metadata, "id"), Some(2));
+        assert_eq!(leaf_index(&metadata, "b"), None);
+        assert_eq!(leaf_index(&metadata, "missing"), None);
+    }
+
+    #[test]
+    fn widen_stats_keeps_the_column_stats_and_widens_the_bounds() {
+        let logged = r#"{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":10},"nullCount":{"id":0},"tightBounds":true}"#;
+        let stats: serde_json::Value =
+            serde_json::from_str(&widen_stats(logged, 10).unwrap()).unwrap();
+        assert_eq!(
+            stats,
+            json!({
+                "numRecords": 10,
+                "minValues": {"id": 1},
+                "maxValues": {"id": 10},
+                "nullCount": {"id": 0},
+                "tightBounds": false,
+            })
+        );
+    }
+
+    #[test]
+    fn widen_stats_writes_the_physical_row_count() {
+        let stats: serde_json::Value =
+            serde_json::from_str(&widen_stats(r#"{"minValues":{"id":1}}"#, 7).unwrap()).unwrap();
+        assert_eq!(
+            stats,
+            json!({"minValues": {"id": 1}, "numRecords": 7, "tightBounds": false})
         );
     }
 }

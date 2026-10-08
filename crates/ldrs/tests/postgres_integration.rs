@@ -690,3 +690,292 @@ tables:
         .batch_execute("DROP SCHEMA IF EXISTS public_test_dates CASCADE")
         .await;
 }
+
+/// `drop_replace` with a `target` replaces the target and leaves the table at `name` alone
+#[tokio::test]
+#[test_log::test]
+async fn drop_replace_with_a_target_never_touches_the_named_table() {
+    let file_url = data_url();
+    let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), file_url),
+        ("LDRS_DEST".to_string(), pg_url.to_string()),
+    ];
+
+    let config = "
+src: file
+
+tables:
+  - name: public_test_target_dr.users
+    filename: public.users/public.users.snappy.parquet
+    destinations:
+      - dest: pg.drop_replace
+        target: public_test_target_dr.renamed
+";
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let client = create_connection(pg_url).await.unwrap();
+    client
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS public_test_target_dr CASCADE;
+             CREATE SCHEMA public_test_target_dr;
+             CREATE TABLE public_test_target_dr.users (sentinel int);
+             INSERT INTO public_test_target_dr.users VALUES (1);",
+        )
+        .await
+        .unwrap();
+
+    for run in 1..=2 {
+        let ex = execute_configs(
+            parse_tables(
+                &serde_yaml::from_str(&config).unwrap(),
+                infer_env_type("LDRS_SRC", &ldrs_env),
+            )
+            .unwrap(),
+            None,
+            &ldrs_env,
+            rt.handle(),
+            &Results::default(),
+        )
+        .await;
+        assert!(ex.is_ok(), "run {run} should succeed: {:?}", ex.err());
+    }
+
+    let rows = client
+        .query("SELECT * FROM public_test_target_dr.renamed", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "the target should hold one load's rows");
+    let sentinel: i32 = client
+        .query_one("SELECT sentinel FROM public_test_target_dr.users", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(sentinel, 1, "the table at `name` should be untouched");
+
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_target_dr CASCADE")
+        .await;
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+/// `truncate_insert` with a `target` loads into the target and creates nothing at `name`.
+#[tokio::test]
+#[test_log::test]
+async fn truncate_insert_with_a_target_loads_into_the_target() {
+    let file_url = data_url();
+    let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), file_url),
+        ("LDRS_DEST".to_string(), pg_url.to_string()),
+    ];
+
+    let config = "
+src: file
+
+tables:
+  - name: public_test_target_ti.users
+    filename: public.users/public.users.snappy.parquet
+    destinations:
+      - dest: pg.truncate_insert
+        target: public_test_target_ti.renamed
+";
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let client = create_connection(pg_url).await.unwrap();
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_target_ti CASCADE")
+        .await;
+
+    let ex = execute_configs(
+        parse_tables(
+            &serde_yaml::from_str(&config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
+        None,
+        &ldrs_env,
+        rt.handle(),
+        &Results::default(),
+    )
+    .await;
+    assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
+
+    let rows = client
+        .query("SELECT * FROM public_test_target_ti.renamed", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "data should land at the target table");
+    let named: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = 'public_test_target_ti' AND table_name = 'users')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!named, "no table should be created at `name`");
+
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_target_ti CASCADE")
+        .await;
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+/// A delete key on a `date` column binds its param and deletes only that date's rows.
+#[tokio::test]
+#[test_log::test]
+async fn delete_insert_on_a_date_key_replaces_that_date() {
+    let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+    let ldrs_env = vec![
+        ("LDRS_DEST".to_string(), pg_url.to_string()),
+        ("LDRS_PARAM_LOAD_DATE".to_string(), "2024-06-01".to_string()),
+    ];
+    let config = "
+src: duckdb.query
+
+tables:
+  - name: public_test_del_date.events
+    sql: SELECT i::INTEGER AS id, DATE '2024-06-01' AS load_date FROM range(3) t(i)
+    destinations:
+      - dest: pg.delete_insert
+        delete_keys: [load_date]
+";
+
+    let client = create_connection(pg_url).await.unwrap();
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_del_date CASCADE")
+        .await;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    for run in 1..=2 {
+        let ex = execute_configs(
+            parse_tables(
+                &serde_yaml::from_str(config).unwrap(),
+                infer_env_type("LDRS_SRC", &ldrs_env),
+            )
+            .unwrap(),
+            None,
+            &ldrs_env,
+            rt.handle(),
+            &Results::default(),
+        )
+        .await;
+        assert!(ex.is_ok(), "run {run} should succeed: {:?}", ex.err());
+        if run == 1 {
+            client
+                .batch_execute(
+                    "INSERT INTO public_test_del_date.events VALUES (99, DATE '2024-05-31')",
+                )
+                .await
+                .unwrap();
+        }
+    }
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+
+    let rows = client
+        .query(
+            "SELECT load_date, count(*) FROM public_test_del_date.events \
+             GROUP BY load_date ORDER BY load_date",
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<(chrono::NaiveDate, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        got,
+        vec![
+            (chrono::NaiveDate::from_ymd_opt(2024, 5, 31).unwrap(), 1),
+            (chrono::NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(), 3),
+        ],
+        "the second run replaces 2024-06-01 and keeps the other date"
+    );
+
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_del_date CASCADE")
+        .await;
+}
+
+/// A `time_unit: Second` override truncates to the second and loads into postgres.
+#[tokio::test]
+#[test_log::test]
+async fn second_precision_timestamps_load() {
+    let pg_url = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+    let ldrs_env = vec![("LDRS_DEST".to_string(), pg_url.to_string())];
+    let config = "
+src: duckdb.query
+destinations:
+  - dest: pg.drop_replace
+
+tables:
+  - name: public_test_seconds.stamps
+    columns:
+      - { name: c_ts, type: timestamp, time_unit: Second }
+      - { name: c_tstz, type: timestamptz, time_unit: Second }
+    sql: |
+      SELECT
+        TIMESTAMP '2024-06-01 12:34:56.789' AS c_ts,
+        TIMESTAMPTZ '2024-06-01 12:34:56.789+00' AS c_tstz
+";
+
+    let client = create_connection(pg_url).await.unwrap();
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_seconds CASCADE")
+        .await;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let ex = execute_configs(
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
+        None,
+        &ldrs_env,
+        rt.handle(),
+        &Results::default(),
+    )
+    .await;
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+    assert!(ex.is_ok(), "ldrs exec should succeed: {:?}", ex.err());
+
+    let row = client
+        .query_one("SELECT c_ts, c_tstz FROM public_test_seconds.stamps", &[])
+        .await
+        .unwrap();
+    let expected = chrono::NaiveDate::from_ymd_opt(2024, 6, 1)
+        .unwrap()
+        .and_hms_opt(12, 34, 56)
+        .unwrap();
+    let c_ts: chrono::NaiveDateTime = row.get(0);
+    let c_tstz: chrono::DateTime<chrono::Utc> = row.get(1);
+    assert_eq!(c_ts, expected, "timestamp truncated to the second");
+    assert_eq!(
+        c_tstz,
+        expected.and_utc(),
+        "timestamptz truncated to the second"
+    );
+
+    let _ = client
+        .batch_execute("DROP SCHEMA IF EXISTS public_test_seconds CASCADE")
+        .await;
+}

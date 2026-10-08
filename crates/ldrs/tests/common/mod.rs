@@ -20,9 +20,15 @@ pub async fn overwrite_delta<S>(
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
+    let mut sink = DeltaOverwriteSink::new(
+        table_path,
+        schema.clone(),
+        max_rows,
+        max_bytes,
+        config,
+        cloud_io,
+    )?;
     ensure_table(table_path, &schema, config).await?;
-    let mut sink =
-        DeltaOverwriteSink::new(table_path, schema, max_rows, max_bytes, config, cloud_io)?;
     let mut stream = std::pin::pin!(stream);
     while let Some(batch) = stream.next().await {
         sink.write_batch(&batch?).await?;
@@ -43,8 +49,8 @@ pub async fn merge_delta<S>(
 where
     S: Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
 {
+    let mut sink = DeltaMergeSink::new(table_path, schema.clone(), merge_config, config, cloud_io)?;
     ensure_table(table_path, &schema, config).await?;
-    let mut sink = DeltaMergeSink::new(table_path, schema, merge_config, config, cloud_io)?;
     let mut stream = std::pin::pin!(stream);
     while let Some(batch) = stream.next().await {
         sink.write_batch(&batch?).await?;

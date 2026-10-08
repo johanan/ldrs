@@ -1,6 +1,7 @@
 use anyhow::Context;
+use bytes::{BufMut, BytesMut};
 use ldrs_arrow::{ColumnSpec, ColumnType};
-use postgres_types::ToSql;
+use postgres_types::{to_sql_checked, Format, IsNull, ToSql, Type};
 use tokio_postgres::Client;
 
 pub fn map_colspec_to_pg_ddl(pq: &ColumnSpec) -> String {
@@ -41,8 +42,8 @@ pub async fn execute_prepared_stmt(
     cols: &[ColumnSpec],
 ) -> Result<(), anyhow::Error> {
     // Type each bind from the target columns by name. The table's columns are the resolved
-    // schema, so a bound key is present by definition; an unmatched name has no type and binds
-    // as text (its string value passes through unchanged).
+    // schema, so a bound key is present by definition. A type with no typed arm, or an unmatched
+    // name, goes to the server as text and is parsed as the column's type there.
     let typed: Vec<(&String, Option<ColumnType>)> = params
         .iter()
         .map(|(name, value)| {
@@ -182,10 +183,36 @@ fn param_tosql<'a>(
                 .parse::<uuid::Uuid>()
                 .map(|v| Box::new(v) as Box<dyn ToSql + Sync>)
                 .map_err(|e| anyhow::anyhow!("Failed to parse Uuid: {}", e)),
-            _ => Ok(Box::new(value)),
+            _ => Ok(Box::new(PgText(value))),
         },
-        (value, None) => Ok(Box::new(value)),
+        (value, None) => Ok(Box::new(PgText(value))),
     }
+}
+
+/// A bind sent in Postgres text format, so the server parses it with the column type's own input
+/// function instead of requiring that type's binary encoding.
+#[derive(Debug)]
+struct PgText<'a>(&'a str);
+
+impl ToSql for PgText<'_> {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.put_slice(self.0.as_bytes());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    fn encode_format(&self, _ty: &Type) -> Format {
+        Format::Text
+    }
+
+    to_sql_checked!();
 }
 
 #[cfg(test)]
