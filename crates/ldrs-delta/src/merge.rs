@@ -21,15 +21,15 @@ use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::{
-    build_add, build_engine, checkpoint_interval, cleanup_source_files, file_path,
+    build_add, build_engine, checkpoint_interval, cleanup_source_files, file_path, physical_name,
     should_checkpoint, version_to_log_filename, write_checkpoint, Commit, DeltaRemove, DeltaTxn,
     Operation, OperationConfig, MERGE_MAX_RETRIES,
 };
 
 use super::dv::{build_dv_file, build_dv_inline, serialize_dv};
 use super::stats::{
-    delta_stats_to_json, key_bounds_as_scalars, max_stat_as_i64, parquet_metadata_to_delta_stats,
-    select_row_groups_by_scalars,
+    column_statistics, key_bounds_as_scalars, max_stat_as_i64, read_add_stats,
+    select_row_groups_by_scalars, widen_stats,
 };
 use delta_kernel::expressions::{Expression as Expr, Predicate as Pred};
 use delta_kernel::scan::state::ScanFile;
@@ -155,29 +155,15 @@ pub(crate) async fn build_key_set(
 pub(crate) fn validate_no_null_keys(
     source_files: &[(String, ParquetMetaData, u64)],
     merge_keys: &[String],
-    schema: &SchemaRef,
 ) -> Result<(), anyhow::Error> {
-    // Resolve indices up-front — fails with a clean error if a merge key
-    // isn't in the schema (instead of panicking inside the iterator).
-    let key_indices: Vec<(usize, &str)> = merge_keys
-        .iter()
-        .map(|k| schema.index_of(k).map(|idx| (idx, k.as_str())))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let null_key = source_files
-        .iter()
-        .flat_map(|(_, metadata, _)| metadata.row_groups())
-        .flat_map(|rg| {
-            key_indices.iter().map(move |(idx, name)| {
-                let null_count = rg
-                    .column(*idx)
-                    .statistics()
-                    .and_then(|s| s.null_count_opt())
-                    .unwrap_or(0);
-                (*name, null_count)
-            })
-        })
-        .find(|(_, count)| *count > 0);
+    let null_key = merge_keys.iter().find_map(|key| {
+        source_files
+            .iter()
+            .flat_map(|(_, metadata, _)| column_statistics(metadata, key))
+            .filter_map(|s| s.null_count_opt())
+            .find(|count| *count > 0)
+            .map(|count| (key, count))
+    });
 
     if let Some((col, count)) = null_key {
         anyhow::bail!("merge key '{}' contains {} null values", col, count);
@@ -210,6 +196,21 @@ impl DeltaMergeSink {
         cloud_io: &Handle,
     ) -> Result<Self, anyhow::Error> {
         crate::refuse_non_micros_timestamps(&schema)?;
+        for key in &merge_config.merge_keys {
+            if schema.column_with_name(key).is_none() {
+                anyhow::bail!("merge key '{key}' is not a column of the source");
+            }
+        }
+        if let TxnConfig::SourceWatermark {
+            watermark_column, ..
+        } = &merge_config.txn_config
+        {
+            if schema.column_with_name(watermark_column).is_none() {
+                anyhow::bail!(
+                    "watermark column '{watermark_column}' is not a column of the source"
+                );
+            }
+        }
         let url = base_or_relative_path(table_path)?;
         let bloom_columns: Vec<Vec<String>> = merge_config
             .merge_keys
@@ -305,7 +306,7 @@ async fn commit_merge(
     source_files: &[(String, ParquetMetaData, u64)],
 ) -> Result<MergeStats, anyhow::Error> {
     if !merge_config.allow_null_keys {
-        validate_no_null_keys(source_files, &merge_config.merge_keys, schema)?;
+        validate_no_null_keys(source_files, &merge_config.merge_keys)?;
     }
 
     let (key_set, converter) = build_key_set(
@@ -322,8 +323,7 @@ async fn commit_merge(
     // watermark column (read written parquets and get max)
     // or an abitrary value that defaults to now
     // or None
-    let (app_id, batch_version) =
-        compute_batch_version(&merge_config.txn_config, source_files, schema)?;
+    let (app_id, batch_version) = compute_batch_version(&merge_config.txn_config, source_files)?;
 
     let table_url = kernel_url(url)?;
 
@@ -341,8 +341,17 @@ async fn commit_merge(
             }
         }
 
+        let physical_keys = merge_config
+            .merge_keys
+            .iter()
+            .map(|key| {
+                physical_name(&snapshot, key)
+                    .with_context(|| format!("cannot merge on key '{key}'"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         // find candidate target files whose stats overlap the source's key range on the first merge key
-        let (candidate_files, existing_dvs) = find_candidate_target_files(
+        let (candidate_files, existing_dvs, existing_stats) = find_candidate_target_files(
             &snapshot,
             engine.as_ref(),
             schema,
@@ -358,6 +367,7 @@ async fn commit_merge(
             schema,
             source_files,
             &merge_config.merge_keys,
+            &physical_keys,
         )
         .await?;
 
@@ -425,8 +435,18 @@ async fn commit_merge(
                 _ => build_dv_file(store.as_ref(), base_path, &dv_bytes, cardinality).await?,
             };
 
-            let file_stats = parquet_metadata_to_delta_stats(&fm.metadata, schema);
-            let stats_json = delta_stats_to_json(&file_stats, schema)?;
+            let num_records = fm.metadata.file_metadata().num_rows();
+            let stats_json = match existing_stats
+                .get(&fm.scan_file.path)
+                .and_then(|logged| logged.as_deref())
+            {
+                Some(logged) => widen_stats(logged, num_records)?,
+                None => serde_json::json!({
+                    "numRecords": num_records,
+                    "tightBounds": false,
+                })
+                .to_string(),
+            };
 
             adds_with_dvs.push(super::DeltaAdd {
                 path: fm.scan_file.path.clone(),
@@ -631,6 +651,7 @@ async fn narrow_to_eligible_row_groups(
     schema: &SchemaRef,
     source_files: &[(String, ParquetMetaData, u64)],
     merge_keys: &[String],
+    physical_keys: &[String],
 ) -> Result<Vec<FileProbe>, anyhow::Error> {
     let mut file_probes: Vec<FileProbe> = Vec::new();
 
@@ -647,17 +668,12 @@ async fn narrow_to_eligible_row_groups(
 
         let mut eligible_rgs: Vec<usize> = (0..metadata.num_row_groups()).collect();
 
-        for key_name in merge_keys {
+        for (key_name, physical) in merge_keys.iter().zip(physical_keys) {
             if let Some((min_scalar, max_scalar)) =
                 key_bounds_as_scalars(source_files, key_name, schema)
             {
-                let key_eligible = select_row_groups_by_scalars(
-                    &metadata,
-                    key_name,
-                    schema,
-                    &min_scalar,
-                    &max_scalar,
-                );
+                let key_eligible =
+                    select_row_groups_by_scalars(&metadata, physical, &min_scalar, &max_scalar);
                 eligible_rgs.retain(|rg| key_eligible.contains(rg));
                 if eligible_rgs.is_empty() {
                     break;
@@ -684,14 +700,13 @@ async fn narrow_to_eligible_row_groups(
 fn compute_batch_version(
     txn_config: &TxnConfig,
     source_files: &[(String, ParquetMetaData, u64)],
-    schema: &SchemaRef,
 ) -> Result<(Option<String>, Option<i64>), anyhow::Error> {
     match txn_config {
         TxnConfig::SourceWatermark {
             app_id,
             watermark_column,
         } => {
-            let wm = max_stat_as_i64(source_files, watermark_column, schema)?;
+            let wm = max_stat_as_i64(source_files, watermark_column)?;
             Ok((Some(app_id.clone()), Some(wm)))
         }
         TxnConfig::ProcessingTime {
@@ -719,6 +734,7 @@ fn find_candidate_target_files(
     (
         Vec<ScanFile>,
         HashMap<String, super::dv::DeletionVectorDescriptor>,
+        HashMap<String, Option<String>>,
     ),
     anyhow::Error,
 > {
@@ -741,6 +757,7 @@ fn find_candidate_target_files(
 
     let mut candidate_files: Vec<ScanFile> = Vec::new();
     let mut existing_dvs: HashMap<String, super::dv::DeletionVectorDescriptor> = HashMap::new();
+    let mut existing_stats: HashMap<String, Option<String>> = HashMap::new();
     for scan_meta in scan.scan_metadata(engine)? {
         let scan_meta = scan_meta?;
         fn collect(acc: &mut Vec<ScanFile>, file: ScanFile) {
@@ -750,8 +767,9 @@ fn find_candidate_target_files(
         // `DvInfo` hides the descriptor; read it off the same batch's `deletionVector` column.
         candidate_files = scan_meta.visit_scan_files(candidate_files, collect)?;
         existing_dvs.extend(super::dv::read_existing_dvs(&scan_meta.scan_files)?);
+        existing_stats.extend(read_add_stats(&scan_meta.scan_files)?);
     }
-    Ok((candidate_files, existing_dvs))
+    Ok((candidate_files, existing_dvs, existing_stats))
 }
 
 /// Read the as-stored `deletionVector` descriptors off one scan-output batch, keyed by file path.
@@ -799,7 +817,7 @@ mod tests {
             metadata_from_batch(&batch),
             0u64,
         )];
-        validate_no_null_keys(&source_files, &["id".to_string()], &schema).unwrap();
+        validate_no_null_keys(&source_files, &["id".to_string()]).unwrap();
     }
 
     #[test]
@@ -823,21 +841,10 @@ mod tests {
             0u64,
         )];
 
-        let err = validate_no_null_keys(&source_files, &["id".to_string()], &schema)
+        let err = validate_no_null_keys(&source_files, &["id".to_string()])
             .expect_err("should error on null keys");
         let msg = err.to_string();
         assert!(msg.contains("merge key 'id'"), "got: {msg}");
         assert!(msg.contains("null"), "got: {msg}");
-    }
-
-    #[test]
-    fn validate_no_null_keys_errors_on_unknown_key_name() {
-        let schema = two_col_schema();
-        let err = validate_no_null_keys(&[], &["does_not_exist".to_string()], &schema)
-            .expect_err("should error on unknown merge key");
-        assert!(
-            err.to_string().contains("does_not_exist"),
-            "error should mention the missing column; got: {err}"
-        );
     }
 }

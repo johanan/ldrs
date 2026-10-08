@@ -5,9 +5,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use arrow_schema::SchemaRef;
 use delta_kernel::scan::state::ScanFile;
-use delta_kernel::schema::{DataType as DeltaDataType, StructField, StructType};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType as DeltaDataType, MetadataValue, StructField, StructType,
+};
 use delta_kernel::snapshot::CheckpointWriteResult;
-use delta_kernel::table_features::TableFeature;
+use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::{Engine, Snapshot, SnapshotRef, Version};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngineBuilder;
@@ -886,6 +888,26 @@ fn file_path(
         anyhow::anyhow!("references the absolute path {log_path}, which is outside the table root")
     })?;
     Ok(join_store_path(base_path, &relative))
+}
+
+/// The name the table's files write `column` under, which column mapping makes a different string
+/// from the one in the schema. Mode `none` ignores a stale annotation, as kernel does.
+fn physical_name(snapshot: &Snapshot, column: &str) -> Result<String, anyhow::Error> {
+    let schema = snapshot.schema();
+    let field = schema
+        .field(column)
+        .ok_or_else(|| anyhow::anyhow!("table has no column '{column}'"))?;
+
+    match (
+        snapshot.table_properties().column_mapping_mode,
+        field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+    ) {
+        (
+            Some(ColumnMappingMode::Id | ColumnMappingMode::Name),
+            Some(MetadataValue::String(physical)),
+        ) => Ok(physical.clone()),
+        _ => Ok(column.to_string()),
+    }
 }
 
 fn version_to_log_filename(version: Version) -> String {

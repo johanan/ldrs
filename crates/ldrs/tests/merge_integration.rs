@@ -1588,3 +1588,189 @@ async fn test_overwrite_after_merge_retires_deletion_vectored_files() {
 
     assert_eq!(duckdb_count(&table_path), "100");
 }
+
+// The key sits at a different position in the source than in the target file
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_merge_matches_a_reordered_source_by_name() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path = test_table_path("reordered_source");
+    cleanup_table(&table_path);
+    let table_url = format!("file://{}/", table_path);
+
+    overwrite_delta(
+        &table_url,
+        test_schema(),
+        stream::iter(vec![Ok(make_target_batch(1..101))]),
+        None,
+        None,
+        &OperationConfig::new("ldrs-test"),
+        &rt,
+    )
+    .await
+    .unwrap();
+
+    // [name, value, updated_at, id]
+    let source = make_source_batch(50..61).project(&[2, 1, 3, 0]).unwrap();
+    let stats = merge_delta(
+        &table_url,
+        source.schema(),
+        stream::iter(vec![Ok(source)]),
+        MergeConfig {
+            merge_keys: vec!["id".to_string()],
+            allow_null_keys: false,
+            max_rows: None,
+            max_bytes: None,
+            txn_config: TxnConfig::None,
+            inline_deletion_vectors: false,
+        },
+        &OperationConfig::new("ldrs-test"),
+        &rt,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(stats.matched_rows, 11, "ids 50..=60 should match");
+    assert_eq!(duckdb_count(&table_path), "100");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_merge_keeps_the_logged_stats_on_a_readded_file() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path = test_table_path("readded_stats");
+    cleanup_table(&table_path);
+    let table_url = format!("file://{}/", table_path);
+
+    overwrite_delta(
+        &table_url,
+        test_schema(),
+        stream::iter(vec![Ok(make_target_batch(1..101))]),
+        None,
+        None,
+        &OperationConfig::new("ldrs-test"),
+        &rt,
+    )
+    .await
+    .unwrap();
+    let overwrite_actions = read_log_actions(&table_path, latest_version(&table_path));
+    let logged = find_action(&overwrite_actions, "add").expect("overwrite should add a file");
+    let mut expected: serde_json::Value =
+        serde_json::from_str(logged["stats"].as_str().unwrap()).unwrap();
+    expected["tightBounds"] = serde_json::Value::Bool(false);
+
+    merge_delta(
+        &table_url,
+        test_schema(),
+        stream::iter(vec![Ok(make_source_batch(50..61))]),
+        MergeConfig {
+            merge_keys: vec!["id".to_string()],
+            allow_null_keys: false,
+            max_rows: None,
+            max_bytes: None,
+            txn_config: TxnConfig::None,
+            inline_deletion_vectors: false,
+        },
+        &OperationConfig::new("ldrs-test"),
+        &rt,
+    )
+    .await
+    .unwrap();
+
+    let merge_actions = read_log_actions(&table_path, latest_version(&table_path));
+    let readded = merge_actions
+        .iter()
+        .filter_map(|action| action.get("add"))
+        .find(|add| add.get("deletionVector").is_some())
+        .expect("the matched file should be re-added with a DV");
+    let readded_stats: serde_json::Value =
+        serde_json::from_str(readded["stats"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        readded_stats, expected,
+        "the re-added file keeps its logged stats with tightBounds false"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_merge_source_wider_than_the_target_file() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path = test_table_path("wider_source");
+    cleanup_table(&table_path);
+    let table_url = format!("file://{}/", table_path);
+
+    // [id, value]
+    let target = make_target_batch(1..101).project(&[0, 1]).unwrap();
+    overwrite_delta(
+        &table_url,
+        target.schema(),
+        stream::iter(vec![Ok(target)]),
+        None,
+        None,
+        &OperationConfig::new("ldrs-test"),
+        &rt,
+    )
+    .await
+    .unwrap();
+
+    let stats = merge_delta(
+        &table_url,
+        test_schema(),
+        stream::iter(vec![Ok(make_source_batch(50..61))]),
+        MergeConfig {
+            merge_keys: vec!["id".to_string()],
+            allow_null_keys: false,
+            max_rows: None,
+            max_bytes: None,
+            txn_config: TxnConfig::None,
+            inline_deletion_vectors: false,
+        },
+        &OperationConfig::new("ldrs-test"),
+        &rt,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(stats.matched_rows, 11, "ids 50..=60 should match");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_merge_key_missing_from_the_source_fails_before_the_table_exists() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path = test_table_path("missing_key");
+    cleanup_table(&table_path);
+    let table_url = format!("file://{}/", table_path);
+
+    let result = merge_delta(
+        &table_url,
+        test_schema(),
+        stream::iter(vec![Ok(make_source_batch(1..11))]),
+        MergeConfig {
+            merge_keys: vec!["does_not_exist".to_string()],
+            allow_null_keys: false,
+            max_rows: None,
+            max_bytes: None,
+            txn_config: TxnConfig::None,
+            inline_deletion_vectors: false,
+        },
+        &OperationConfig::new("ldrs-test"),
+        &rt,
+    )
+    .await;
+    let err = match result {
+        Ok(_) => panic!("a merge key the source does not have should fail"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("does_not_exist"),
+        "error should name the missing key; got: {err}"
+    );
+    assert!(
+        !std::path::Path::new(&table_path)
+            .join("_delta_log")
+            .exists(),
+        "the table should not be created"
+    );
+}
