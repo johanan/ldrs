@@ -390,7 +390,7 @@ pub async fn execute_configs(
         let elapsed_ms = (task_end - task_start).as_millis() as u64;
         match &outcome {
             Ok(rows) => info!(name = %task_name, rows, elapsed_ms, "Task completed"),
-            Err(e) => error!(name = %task_name, elapsed_ms, "{e}"),
+            Err(e) => error!(name = %task_name, elapsed_ms, "{e:#}"),
         }
         outcomes.push((task_name, outcome));
     }
