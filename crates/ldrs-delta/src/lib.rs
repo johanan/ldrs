@@ -5,11 +5,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use arrow_schema::SchemaRef;
 use delta_kernel::scan::state::ScanFile;
-use delta_kernel::schema::{
-    ColumnMetadataKey, DataType as DeltaDataType, MetadataValue, StructField, StructType,
-};
+use delta_kernel::schema::{DataType as DeltaDataType, StructField, StructType};
 use delta_kernel::snapshot::CheckpointWriteResult;
-use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
+use delta_kernel::table_features::TableFeature;
 use delta_kernel::{Engine, Snapshot, SnapshotRef, Version};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngineBuilder;
@@ -897,17 +895,8 @@ fn physical_name(snapshot: &Snapshot, column: &str) -> Result<String, anyhow::Er
     let field = schema
         .field(column)
         .ok_or_else(|| anyhow::anyhow!("table has no column '{column}'"))?;
-
-    match (
-        snapshot.table_properties().column_mapping_mode,
-        field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
-    ) {
-        (
-            Some(ColumnMappingMode::Id | ColumnMappingMode::Name),
-            Some(MetadataValue::String(physical)),
-        ) => Ok(physical.clone()),
-        _ => Ok(column.to_string()),
-    }
+    let mode = snapshot.table_configuration().column_mapping_mode();
+    Ok(field.physical_name(mode).to_string())
 }
 
 fn version_to_log_filename(version: Version) -> String {
