@@ -327,10 +327,10 @@ async fn commit_merge(
 
     let table_url = kernel_url(url)?;
 
+    let mut snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
     // Retry loop
     for _attempt in 0..MERGE_MAX_RETRIES {
-        // get a fresh snapshot, this is either the first pass or we failed and we need fresh metadata
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let version = snapshot.version();
         if let (Some(app_id), Some(batch_version)) = (app_id.as_ref(), batch_version) {
             if let Ok(Some(last_version)) = snapshot.get_app_id_version(app_id, engine.as_ref()) {
@@ -533,7 +533,10 @@ async fn commit_merge(
                     skipped_version: None,
                 });
             }
-            Err(object_store::Error::AlreadyExists { .. }) => continue,
+            // another writer took this version; apply its commits to the snapshot and go again
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                snapshot = Snapshot::builder_from(snapshot).build(engine.as_ref())?;
+            }
             Err(e) => return Err(e.into()),
         }
     }

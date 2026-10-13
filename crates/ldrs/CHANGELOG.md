@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.2] - 2026-10-13
+
+### Bug Fixes
+
+- *(delta)* Bump kernel to 0.29.0
+
+Flipped physical name to kernel functions.
+Vacuum scan now only pulls data it uses and fixed a small url bug.
+
+
 ## [0.25.1] - 2026-10-08
 
 ### Bug Fixes

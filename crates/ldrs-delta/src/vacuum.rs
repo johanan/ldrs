@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use delta_kernel::commit_range::{CommitRange, DeltaAction};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
+use delta_kernel::scan::StatsOptions;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::{Engine, Snapshot, SnapshotRef, Version};
 use futures::StreamExt;
@@ -20,6 +21,7 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use tokio::runtime::Handle;
 use tracing::{debug, info};
+use url::Url;
 
 use crate::build_engine;
 use crate::features::{check_writer_version, files_are_enumerable, writer_features};
@@ -137,7 +139,7 @@ pub async fn vacuum(
             let oldest_commit = oldest_commit.ok_or_else(|| {
                 anyhow::anyhow!("no commit files found under {base_path}/_delta_log")
             })?;
-            let cdc_hash = read_cdc_paths(url.as_str(), oldest_commit, &engine)?;
+            let cdc_hash = read_cdc_paths(&kernel_url(&url)?, oldest_commit, &engine)?;
             sweep.candidates.retain(|location| {
                 relative_path(&base_path, location)
                     .is_none_or(|relative| !cdc_hash.contains(relative))
@@ -269,7 +271,11 @@ fn collect_keep_set(
     snapshot: &SnapshotRef,
     engine: &dyn Engine,
 ) -> Result<HashSet<String>, anyhow::Error> {
-    let scan = snapshot.clone().scan_builder().build()?;
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(StatsOptions::none())
+        .build()?;
     let mut keep: HashSet<String> = HashSet::new();
 
     for scan_metadata in scan.scan_metadata(engine)? {
@@ -337,7 +343,7 @@ fn may_have_change_data(snapshot: &Snapshot) -> bool {
 }
 
 fn read_cdc_paths(
-    table_root: &str,
+    table_root: &Url,
     start_version: Version,
     engine: &Arc<dyn Engine>,
 ) -> Result<HashSet<String>, anyhow::Error> {
