@@ -122,75 +122,86 @@ impl<'a> TypedColumnAccessor<'a> {
         }
     }
 
-    pub fn as_chrono_naive(&self, row: usize) -> Option<NaiveDateTime> {
+    /// The row as a naive datetime, `Ok(None)` for a null, or `Err` with the raw value when
+    /// chrono cannot represent it.
+    pub fn as_chrono_naive(&self, row: usize) -> Result<Option<NaiveDateTime>, i64> {
         match self {
             Self::TimestampSecond(arr, _) => {
                 if arr.is_null(row) {
-                    None
+                    Ok(None)
                 } else {
-                    arr.value_as_datetime(row)
+                    arr.value_as_datetime(row).map(Some).ok_or(arr.value(row))
                 }
             }
             Self::TimestampMillisecond(arr, _) => {
                 if arr.is_null(row) {
-                    None
+                    Ok(None)
                 } else {
-                    arr.value_as_datetime(row)
+                    arr.value_as_datetime(row).map(Some).ok_or(arr.value(row))
                 }
             }
             Self::TimestampMicrosecond(arr, _) => {
                 if arr.is_null(row) {
-                    None
+                    Ok(None)
                 } else {
-                    arr.value_as_datetime(row)
+                    arr.value_as_datetime(row).map(Some).ok_or(arr.value(row))
                 }
             }
             Self::TimestampNanosecond(arr, _) => {
                 if arr.is_null(row) {
-                    None
+                    Ok(None)
                 } else {
-                    arr.value_as_datetime(row)
+                    arr.value_as_datetime(row).map(Some).ok_or(arr.value(row))
                 }
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 
-    pub unsafe fn as_chrono_tz(&self, row: usize) -> Option<chrono::DateTime<chrono::Utc>> {
+    /// The row as a UTC datetime, `Ok(None)` for a null, or `Err` with the raw value when chrono
+    /// cannot represent it.
+    pub unsafe fn as_chrono_tz(
+        &self,
+        row: usize,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, i64> {
         match self {
             Self::TimestampSecond(arr, _) => {
                 if arr.is_null(row) {
-                    None
+                    Ok(None)
                 } else {
                     let ts = arr.value_unchecked(row);
-                    DateTime::<Utc>::from_timestamp(ts, 0)
+                    DateTime::<Utc>::from_timestamp(ts, 0).map(Some).ok_or(ts)
                 }
             }
             Self::TimestampMillisecond(arr, _) => {
                 if arr.is_null(row) {
-                    None
+                    Ok(None)
                 } else {
                     let ts = arr.value_unchecked(row);
                     DateTime::<Utc>::from_timestamp_millis(ts)
+                        .map(Some)
+                        .ok_or(ts)
                 }
             }
             Self::TimestampMicrosecond(arr, _) => {
                 if arr.is_null(row) {
-                    None
+                    Ok(None)
                 } else {
                     let ts = arr.value_unchecked(row);
                     DateTime::<Utc>::from_timestamp_micros(ts)
+                        .map(Some)
+                        .ok_or(ts)
                 }
             }
             Self::TimestampNanosecond(arr, _) => {
                 if arr.is_null(row) {
-                    None
+                    Ok(None)
                 } else {
                     let ts = arr.value_unchecked(row);
-                    Some(DateTime::<Utc>::from_timestamp_nanos(ts))
+                    Ok(Some(DateTime::<Utc>::from_timestamp_nanos(ts)))
                 }
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 
