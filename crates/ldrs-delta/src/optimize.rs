@@ -4,10 +4,10 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use anyhow::Context;
-use arrow::compute::filter_record_batch;
+use arrow::compute::{cast, filter_record_batch};
 use arrow_array::builder::BooleanBufferBuilder;
-use arrow_array::BooleanArray;
-use arrow_schema::{DataType, SchemaRef};
+use arrow_array::{BooleanArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::table_features::TableFeature;
@@ -307,10 +307,11 @@ async fn read_candidates(
                 let path = path.context("cannot optimize this table")?;
                 let metadata =
                     read_parquet_metadata(store, &path, file.size.max(0) as u64, handle).await?;
-                let schema = Arc::new(parquet_to_arrow_schema(
+                let footer = parquet_to_arrow_schema(
                     metadata.file_metadata().schema_descr(),
                     metadata.file_metadata().key_value_metadata(),
-                )?);
+                )?;
+                let schema = Arc::new(micros_schema(&footer));
                 let order_min = order_column.and_then(|column| min_of(&metadata, column));
                 Ok(Candidate {
                     file,
@@ -322,6 +323,32 @@ async fn read_candidates(
         .buffered(FOOTER_CONCURRENCY)
         .try_collect()
         .await
+}
+
+/// The type delta stores `data_type` as, when parquet reads it as something else. A delta
+/// timestamp is microseconds adjusted to UTC; parquet reads INT96 and nanosecond columns as
+/// nanoseconds.
+fn delta_type(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        )),
+        _ => None,
+    }
+}
+
+/// The schema with each column as delta stores it.
+fn micros_schema(schema: &Schema) -> Schema {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| match delta_type(field.data_type()) {
+            Some(data_type) => field.as_ref().clone().with_data_type(data_type),
+            None => field.as_ref().clone(),
+        })
+        .collect();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
 }
 
 /// The smallest value of `column` across the file's row groups. `None` when the file does not hold
@@ -403,10 +430,28 @@ async fn rewrite_bin(
             cloud_io.clone(),
         )
         .await?;
+        let needs_cast = stream
+            .schema()
+            .fields()
+            .iter()
+            .zip(bin.schema.fields())
+            .any(|(read, write)| read.data_type() != write.data_type());
 
         let mut offset = 0u64;
         while let Some(batch) = stream.next().await {
             let batch = batch?;
+            let batch = match needs_cast {
+                true => {
+                    let columns = batch
+                        .columns()
+                        .iter()
+                        .zip(bin.schema.fields())
+                        .map(|(column, field)| cast(column, field.data_type()))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    RecordBatch::try_new(bin.schema.clone(), columns)?
+                }
+                false => batch,
+            };
             match keep_mask(&deleted, offset, batch.num_rows()) {
                 Some(mask) => {
                     sink.write_batch(&filter_record_batch(&batch, &mask)?)

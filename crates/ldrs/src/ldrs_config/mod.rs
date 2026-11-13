@@ -568,7 +568,8 @@ pub async fn execute_task(
         error!(phase = "load", "{f}");
     }
     // Written before any post-load phase runs, and covers failed tasks too.
-    results.write(ResultLine::Load(&phase))?;
+    let mut results_failures = Vec::new();
+    results_failures.extend(results.write(ResultLine::Load(&phase)).err());
 
     let register_failures = run_register(&registers, &phase, results).await;
     for f in &register_failures {
@@ -581,10 +582,17 @@ pub async fn execute_task(
         error!(phase = "finalize", "{f}");
     }
     if !finalize_failures.is_empty() {
-        results.write(ResultLine::Finalize {
-            name: &phase.name,
-            errors: &finalize_failures,
-        })?;
+        results_failures.extend(
+            results
+                .write(ResultLine::Finalize {
+                    name: &phase.name,
+                    errors: &finalize_failures,
+                })
+                .err(),
+        );
+    }
+    for f in &results_failures {
+        error!(phase = "results", "{f:#}");
     }
     let mut summary = Vec::new();
     if !load_failures.is_empty() {
@@ -595,6 +603,9 @@ pub async fn execute_task(
     }
     if !finalize_failures.is_empty() {
         summary.push(format!("{} finalize", finalize_failures.len()));
+    }
+    if !results_failures.is_empty() {
+        summary.push(format!("{} results", results_failures.len()));
     }
     // A destination that committed is data a retry would re-apply, so it decides the exit code.
     let committed = phase.destinations.iter().any(|d| d.succeeded());

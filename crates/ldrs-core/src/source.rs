@@ -17,7 +17,7 @@ use url::Url;
 use crate::plan::SourceSpec;
 use crate::spawn::{resolve_schema, spawn_arrow_source};
 
-/// The source stream shapes the executor drives: a parquet file stream, or a pumped receiver
+/// The source stream shapes the executor drives: a parquet file stream, or a channel receiver
 /// (spawned process today; FFI / stdin later).
 pub enum StreamType {
     Parquet(ParquetRecordBatchStream<SpawnedStoreReader>),
@@ -51,7 +51,7 @@ pub struct SrcStream {
     pub source_files: Option<Vec<String>>,
 }
 
-/// Open a resolved source: build the object store / spawn the process and pump batches, producing
+/// Open a resolved source: build the object store / spawn the process and read its batches, producing
 /// the schema and columns the sinks are built against.
 pub async fn open_source(
     spec: SourceSpec,

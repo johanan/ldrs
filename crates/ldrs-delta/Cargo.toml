@@ -1,13 +1,12 @@
 [package]
 name = "ldrs-delta"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
 
 [dependencies]
-ldrs-arrow = { path = "../ldrs-arrow" }
 ldrs-parquet = { path = "../ldrs-parquet" }
 ldrs-storage = { path = "../ldrs-storage" }
 

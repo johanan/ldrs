@@ -190,6 +190,10 @@ pub fn columnspec_from_parquet(field: &Arc<parquet::schema::types::Type>) -> Opt
                     parquet::basic::Type::INT32 => Some(ColumnSpec::Integer { name }),
                     parquet::basic::Type::INT64 => Some(ColumnSpec::BigInt { name }),
                     parquet::basic::Type::BOOLEAN => Some(ColumnSpec::Boolean { name }),
+                    parquet::basic::Type::INT96 => Some(ColumnSpec::Timestamp {
+                        name,
+                        time_unit: TimeUnit::Micros,
+                    }),
                     _ => None,
                 },
             }
@@ -201,6 +205,7 @@ pub fn columnspec_from_parquet(field: &Arc<parquet::schema::types::Type>) -> Opt
 mod tests {
     use super::*;
     use crate::builder_from_string;
+    use arrow_schema::DataType;
     use ldrs_test_fixtures::fixture_url;
 
     pub fn create_runtime() -> tokio::runtime::Runtime {
@@ -229,6 +234,81 @@ mod tests {
         // now get the fields
         let fields = get_fields(metadata).unwrap();
         assert_eq!(fields.len(), 6);
+        drop_runtime(rt);
+    }
+
+    const INT96_FILE: &str =
+        "delta_spark/penguins_timestamps/part-00000-e9077e78-29e5-443c-af05-b254237e5ccb-c000.snappy.parquet";
+
+    #[tokio::test]
+    async fn int96_reads_as_zoneless_micros() {
+        use arrow::array::AsArray;
+        use arrow::datatypes::TimestampMicrosecondType;
+        use futures::StreamExt;
+
+        let rt = create_runtime();
+        let builder = builder_from_string(fixture_url(INT96_FILE), rt.handle().clone())
+            .await
+            .unwrap();
+        let micros = DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None);
+        let field = builder
+            .schema()
+            .field_with_name("observed_at")
+            .unwrap()
+            .clone();
+        assert_eq!(field.data_type(), &micros);
+
+        let fields = get_fields(builder.metadata().file_metadata()).unwrap();
+        let observed = fields.iter().find(|f| f.name() == "observed_at").unwrap();
+        assert_eq!(
+            columnspec_from_parquet(observed),
+            Some(ColumnSpec::Timestamp {
+                name: "observed_at".into(),
+                time_unit: TimeUnit::Micros,
+            })
+        );
+
+        let mut stream = builder.build().unwrap();
+        let batch = stream.next().await.unwrap().unwrap();
+        let column = batch.column_by_name("observed_at").unwrap();
+        // 2008-11-06T05:00:51.123456Z, the fraction intact
+        assert_eq!(
+            column.as_primitive::<TimestampMicrosecondType>().value(0),
+            1_225_947_651_123_456
+        );
+        drop_runtime(rt);
+    }
+
+    #[tokio::test]
+    async fn int96_reads_as_micros_beside_the_row_number() {
+        use futures::StreamExt;
+        use ldrs_storage::build_store;
+        use object_store::ObjectStoreExt;
+
+        let rt = create_runtime();
+        let url = url::Url::parse(&fixture_url(INT96_FILE)).unwrap();
+        let (store, path, _) = build_store(&url).unwrap();
+        let size = store.head(&path).await.unwrap().size;
+        let mut stream = crate::stream_projected_parquet(
+            store,
+            &path,
+            &["observed_at".to_string()],
+            None,
+            size,
+            rt.handle().clone(),
+        )
+        .await
+        .unwrap();
+        let batch = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            batch
+                .schema()
+                .field_with_name("observed_at")
+                .unwrap()
+                .data_type(),
+            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+        );
+        assert!(batch.column_by_name(crate::ROW_NUMBER_COLUMN).is_some());
         drop_runtime(rt);
     }
 

@@ -9,6 +9,9 @@ pub struct PgCommon {
     pub target: Option<String>,
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
+    #[schemars(
+        description = "Deprecated: set the role on the connection URL with `options=-c role=<name>`."
+    )]
     pub role: Option<String>,
     #[serde(default)]
     #[schemars(schema_with = "crate::cli_schema::columns_schema")]
@@ -22,6 +25,9 @@ pub struct PgDeleteInsert {
     pub target: Option<String>,
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
+    #[schemars(
+        description = "Deprecated: set the role on the connection URL with `options=-c role=<name>`."
+    )]
     pub role: Option<String>,
     #[serde(default)]
     #[schemars(schema_with = "crate::cli_schema::columns_schema")]
@@ -36,6 +42,9 @@ pub struct PgMerge {
     pub target: Option<String>,
     pub pre_sql: Option<String>,
     pub post_sql: Option<String>,
+    #[schemars(
+        description = "Deprecated: set the role on the connection URL with `options=-c role=<name>`."
+    )]
     pub role: Option<String>,
     #[serde(default)]
     #[schemars(schema_with = "crate::cli_schema::columns_schema")]
@@ -163,7 +172,14 @@ impl PgDestination {
             PgDestination::Merge(merge) => merge.role.as_ref(),
             PgDestination::DeleteInsert(delete_insert) => delete_insert.role.as_ref(),
         }
-        .map(|role| PgDestCommand::Sql(format!("SET ROLE {}", role)));
+        // DEPRECATED: a future release removes `role:`; the URL's `options=-c role=` replaces it.
+        .map(|role| {
+            tracing::warn!(
+                "'role' is deprecated and will be removed in a future release; set it on the \
+                 connection URL instead: 'options=-c role={role}'"
+            );
+            PgDestCommand::Sql(format!("SET ROLE {}", role))
+        });
 
         let pre_sql = match self {
             PgDestination::DropReplace(common) => common.pre_sql.as_ref(),

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use ldrs_arrow::ColumnType;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -78,7 +79,9 @@ pub fn from_serde_yaml(yaml: &Value, tag: Option<&str>) -> Result<SFSource, anyh
     let sql = yaml.get("sql").and_then(|v| v.as_str());
     let param_keys = yaml
         .get("param_keys")
-        .and_then(|v| Vec::<String>::deserialize(v).ok());
+        .map(Vec::<String>::deserialize)
+        .transpose()
+        .context("'param_keys' must be a list of env var names")?;
 
     match (name, sql) {
         (Some(name), Some(sql)) => {

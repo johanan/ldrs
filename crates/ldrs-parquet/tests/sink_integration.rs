@@ -1,8 +1,9 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::{Int64Array, Int8Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use ldrs_arrow::{build_arrow_transform_strategy, transform_batch, ColumnType};
 use ldrs_parquet::{FileNamer, ParquetSink};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -111,6 +112,85 @@ async fn sink_rotates_by_rows() {
         let (rows, _) = read_rows(&dir, filename);
         assert_eq!(rows, 2);
     }
+}
+
+#[tokio::test]
+async fn sink_rotates_by_bytes_within_a_row_group() {
+    let schema = test_schema();
+    let dir = test_dir("rotate_bytes");
+    let max_bytes = 64 * 1024;
+
+    // Far fewer rows than one row group, so nothing is flushed before `finish` unless the sink
+    // counts the row group it is still buffering.
+    let mut sink = ParquetSink::new(
+        &dir,
+        schema.clone(),
+        None,
+        Some(max_bytes),
+        indexed_namer(),
+        None,
+    )
+    .unwrap();
+    for i in 0..100 {
+        sink.write_batch(&test_batch(&schema, i * 1000, 1000))
+            .await
+            .unwrap();
+    }
+    let results = sink.finish().await.unwrap();
+
+    assert!(results.len() > 1, "{} bytes in one file", results[0].2);
+    for (filename, _, size) in &results {
+        assert!(
+            *size < 2 * max_bytes as u64,
+            "{filename} is {size} bytes against a {max_bytes} byte limit"
+        );
+    }
+    let rows: usize = results
+        .iter()
+        .map(|(filename, _, _)| read_rows(&dir, filename).0)
+        .sum();
+    assert_eq!(rows, 100_000);
+}
+
+/// Snowflake sends DECIMAL(1,0) as Int8; the transformed column must write as parquet.
+#[tokio::test]
+async fn sink_writes_a_decimal_1_0_transformed_from_int8() {
+    let logical = ColumnType::Numeric(1, 0);
+    let strategy =
+        build_arrow_transform_strategy(logical.clone(), logical.clone(), &DataType::Int8).unwrap();
+    let source_schema = Arc::new(Schema::new(vec![Field::new("flag", DataType::Int8, true)]));
+    let target_schema = Arc::new(Schema::new(vec![Field::new(
+        "flag",
+        logical.to_arrow_datatype(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        source_schema,
+        vec![Arc::new(Int8Array::from(vec![Some(1), Some(0), None]))],
+    )
+    .unwrap();
+    let transformed = transform_batch(&batch, &[strategy], target_schema.clone()).unwrap();
+
+    let dir = test_dir("decimal_1_0");
+    let mut sink = ParquetSink::new(
+        &dir,
+        target_schema.clone(),
+        None,
+        None,
+        indexed_namer(),
+        None,
+    )
+    .unwrap();
+    sink.write_batch(&transformed).await.unwrap();
+    let results = sink.finish().await.unwrap();
+
+    assert_eq!(results.len(), 1);
+    let (rows, schema) = read_rows(&dir, &results[0].0);
+    assert_eq!(rows, 3);
+    assert_eq!(
+        schema.field_with_name("flag").unwrap().data_type(),
+        target_schema.field(0).data_type()
+    );
 }
 
 #[tokio::test]

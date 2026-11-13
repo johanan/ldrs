@@ -1,12 +1,12 @@
-//! Spawn an external process that emits an Arrow IPC stream on stdout, and pump it back as a
+//! Spawn an external process that emits an Arrow IPC stream on stdout, and read it back as a
 //! bounded batch stream. Everything here is resolved: the binary, args, an optional stdin script,
 //! and the complete child environment are handed in. The child-env policy (which `LDRS_*` vars to
 //! strip or keep) belongs to the shell.
 
 use std::ffi::OsString;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, Command, Stdio};
 use std::thread;
 
 use anyhow::Context;
@@ -27,7 +27,7 @@ pub struct Spawned {
     pub env: Vec<(String, OsString)>,
 }
 
-/// The pumped output of a spawned source: the batch stream, the schema (sent once the stream
+/// The output of a spawned source: the batch stream, the schema (sent once the stream
 /// opens), and the child's cleanup handle carrying the settlement verdict.
 pub struct SpawnedStream {
     pub batch_stream: ReceiverStream<Result<RecordBatch, anyhow::Error>>,
@@ -35,7 +35,7 @@ pub struct SpawnedStream {
     pub command_handle: JoinHandle<Result<(), anyhow::Error>>,
 }
 
-/// Spawn the process and pump its stdout Arrow IPC stream into a bounded channel. Settlement:
+/// Spawn the process and read its stdout Arrow IPC stream into a bounded channel. Settlement:
 /// a truncated stream reads without error, so the child's exit status (and whether the stream
 /// opened at all) is the integrity signal, reported through `command_handle`.
 ///
@@ -85,15 +85,11 @@ pub fn spawn_arrow_source(spec: Spawned) -> SpawnedStream {
             None => None,
         };
 
-        let mut stderr_handle = child
+        let stderr_handle = child
             .stderr
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
-        let stderr_drain = thread::spawn(move || -> Result<String, anyhow::Error> {
-            let mut buf = String::new();
-            stderr_handle.read_to_string(&mut buf)?;
-            Ok(buf)
-        });
+        let stderr_drain = thread::spawn(move || drain_tail(stderr_handle));
 
         let stdout = child
             .stdout
@@ -110,11 +106,16 @@ pub fn spawn_arrow_source(spec: Spawned) -> SpawnedStream {
                     let mut forwarded = Ok(());
                     for batch_result in reader {
                         trace!("Processing batch");
+                        let decode_failed = batch_result.is_err();
                         if tx
                             .blocking_send(batch_result.map_err(anyhow::Error::from))
                             .is_err()
                         {
                             forwarded = Err(anyhow::anyhow!("Failed to send batch"));
+                            break;
+                        }
+                        // The reader does not stop after an error.
+                        if decode_failed {
                             break;
                         }
                     }
@@ -125,17 +126,18 @@ pub fn spawn_arrow_source(spec: Spawned) -> SpawnedStream {
         // Close our end of stdout before waiting on the child.
         drop(stream_reader);
 
-        // Abandoning the stream leaves the child writing into a pipe nobody drains, so `wait`
-        // would never return.
+        // The consumer stopped reading. The kill is ours, not a child failure.
         if stream_result.is_err() {
             let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
         }
 
         let status = child.wait()?;
-        let stderr_output = stderr_drain
-            .join()
-            .map_err(|_| anyhow::anyhow!("stderr drain panicked"))
-            .flatten()?;
+        let stderr_output = match stderr_drain.join() {
+            Ok(tail) => String::from_utf8_lossy(&tail).into_owned(),
+            Err(_) => "stderr drain panicked".to_string(),
+        };
         let stdin_result = match stdin_writer {
             Some(handle) => handle
                 .join()
@@ -146,18 +148,17 @@ pub fn spawn_arrow_source(spec: Spawned) -> SpawnedStream {
 
         // The child's verdict outranks our plumbing: a script that fails early closes the stdin
         // pipe, so a broken-pipe write is a symptom of that failure rather than the cause.
-        match (status.success(), stream_opened, stream_result) {
-            (false, _, _) => Err(anyhow::anyhow!(
+        match (status.success(), stream_opened) {
+            (false, _) => Err(anyhow::anyhow!(
                 "Spawned command failed with status: {}. Stderr: {}",
                 status,
                 stderr_output
             )),
-            (true, _, Err(e)) => Err(e),
-            (true, false, Ok(())) => Err(anyhow::anyhow!(
+            (true, false) => Err(anyhow::anyhow!(
                 "Command succeeded but failed to open Arrow stream. Stderr: {}",
                 stderr_output
             )),
-            (true, true, Ok(())) => {
+            (true, true) => {
                 if !stderr_output.trim().is_empty() {
                     debug!("child stderr: {}", stderr_output);
                 }
@@ -171,6 +172,29 @@ pub fn spawn_arrow_source(spec: Spawned) -> SpawnedStream {
         schema_rx,
         command_handle,
     }
+}
+
+/// How much of the end of the child's stderr is kept.
+const STDERR_TAIL: usize = 64 * 1024;
+
+/// The last `STDERR_TAIL` bytes of stderr. Reads to EOF so the child never blocks on the pipe.
+fn drain_tail(mut stderr: ChildStderr) -> Vec<u8> {
+    let mut tail = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                tail.extend_from_slice(&chunk[..n]);
+                if tail.len() > STDERR_TAIL {
+                    tail.drain(..tail.len() - STDERR_TAIL);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    tail
 }
 
 /// Await the schema a spawned source sends once its stream opens. Empty fields (or a dropped

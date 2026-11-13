@@ -333,7 +333,7 @@ async fn commit_merge(
     for _attempt in 0..MERGE_MAX_RETRIES {
         let version = snapshot.version();
         if let (Some(app_id), Some(batch_version)) = (app_id.as_ref(), batch_version) {
-            if let Ok(Some(last_version)) = snapshot.get_app_id_version(app_id, engine.as_ref()) {
+            if let Some(last_version) = snapshot.get_app_id_version(app_id, engine.as_ref())? {
                 // if there is a newer version committed, nothing to do so we skip
                 if last_version >= batch_version {
                     return Ok(MergeStats::skipped(last_version));

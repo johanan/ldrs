@@ -458,6 +458,20 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_param_keys_is_an_error() {
+        for src in ["sf.query", "sf"] {
+            let value: Value = serde_yaml::from_str(&format!(
+                "{{src: {src}, name: q, sql: 'select ?', param_keys: P1}}"
+            ))
+            .unwrap();
+            assert!(
+                parse_src(value, &None).is_err(),
+                "'{src}' accepted a scalar param_keys"
+            );
+        }
+    }
+
+    #[test]
     fn source_known_fields_file() {
         let src = LdrsSource::File(FileSource {
             name: String::new(),

@@ -27,6 +27,8 @@ pub enum ExtractedValue<'a> {
     TimestampTzNanos(Option<DateTime<Utc>>),
     Jsonb(Option<&'a str>),
     Bytea(Option<&'a [u8]>),
+    /// A non-null date or timestamp chrono cannot represent, as its raw arrow value.
+    OutOfRange(i64),
 }
 
 #[derive(Debug)]
@@ -152,36 +154,53 @@ impl<'a> ColumnConverter<'a> {
                 ExtractedValue::Jsonb(self.accessor.Utf8(row_idx))
             },
             // Date32 counts days from 1970-01-01, which is day 719_163 of the common era
-            ExtractionStrategy::Date => unsafe {
-                ExtractedValue::Date(
-                    self.accessor
-                        .Date32(row_idx)
-                        .and_then(|days| NaiveDate::from_num_days_from_ce_opt(days + 719_163)),
+            ExtractionStrategy::Date => match unsafe { self.accessor.Date32(row_idx) } {
+                None => ExtractedValue::Date(None),
+                Some(days) => days
+                    .checked_add(719_163)
+                    .and_then(NaiveDate::from_num_days_from_ce_opt)
+                    .map_or(ExtractedValue::OutOfRange(days.into()), |date| {
+                        ExtractedValue::Date(Some(date))
+                    }),
+            },
+            ExtractionStrategy::TimestampSeconds => self
+                .accessor
+                .as_chrono_naive(row_idx)
+                .map_or_else(ExtractedValue::OutOfRange, ExtractedValue::TimestampSeconds),
+            ExtractionStrategy::TimestampMillis => self
+                .accessor
+                .as_chrono_naive(row_idx)
+                .map_or_else(ExtractedValue::OutOfRange, ExtractedValue::TimestampMillis),
+            ExtractionStrategy::TimestampMicros => self
+                .accessor
+                .as_chrono_naive(row_idx)
+                .map_or_else(ExtractedValue::OutOfRange, ExtractedValue::TimestampMicros),
+            ExtractionStrategy::TimestampNanos => self
+                .accessor
+                .as_chrono_naive(row_idx)
+                .map_or_else(ExtractedValue::OutOfRange, ExtractedValue::TimestampNanos),
+            ExtractionStrategy::TimestampTzSeconds => unsafe {
+                self.accessor.as_chrono_tz(row_idx).map_or_else(
+                    ExtractedValue::OutOfRange,
+                    ExtractedValue::TimestampTzSeconds,
                 )
             },
-            ExtractionStrategy::TimestampSeconds => {
-                ExtractedValue::TimestampSeconds(self.accessor.as_chrono_naive(row_idx))
-            }
-            ExtractionStrategy::TimestampMillis => {
-                ExtractedValue::TimestampMillis(self.accessor.as_chrono_naive(row_idx))
-            }
-            ExtractionStrategy::TimestampMicros => {
-                ExtractedValue::TimestampMicros(self.accessor.as_chrono_naive(row_idx))
-            }
-            ExtractionStrategy::TimestampNanos => {
-                ExtractedValue::TimestampNanos(self.accessor.as_chrono_naive(row_idx))
-            }
-            ExtractionStrategy::TimestampTzSeconds => unsafe {
-                ExtractedValue::TimestampTzSeconds(self.accessor.as_chrono_tz(row_idx))
-            },
             ExtractionStrategy::TimestampTzMillis => unsafe {
-                ExtractedValue::TimestampTzMillis(self.accessor.as_chrono_tz(row_idx))
+                self.accessor.as_chrono_tz(row_idx).map_or_else(
+                    ExtractedValue::OutOfRange,
+                    ExtractedValue::TimestampTzMillis,
+                )
             },
             ExtractionStrategy::TimestampTzMicros => unsafe {
-                ExtractedValue::TimestampTzMicros(self.accessor.as_chrono_tz(row_idx))
+                self.accessor.as_chrono_tz(row_idx).map_or_else(
+                    ExtractedValue::OutOfRange,
+                    ExtractedValue::TimestampTzMicros,
+                )
             },
             ExtractionStrategy::TimestampTzNanos => unsafe {
-                ExtractedValue::TimestampTzNanos(self.accessor.as_chrono_tz(row_idx))
+                self.accessor
+                    .as_chrono_tz(row_idx)
+                    .map_or_else(ExtractedValue::OutOfRange, ExtractedValue::TimestampTzNanos)
             },
         }
     }
@@ -214,6 +233,10 @@ impl<'a> ToSql for ExtractedValue<'a> {
             ExtractedValue::Decimal(v) => v.to_sql(ty, out),
             ExtractedValue::Utf8(v) => v.to_sql(ty, out),
             ExtractedValue::Bytea(v) => v.to_sql(ty, out),
+            ExtractedValue::OutOfRange(raw) => Err(format!(
+                "value {raw} is outside the date/time range ldrs can send to postgres"
+            )
+            .into()),
             ExtractedValue::Jsonb(v) => match v {
                 None => Ok(postgres_types::IsNull::Yes),
                 Some(s) => {
@@ -235,7 +258,7 @@ impl<'a> ToSql for ExtractedValue<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, Date32Array};
+    use arrow_array::{ArrayRef, Date32Array, TimestampMicrosecondArray};
     use bytes::BytesMut;
     use chrono::NaiveDate;
     use postgres_types::IsNull;
@@ -276,5 +299,35 @@ mod tests {
             );
             assert_eq!(got, want, "row {row} bytes");
         }
+    }
+
+    /// Encode row 0 of `array` as `spec`: whether it went out as a NULL, or the encode error.
+    fn encode(array: ArrayRef, spec: ColumnSpec, ty: &Type) -> Result<bool, String> {
+        let accessor = TypedColumnAccessor::new(&array);
+        let converter = ColumnConverter::new(&accessor, &spec).unwrap();
+        converter
+            .extract_value(0)
+            .to_sql(ty, &mut BytesMut::new())
+            .map(|null| matches!(null, IsNull::Yes))
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_date_chrono_cannot_hold_is_an_error_not_a_null() {
+        // About 548,000 years past 1970: a valid Date32, beyond chrono's range.
+        let array: ArrayRef = Arc::new(Date32Array::from(vec![200_000_000]));
+        let encoded = encode(array, ColumnSpec::Date { name: "d".into() }, &Type::DATE);
+        assert!(encoded.is_err(), "sent as NULL: {encoded:?}");
+    }
+
+    #[test]
+    fn a_timestamp_chrono_cannot_hold_is_an_error_not_a_null() {
+        let array: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![i64::MAX]));
+        let spec = ColumnSpec::Timestamp {
+            name: "t".into(),
+            time_unit: ldrs_arrow::TimeUnit::Micros,
+        };
+        let encoded = encode(array, spec, &Type::TIMESTAMP);
+        assert!(encoded.is_err(), "sent as NULL: {encoded:?}");
     }
 }
