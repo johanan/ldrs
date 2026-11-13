@@ -126,6 +126,49 @@ tables:
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
 
+/// A results file that cannot be written after a destination committed is a partial run, exit 3.
+#[tokio::test]
+#[test_log::test]
+async fn test_results_write_failure_after_commit_is_partial() {
+    let config = r#"
+src: file
+src_defaults:
+  filename: "{{ name }}/{{ name }}.snappy.parquet"
+destinations:
+  - dest: pq
+    filename: parquet_writes/{{ target }}_results_failure.snappy.parquet
+tables:
+  - name: public.numbers
+"#;
+    let ldrs_env = vec![
+        ("LDRS_SRC".to_string(), data_url()),
+        ("LDRS_DEST".to_string(), data_url()),
+    ];
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    // Opens fine; every write fails with ENOSPC.
+    let results = Results::create(Some("/dev/full")).unwrap();
+
+    let err = execute_configs(
+        parse_tables(
+            &serde_yaml::from_str(config).unwrap(),
+            infer_env_type("LDRS_SRC", &ldrs_env),
+        )
+        .unwrap(),
+        None,
+        &ldrs_env,
+        rt.handle(),
+        &results,
+    )
+    .await
+    .expect_err("an unwritable results file must fail the run");
+    assert_eq!(err.code(), 3, "got: {err}");
+    tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
 /// A relative `file://` dest with a relative filename resolves under the working directory,
 /// not the filesystem root. Drives config -> ParquetSink -> object_store write and asserts
 /// the file lands cwd-relative.
