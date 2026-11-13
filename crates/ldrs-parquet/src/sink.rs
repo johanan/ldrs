@@ -134,11 +134,22 @@ impl ParquetSink {
             .is_some_and(|limit| self.current_rows >= limit)
             || self
                 .max_bytes
-                .is_some_and(|limit| w.bytes_written() >= limit);
+                .is_some_and(|limit| w.bytes_written() + w.in_progress_size() >= limit);
 
         if should_rotate {
-            // `finish` (not `close`) finalizes without consuming, so `bytes_written` can be read
+            // On error the writer is gone; `abort` still deletes the completed files.
             let mut w = self.writer.take().unwrap();
+            // A failed flush has not started shutdown, so the upload can still be aborted
+            if let Err(e) = w.flush().await {
+                if let Err(abort_err) = w.into_inner().abort().await {
+                    warn!(
+                        "could not abort upload of {}: {}",
+                        self.current_filename, abort_err
+                    );
+                }
+                return Err(e.into());
+            }
+            // `finish` (not `close`) finalizes without consuming, so `bytes_written` can be read
             let metadata = w.finish().await?;
             let size = w.bytes_written() as u64;
             self.results
@@ -154,6 +165,17 @@ impl ParquetSink {
     /// completed are deleted before returning the error.
     pub async fn finish(mut self) -> Result<Vec<(String, ParquetMetaData, u64)>, anyhow::Error> {
         if let Some(mut w) = self.writer.take() {
+            // A failed flush has not started shutdown, so the upload can still be aborted
+            if let Err(e) = w.flush().await {
+                if let Err(abort_err) = w.into_inner().abort().await {
+                    warn!(
+                        "could not abort upload of {}: {}",
+                        self.current_filename, abort_err
+                    );
+                }
+                self.delete_completed().await;
+                return Err(e.into());
+            }
             match w.finish().await {
                 Ok(metadata) => {
                     let size = w.bytes_written() as u64;
@@ -194,10 +216,14 @@ impl ParquetSink {
         }
     }
 
-    /// Failure path: drop the in-flight writer (an unfinished multipart upload
-    /// never becomes a visible object), then delete the completed files.
+    /// Failure path: abort the in-flight upload (S3 and GCS keep uploaded parts
+    /// otherwise), then delete the completed files.
     pub async fn abort(mut self) {
-        drop(self.writer.take());
+        if let Some(w) = self.writer.take() {
+            if let Err(e) = w.into_inner().abort().await {
+                warn!("could not abort upload of {}: {}", self.current_filename, e);
+            }
+        }
         self.delete_completed().await;
     }
 }

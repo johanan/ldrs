@@ -8,7 +8,7 @@ use object_store::buffered::BufWriter;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
-use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::AsyncArrowWriter;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
@@ -16,6 +16,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
+use crate::parquet_builder::open_builder;
 use crate::store_reader::{SpawnedStoreReader, StoreReader};
 
 use parquet::arrow::RowNumber;
@@ -131,8 +132,8 @@ where
         w.write(&batch).await?;
         current_rows += batch.num_rows();
 
-        let should_rotate = max_rows.map_or(false, |limit| current_rows >= limit)
-            || max_bytes.map_or(false, |limit| w.bytes_written() >= limit);
+        let should_rotate = max_rows.is_some_and(|limit| current_rows >= limit)
+            || max_bytes.is_some_and(|limit| w.bytes_written() >= limit);
 
         if should_rotate {
             let metadata = writer.take().unwrap().close().await?;
@@ -173,7 +174,7 @@ pub async fn stream_parquet(
 ) -> Result<parquet::arrow::async_reader::ParquetRecordBatchStream<SpawnedStoreReader>, anyhow::Error>
 {
     let reader = StoreReader::spawned(store, path.clone(), size, handle);
-    Ok(ParquetRecordBatchStreamBuilder::new(reader)
+    Ok(open_builder(reader, ArrowReaderOptions::new())
         .await?
         .build()?)
 }
@@ -193,7 +194,7 @@ pub async fn stream_projected_parquet(
     let options = ArrowReaderOptions::new().with_virtual_columns(vec![row_number_field])?;
 
     let reader = StoreReader::spawned(store, path.clone(), size, handle);
-    let mut builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
+    let mut builder = open_builder(reader, options).await?;
 
     let mask = parquet::arrow::ProjectionMask::columns(
         builder.parquet_schema(),

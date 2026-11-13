@@ -114,6 +114,44 @@ async fn sink_rotates_by_rows() {
 }
 
 #[tokio::test]
+async fn sink_rotates_by_bytes_within_a_row_group() {
+    let schema = test_schema();
+    let dir = test_dir("rotate_bytes");
+    let max_bytes = 64 * 1024;
+
+    // Far fewer rows than one row group, so nothing is flushed before `finish` unless the sink
+    // counts the row group it is still buffering.
+    let mut sink = ParquetSink::new(
+        &dir,
+        schema.clone(),
+        None,
+        Some(max_bytes),
+        indexed_namer(),
+        None,
+    )
+    .unwrap();
+    for i in 0..100 {
+        sink.write_batch(&test_batch(&schema, i * 1000, 1000))
+            .await
+            .unwrap();
+    }
+    let results = sink.finish().await.unwrap();
+
+    assert!(results.len() > 1, "{} bytes in one file", results[0].2);
+    for (filename, _, size) in &results {
+        assert!(
+            *size < 2 * max_bytes as u64,
+            "{filename} is {size} bytes against a {max_bytes} byte limit"
+        );
+    }
+    let rows: usize = results
+        .iter()
+        .map(|(filename, _, _)| read_rows(&dir, filename).0)
+        .sum();
+    assert_eq!(rows, 100_000);
+}
+
+#[tokio::test]
 async fn sink_collision_check_rejects_constant_name_with_rotation() {
     let schema = test_schema();
     let dir = test_dir("collision");
