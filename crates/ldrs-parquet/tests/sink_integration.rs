@@ -1,8 +1,9 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::{Int64Array, Int8Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use ldrs_arrow::{build_arrow_transform_strategy, transform_batch, ColumnType};
 use ldrs_parquet::{FileNamer, ParquetSink};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -149,6 +150,47 @@ async fn sink_rotates_by_bytes_within_a_row_group() {
         .map(|(filename, _, _)| read_rows(&dir, filename).0)
         .sum();
     assert_eq!(rows, 100_000);
+}
+
+/// Snowflake sends DECIMAL(1,0) as Int8; the transformed column must write as parquet.
+#[tokio::test]
+async fn sink_writes_a_decimal_1_0_transformed_from_int8() {
+    let logical = ColumnType::Numeric(1, 0);
+    let strategy =
+        build_arrow_transform_strategy(logical.clone(), logical.clone(), &DataType::Int8).unwrap();
+    let source_schema = Arc::new(Schema::new(vec![Field::new("flag", DataType::Int8, true)]));
+    let target_schema = Arc::new(Schema::new(vec![Field::new(
+        "flag",
+        logical.to_arrow_datatype(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        source_schema,
+        vec![Arc::new(Int8Array::from(vec![Some(1), Some(0), None]))],
+    )
+    .unwrap();
+    let transformed = transform_batch(&batch, &[strategy], target_schema.clone()).unwrap();
+
+    let dir = test_dir("decimal_1_0");
+    let mut sink = ParquetSink::new(
+        &dir,
+        target_schema.clone(),
+        None,
+        None,
+        indexed_namer(),
+        None,
+    )
+    .unwrap();
+    sink.write_batch(&transformed).await.unwrap();
+    let results = sink.finish().await.unwrap();
+
+    assert_eq!(results.len(), 1);
+    let (rows, schema) = read_rows(&dir, &results[0].0);
+    assert_eq!(rows, 3);
+    assert_eq!(
+        schema.field_with_name("flag").unwrap().data_type(),
+        target_schema.field(0).data_type()
+    );
 }
 
 #[tokio::test]

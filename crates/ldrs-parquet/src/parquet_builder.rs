@@ -1,19 +1,21 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Error};
-use arrow_schema::{DataType, SchemaBuilder, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef, TimeUnit};
 use ldrs_storage::{base_or_relative_path, build_store};
-use object_store::ObjectStoreExt;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::async_reader::AsyncFileReader;
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, RowNumber};
 use parquet::basic::Type as PhysicalType;
+use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::Type;
 use tokio::runtime::Handle;
 use url::Url;
 
 use crate::store_reader::{SpawnedStoreReader, StoreReader};
 
-pub(crate) async fn open_builder(
+async fn open_builder(
     mut reader: SpawnedStoreReader,
     options: ArrowReaderOptions,
 ) -> Result<ParquetRecordBatchStreamBuilder<SpawnedStoreReader>, anyhow::Error> {
@@ -90,4 +92,63 @@ pub async fn builder_from_string(
 ) -> Result<ParquetRecordBatchStreamBuilder<SpawnedStoreReader>, Error> {
     let path_parsed = base_or_relative_path(&path)?;
     builder_from_url(path_parsed, handle).await
+}
+
+pub const ROW_NUMBER_COLUMN: &str = "_row_number";
+
+/// Read just the parquet footer metadata from a file in object store.
+/// No data is read — only the file's footer (typically < 100KB).
+pub async fn read_parquet_metadata(
+    store: Arc<dyn ObjectStore>,
+    path: &object_store::path::Path,
+    size: u64,
+    handle: Handle,
+) -> Result<Arc<ParquetMetaData>, anyhow::Error> {
+    let mut reader = StoreReader::spawned(store, path.clone(), size, handle);
+    Ok(reader.get_metadata(None).await?)
+}
+
+/// Stream every column of every row group, in file order.
+pub async fn stream_parquet(
+    store: Arc<dyn ObjectStore>,
+    path: &object_store::path::Path,
+    size: u64,
+    handle: Handle,
+) -> Result<parquet::arrow::async_reader::ParquetRecordBatchStream<SpawnedStoreReader>, anyhow::Error>
+{
+    let reader = StoreReader::spawned(store, path.clone(), size, handle);
+    Ok(open_builder(reader, ArrowReaderOptions::new())
+        .await?
+        .build()?)
+}
+
+pub async fn stream_projected_parquet(
+    store: Arc<dyn ObjectStore>,
+    path: &object_store::path::Path,
+    columns: &[String],
+    row_groups: Option<Vec<usize>>,
+    size: u64,
+    handle: Handle,
+) -> Result<parquet::arrow::async_reader::ParquetRecordBatchStream<SpawnedStoreReader>, anyhow::Error>
+{
+    let row_number_field = Arc::new(
+        Field::new(ROW_NUMBER_COLUMN, DataType::Int64, false).with_extension_type(RowNumber),
+    );
+    let options = ArrowReaderOptions::new().with_virtual_columns(vec![row_number_field])?;
+
+    let reader = StoreReader::spawned(store, path.clone(), size, handle);
+    let mut builder = open_builder(reader, options).await?;
+
+    let mask = parquet::arrow::ProjectionMask::columns(
+        builder.parquet_schema(),
+        columns.iter().map(|s| s.as_str()),
+    );
+
+    builder = builder.with_projection(mask);
+    if let Some(groups) = row_groups {
+        builder = builder.with_row_groups(groups);
+    }
+
+    let stream = builder.build()?;
+    Ok(stream)
 }
