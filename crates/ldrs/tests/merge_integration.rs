@@ -903,6 +903,81 @@ async fn test_merge_txn_processing_time_skip() {
     );
 }
 
+// A txn version that cannot be read must stop the merge, not read as "never committed".
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_merge_fails_when_the_txn_version_cannot_be_read() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path = test_table_path("txn_unreadable");
+    cleanup_table(&table_path);
+
+    let schema = test_schema();
+    let table_url = format!("file://{}/", table_path);
+
+    overwrite_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(make_target_batch(1..1001))]),
+        None,
+        None,
+        &OperationConfig::new("ldrs-test"),
+        &rt,
+    )
+    .await
+    .unwrap();
+
+    // A retention past i64 milliseconds parses, so the snapshot loads, but kernel's txn
+    // lookup fails computing the expiration.
+    let v0_actions = read_log_actions(&table_path, 0);
+    let mut metadata = find_action(&v0_actions, "metaData").unwrap().clone();
+    metadata["configuration"]["delta.setTransactionRetentionDuration"] =
+        "interval 9223372036854775807 seconds".into();
+    // In-commit timestamps are on, so the commit leads with a later `inCommitTimestamp`.
+    let ict = find_action(&v0_actions, "commitInfo").unwrap()["inCommitTimestamp"]
+        .as_i64()
+        .unwrap()
+        + 1;
+    let commit_info = serde_json::json!({ "commitInfo": {
+        "timestamp": ict,
+        "operation": "SET TBLPROPERTIES",
+        "inCommitTimestamp": ict,
+    }});
+    std::fs::write(
+        format!("{}/_delta_log/{:020}.json", table_path, 1),
+        format!("{commit_info}\n{}\n", serde_json::json!({ "metaData": metadata })),
+    )
+    .unwrap();
+
+    let config = MergeConfig {
+        merge_keys: vec!["id".to_string()],
+        allow_null_keys: false,
+        max_rows: None,
+        max_bytes: None,
+        txn_config: TxnConfig::ProcessingTime {
+            app_id: "ldrs-merge-test".to_string(),
+            batch_version: Some(1),
+        },
+        inline_deletion_vectors: false,
+    };
+    let err = merge_delta(
+        &table_url,
+        schema.clone(),
+        stream::iter(vec![Ok(make_source_batch(501..1501))]),
+        config,
+        &OperationConfig::new("ldrs-test"),
+        &rt,
+    )
+    .await
+    .err()
+    .expect("merge should fail when the txn version cannot be read");
+
+    assert!(
+        format!("{err:#}").contains("Retention duration exceeds"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(latest_version(&table_path), 1, "nothing should commit");
+}
+
 fn list_parquets(table_path: &str) -> std::collections::HashSet<std::ffi::OsString> {
     std::fs::read_dir(table_path)
         .unwrap()

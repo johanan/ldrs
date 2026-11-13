@@ -1996,7 +1996,6 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "futures",
- "ldrs-arrow",
  "ldrs-parquet",
  "ldrs-storage",
  "object_store",

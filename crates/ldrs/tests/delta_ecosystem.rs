@@ -384,6 +384,60 @@ async fn test_optimize_carries_a_foreign_in_commit_timestamp_forward() {
     assert_eq!(duckdb_islands(&table_path), contents);
 }
 
+/// Rows and a microsecond checksum per study. DuckDB reads INT96 as wall-clock time in its session
+/// time zone, so the session is pinned to UTC.
+fn duckdb_observed(table_path: &str) -> String {
+    duckdb_csv(&format!(
+        "SET TimeZone = 'UTC'; SELECT study_name, count(*), sum(epoch_us(observed_at)) \
+         FROM delta_scan('{table_path}') GROUP BY 1 ORDER BY 1"
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_optimize_rewrites_int96_timestamps_as_micros() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path =
+        copy_fixture_table("delta_spark/penguins_timestamps", "ecosystem_timestamps");
+    let table_url = format!("file://{}/", table_path);
+    let contents = duckdb_observed(&table_path);
+
+    let plan = ldrs_delta::plan_optimize(&table_url, None, None, &rt)
+        .await
+        .unwrap();
+    assert_eq!(plan.bins().len(), 1, "two files, one bin");
+
+    let outcome = ldrs_delta::execute_plan(plan, &OperationConfig::new("ldrs-test"), &rt)
+        .await
+        .unwrap();
+    let version = outcome.version.expect("a commit should have been written");
+
+    let actions = read_log_actions(&table_path, version);
+    let add = find_action(&actions, "add").expect("the compacted file should be added");
+    let file = format!("{}/{}", table_path, add["path"].as_str().unwrap());
+    assert_eq!(
+        duckdb_csv(&format!(
+            "SELECT type, logical_type FROM parquet_schema('{file}') WHERE name = 'observed_at'"
+        )),
+        "INT64,\"TimestampType(isAdjustedToUTC=1, unit=TimeUnit(MILLIS=<null>, \
+         MICROS=MicroSeconds(), NANOS=<null>))\"",
+        "delta stores a timestamp at microsecond precision"
+    );
+
+    let stats: serde_json::Value =
+        serde_json::from_str(add["stats"].as_str().expect("the add should carry stats")).unwrap();
+    assert_eq!(
+        stats["minValues"]["observed_at"],
+        "2007-11-10T05:00:25.123Z"
+    );
+    assert_eq!(
+        stats["maxValues"]["observed_at"],
+        "2008-11-15T05:01:00.123Z"
+    );
+
+    assert_eq!(duckdb_observed(&table_path), contents);
+}
+
 /// Rows per partition, with a real null told apart from an empty string.
 fn duckdb_partitions(table_path: &str) -> String {
     duckdb_csv(&format!(

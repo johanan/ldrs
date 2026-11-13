@@ -7,7 +7,6 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-ldrs-arrow = { path = "../ldrs-arrow" }
 ldrs-parquet = { path = "../ldrs-parquet" }
 ldrs-storage = { path = "../ldrs-storage" }
 

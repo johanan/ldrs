@@ -118,9 +118,32 @@ fn in_commit_timestamp(
 struct DeltaProtocol {
     min_reader_version: i32,
     min_writer_version: i32,
-    reader_features: Vec<TableFeature>,
-    writer_features: Vec<TableFeature>,
+    /// `None` on a side below table features, whose version alone declares what it supports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reader_features: Option<Vec<TableFeature>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writer_features: Option<Vec<TableFeature>>,
+    /// The legacy features the table's protocol supports, listed when a side moves to table
+    /// features.
+    #[serde(skip)]
+    reader_implied: Vec<TableFeature>,
+    #[serde(skip)]
+    writer_implied: Vec<TableFeature>,
 }
+
+/// The reader features a legacy reader version can support.
+const LEGACY_READER_FEATURES: [TableFeature; 1] = [TableFeature::ColumnMapping];
+
+/// The writer features a legacy writer version can support.
+const LEGACY_WRITER_FEATURES: [TableFeature; 7] = [
+    TableFeature::AppendOnly,
+    TableFeature::Invariants,
+    TableFeature::CheckConstraints,
+    TableFeature::ChangeDataFeed,
+    TableFeature::GeneratedColumns,
+    TableFeature::IdentityColumns,
+    TableFeature::ColumnMapping,
+];
 
 impl DeltaProtocol {
     /// What a table that declares nothing looks like, for a table being created.
@@ -128,36 +151,71 @@ impl DeltaProtocol {
         DeltaProtocol {
             min_reader_version: 0,
             min_writer_version: 0,
-            reader_features: Vec::new(),
-            writer_features: Vec::new(),
+            reader_features: None,
+            writer_features: None,
+            reader_implied: Vec::new(),
+            writer_implied: Vec::new(),
         }
     }
 
     fn from_snapshot(snapshot: &Snapshot) -> Self {
-        let protocol = snapshot.table_configuration().protocol();
+        let configuration = snapshot.table_configuration();
+        let protocol = configuration.protocol();
+        let supported = |candidates: &[TableFeature]| {
+            candidates
+                .iter()
+                .filter(|feature| configuration.is_feature_supported(feature))
+                .cloned()
+                .collect()
+        };
         DeltaProtocol {
             min_reader_version: protocol.min_reader_version(),
             min_writer_version: protocol.min_writer_version(),
-            reader_features: protocol.reader_features().unwrap_or_default().to_vec(),
-            writer_features: protocol.writer_features().unwrap_or_default().to_vec(),
+            reader_features: protocol.reader_features().map(<[_]>::to_vec),
+            writer_features: protocol.writer_features().map(<[_]>::to_vec),
+            reader_implied: supported(&LEGACY_READER_FEATURES),
+            writer_implied: supported(&LEGACY_WRITER_FEATURES),
         }
     }
 
-    fn with_reader_features(mut self, required: &[TableFeature]) -> Self {
-        append_missing(&mut self.reader_features, required);
-        if !self.reader_features.is_empty() {
+    fn with_reader_features(mut self, wanted: &[TableFeature]) -> Self {
+        if let Some(features) = raise(
+            self.reader_features.as_deref(),
+            &self.reader_implied,
+            wanted,
+        ) {
+            self.reader_features = Some(features);
             self.min_reader_version = MIN_READER_VERSION;
         }
         self
     }
 
-    fn with_writer_features(mut self, required: &[TableFeature]) -> Self {
-        append_missing(&mut self.writer_features, required);
-        if !self.writer_features.is_empty() {
+    fn with_writer_features(mut self, wanted: &[TableFeature]) -> Self {
+        if let Some(features) = raise(
+            self.writer_features.as_deref(),
+            &self.writer_implied,
+            wanted,
+        ) {
+            self.writer_features = Some(features);
             self.min_writer_version = MIN_WRITER_VERSION;
         }
         self
     }
+}
+
+/// One side's feature list with `wanted` added to what it declares and implies, or `None` when
+/// it already has everything wanted.
+fn raise(
+    declared: Option<&[TableFeature]>,
+    implied: &[TableFeature],
+    wanted: &[TableFeature],
+) -> Option<Vec<TableFeature>> {
+    let mut features = Vec::new();
+    append_missing(&mut features, declared.unwrap_or_default());
+    append_missing(&mut features, implied);
+    let had = features.len();
+    append_missing(&mut features, wanted);
+    (features.len() > had).then_some(features)
 }
 
 /// Append the required features the list does not already hold.
@@ -1113,8 +1171,10 @@ mod tests {
         DeltaProtocol {
             min_reader_version: MIN_READER_VERSION,
             min_writer_version: MIN_WRITER_VERSION,
-            reader_features: reader.to_vec(),
-            writer_features: writer.to_vec(),
+            reader_features: Some(reader.to_vec()),
+            writer_features: Some(writer.to_vec()),
+            reader_implied: Vec::new(),
+            writer_implied: Vec::new(),
         }
     }
 
@@ -1151,7 +1211,10 @@ mod tests {
         .unwrap();
         assert_eq!(target.min_reader_version, MIN_READER_VERSION);
         assert_eq!(target.min_writer_version, MIN_WRITER_VERSION);
-        assert_eq!(target.writer_features, merge.writer_features().to_vec());
+        assert_eq!(
+            target.writer_features,
+            Some(merge.writer_features().to_vec())
+        );
     }
 
     #[test]
@@ -1165,11 +1228,11 @@ mod tests {
         let target = upgrade(current, merge.reader_features(), merge.writer_features()).unwrap();
         assert_eq!(
             target.writer_features,
-            vec![
+            Some(vec![
                 TableFeature::TimestampWithoutTimezone,
                 rowtracking,
                 TableFeature::DeletionVectors,
-            ]
+            ])
         );
     }
 
@@ -1178,7 +1241,7 @@ mod tests {
         let unknown = TableFeature::Unknown("someFutureFeature".to_string());
         let current = declaring(&[], &[unknown.clone()]);
         let target = upgrade(current, &[], Operation::Merge.writer_features()).unwrap();
-        assert_eq!(target.writer_features[0], unknown);
+        assert_eq!(target.writer_features.as_deref().unwrap()[0], unknown);
         assert!(serde_json::to_string(&target)
             .unwrap()
             .contains("someFutureFeature"));
@@ -1198,6 +1261,133 @@ mod tests {
             upgrade(current, merge.reader_features(), merge.writer_features()),
             None
         );
+    }
+
+    /// A one-commit table holding an `id: long` column and the given `protocol` action.
+    fn table_with_protocol(protocol: &str) -> (SnapshotRef, Arc<dyn Engine>) {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let commit = format!(
+            "{}\n{}\n",
+            protocol,
+            r#"{"metaData":{"id":"legacy","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":0}}"#
+        );
+        futures::executor::block_on(store.put(
+            &object_store::path::Path::from("t/_delta_log/00000000000000000000.json"),
+            PutPayload::from(commit),
+        ))
+        .unwrap();
+        let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
+        let url = url::Url::parse("memory:///t/").unwrap();
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        (snapshot, engine)
+    }
+
+    fn id_schema() -> SchemaRef {
+        Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            true,
+        )]))
+    }
+
+    fn written_protocol(protocol: &str, operation: Operation) -> DeltaProtocol {
+        let (snapshot, engine) = table_with_protocol(protocol);
+        Commit::for_table(
+            operation,
+            &snapshot,
+            &id_schema(),
+            &OperationConfig::new("ldrs-test"),
+            engine.as_ref(),
+            0,
+        )
+        .unwrap()
+        .protocol
+        .expect("the operation needs features the table lacks")
+    }
+
+    fn assert_lists(declared: &Option<Vec<TableFeature>>, expected: &[TableFeature]) {
+        let declared = declared.as_deref().unwrap_or_default();
+        for feature in expected {
+            assert!(
+                declared.contains(feature),
+                "{feature:?} missing from {declared:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_upgrade_lists_what_a_legacy_writer_version_implied() {
+        let target = written_protocol(
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            Operation::Write,
+        );
+        assert_lists(
+            &target.writer_features,
+            &[
+                TableFeature::AppendOnly,
+                TableFeature::Invariants,
+                TableFeature::TimestampWithoutTimezone,
+            ],
+        );
+        assert_eq!(
+            target.reader_features,
+            Some(vec![TableFeature::TimestampWithoutTimezone])
+        );
+    }
+
+    #[test]
+    fn protocol_upgrade_lists_what_legacy_reader_and_writer_versions_implied() {
+        let target = written_protocol(
+            r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":5}}"#,
+            Operation::Merge,
+        );
+        assert_lists(
+            &target.reader_features,
+            &[TableFeature::ColumnMapping, TableFeature::DeletionVectors],
+        );
+        assert_lists(
+            &target.writer_features,
+            &[
+                TableFeature::AppendOnly,
+                TableFeature::Invariants,
+                TableFeature::CheckConstraints,
+                TableFeature::ChangeDataFeed,
+                TableFeature::GeneratedColumns,
+                TableFeature::ColumnMapping,
+                TableFeature::DeletionVectors,
+            ],
+        );
+    }
+
+    #[test]
+    fn protocol_upgrade_lists_what_a_legacy_reader_version_implied() {
+        // The shape Spark writes for a column-mapped table
+        let target = written_protocol(
+            r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":7,"writerFeatures":["columnMapping","appendOnly","invariants"]}}"#,
+            Operation::Write,
+        );
+        assert_lists(
+            &target.reader_features,
+            &[
+                TableFeature::ColumnMapping,
+                TableFeature::TimestampWithoutTimezone,
+            ],
+        );
+    }
+
+    #[test]
+    fn protocol_upgrade_leaves_a_legacy_table_alone_when_nothing_is_needed() {
+        let (snapshot, engine) =
+            table_with_protocol(r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#);
+        let commit = Commit::for_maintenance(
+            Operation::Optimize,
+            &snapshot,
+            &OperationConfig::new("ldrs-test"),
+            engine.as_ref(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(commit.protocol, None);
     }
 
     #[test]

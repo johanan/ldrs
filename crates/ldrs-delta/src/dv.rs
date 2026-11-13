@@ -33,9 +33,13 @@ pub(crate) fn serialize_dv(bitmap: &RoaringTreemap) -> Vec<u8> {
 }
 
 pub(crate) fn build_dv_inline(bytes: &[u8], cardinality: i64) -> DeletionVectorDescriptor {
+    // Delta's Base85 zero-pads the end to a multiple of 4 and readers truncate to `sizeInBytes`;
+    // the z85 crate's own tail encoding for unaligned input is not readable by Spark.
+    let mut padded = bytes.to_vec();
+    padded.resize(bytes.len().next_multiple_of(4), 0);
     DeletionVectorDescriptor {
         storage_type: "i".to_string(),
-        path_or_inline_dv: z85::encode(bytes),
+        path_or_inline_dv: z85::encode(&padded),
         offset: None,
         size_in_bytes: bytes.len() as i32,
         cardinality,
@@ -134,4 +138,56 @@ pub(crate) fn read_existing_dvs(
         );
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use delta_kernel::actions::deletion_vector::{
+        DeletionVectorDescriptor as KernelDv, DeletionVectorStorageType,
+    };
+    use delta_kernel::Engine;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
+    use std::sync::Arc;
+
+    // Row indexes 99..=109 serialize to 54 bytes, two past a multiple of 4.
+    fn unaligned_bitmap() -> RoaringTreemap {
+        (99..=109).collect()
+    }
+
+    #[test]
+    fn an_unaligned_inline_dv_encodes_like_spark() {
+        let bytes = serialize_dv(&unaligned_bitmap());
+        assert_eq!(bytes.len(), 54);
+
+        let dv = build_dv_inline(&bytes, 11);
+
+        // Spark 3.5.5 / delta-spark 3.3.2 `Base85Codec.encodeBytes` of the same bytes.
+        assert_eq!(
+            dv.path_or_inline_dv,
+            "^Bg9^0rr910000000000iXQKl0rr91000ua5c8Xgv/Q3twDlrxx8(PBx-I(FyxeeJz2:Lo"
+        );
+        assert_eq!(dv.size_in_bytes, 54);
+    }
+
+    #[test]
+    fn kernel_reads_an_unaligned_inline_dv() {
+        let bytes = serialize_dv(&unaligned_bitmap());
+        let dv = build_dv_inline(&bytes, 11);
+
+        let kernel_dv = KernelDv::try_new(
+            DeletionVectorStorageType::Inline,
+            dv.path_or_inline_dv,
+            None,
+            dv.size_in_bytes,
+            dv.cardinality,
+        )
+        .unwrap();
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let engine = DefaultEngineBuilder::new(store).build();
+        let parent = url::Url::parse("memory:///t/").unwrap();
+
+        let read = kernel_dv.read(engine.storage_handler(), &parent).unwrap();
+        assert_eq!(read, unaligned_bitmap());
+    }
 }

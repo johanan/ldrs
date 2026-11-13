@@ -164,6 +164,32 @@ def penguins_in_commit_timestamps(spark: SparkSession, path: Path) -> None:
         )
 
 
+def penguins_timestamps(spark: SparkSession, path: Path) -> None:
+    frame = (
+        snake_case(penguins(spark))
+        .select(
+            "study_name",
+            "sample_number",
+            # Spark writes `timestamp` as INT96. The microsecond fraction exposes a unit mixup
+            # that a midnight value would hide.
+            (
+                F.col("date_egg").cast("timestamp")
+                + F.make_interval(secs=F.col("sample_number") + F.lit(0.123456))
+            ).alias("observed_at"),
+        )
+        .cache()
+    )
+    for study in studies(frame, "study_name")[:2]:
+        (
+            frame.where(F.col("study_name") == study)
+            .limit(40)
+            .repartition(1)
+            .write.format("delta")
+            .mode("append")
+            .save(str(path))
+        )
+
+
 def studies(frame: DataFrame, column: str) -> list[str]:
     return [
         row[0] for row in frame.select(column).distinct().sort(column).collect()
@@ -189,6 +215,8 @@ def build(spark: SparkSession, name: str) -> None:
             penguins_in_commit_timestamps(spark, path)
         case "penguins_iceberg_compat":
             penguins_iceberg_compat(spark, path)
+        case "penguins_timestamps":
+            penguins_timestamps(spark, path)
         case _:
             raise ValueError(f"unknown fixture '{name}'")
 
