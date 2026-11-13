@@ -31,8 +31,9 @@ pub fn base_or_relative_path(path: &str) -> Result<Url, anyhow::Error> {
             );
             let current_dir =
                 std::env::current_dir().with_context(|| "Could not get current dir")?;
-            let base = Url::parse(&format!("file://{}/", current_dir.display()))
-                .with_context(|| "Could not parse base path file URL")?;
+            let base = Url::from_directory_path(&current_dir).map_err(|()| {
+                anyhow::anyhow!("Could not build a file URL for '{}'", current_dir.display())
+            })?;
             Url::options()
                 .base_url(Some(&base))
                 .parse(relative_path)
@@ -42,15 +43,23 @@ pub fn base_or_relative_path(path: &str) -> Result<Url, anyhow::Error> {
         Err(ParseError::RelativeUrlWithoutBase) => {
             let current_dir =
                 std::env::current_dir().with_context(|| "Could not get current dir")?;
-            let base = Url::parse(&format!("file://{}/", current_dir.display()))
-                .with_context(|| "Could not parse base path file URL")?;
+            let base = Url::from_directory_path(&current_dir).map_err(|()| {
+                anyhow::anyhow!("Could not build a file URL for '{}'", current_dir.display())
+            })?;
             Url::options()
                 .base_url(Some(&base))
-                .parse(path)
+                .parse(&escape_path(path))
                 .with_context(|| "Could not parse relative path file URL")
         }
         _ => Err(anyhow::Error::msg("Could not parse path URL")),
     }
+}
+
+/// Escape the characters a relative URL reads differently from a path.
+fn escape_path(path: &str) -> String {
+    path.replace('%', "%25")
+        .replace('#', "%23")
+        .replace('?', "%3F")
 }
 
 /// Resolve `base` (via [`base_or_relative_path`]) and append `relative` onto its path with
@@ -64,7 +73,7 @@ pub fn join_into_url(base: &str, relative: &str) -> Result<Url, anyhow::Error> {
         url.set_path(&dir_path);
     }
     // Strip a leading slash so `relative` joins as relative, not absolute.
-    url.join(relative.trim_start_matches('/'))
+    url.join(&escape_path(relative.trim_start_matches('/')))
         .with_context(|| "Could not join relative path onto base URL")
 }
 
@@ -403,6 +412,29 @@ mod tests {
             if *is_ok {
                 assert_eq!(result.unwrap().as_str(), *expected);
             }
+        }
+    }
+
+    #[test]
+    fn a_path_keeps_url_reserved_characters_in_its_name() {
+        let cd = std::env::current_dir().unwrap();
+        for name in ["data#1.parquet", "x?y.parquet", "pct%41.parquet"] {
+            let url = base_or_relative_path(name).unwrap();
+            assert_eq!(url.to_file_path().unwrap(), cd.join(name), "path {name}");
+        }
+    }
+
+    #[test]
+    fn a_joined_name_keeps_url_reserved_characters() {
+        for (name, expected) in [
+            ("out#1.parquet", "/dir/out%231.parquet"),
+            ("x?y.parquet", "/dir/x%3Fy.parquet"),
+            ("pct%41.parquet", "/dir/pct%2541.parquet"),
+        ] {
+            let url = join_into_url("s3://bucket/dir", name).unwrap();
+            assert_eq!(url.path(), expected, "join {name}");
+            assert_eq!(url.query(), None, "join {name}");
+            assert_eq!(url.fragment(), None, "join {name}");
         }
     }
 
