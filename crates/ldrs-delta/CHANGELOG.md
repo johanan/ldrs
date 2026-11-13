@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5] - 2026-11-13
+
+### Bug Fixes
+
+- *(delta)* Protocol upgrade, txn guard, inline DVs, INT96 optimize
+
+Fix for legacy protocol upgrades, or skipping them.
+
+txn version failure fix
+
+Inline DVs correctly pad to multiples of 4 (Spark compat)
+
+Optimize handles INT96 and nanosecond columns
+
+- *(parquet)* INT96 as micros, max_bytes, abort upload
+
+Always upgrade INT96 to micros.
+
+max_bytes counts in memory row groups now.
+
+Better abort on failures to not leave uploads hanging around.
+
+- *(postgres)* Out-of-range dates error, deprecate role
+
+Properly errors out bad dates instead of NULL.
+
+role config option is deprecated. Use the options=-c role
+instead
+
+- *(storage)* Reserved characters in paths
+
+Properly handle #,?, and % in a path.
+
+
+### Refactor
+
+- *(parquet)* Drop unused write_parquet functions
+
+Everything writes through the sink and this was code that just was used
+in tests.
+
+
 ## [0.1.4] - 2026-10-13
 
 ### Bug Fixes
