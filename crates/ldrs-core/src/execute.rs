@@ -15,7 +15,7 @@ use ldrs_delta::{ensure_table, DeltaMergeSink, DeltaOverwriteSink, OperationConf
 use ldrs_parquet::{default_writer_props, with_bloom_filters, ParquetSink};
 use ldrs_postgres::{build_pg_pool, PgLoad, PgSink};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::phase::PhaseOutput;
 use crate::plan::{DeltaMode, DestSpec, Task};
@@ -65,17 +65,18 @@ pub async fn run_task(
                 }
                 Err(e) => {
                     abort_all(sinks).await;
-                    // Prefer the sink error: it names exactly what failed.
-                    if let Err(child_err) = reap_source(cleanup_handle).await {
-                        debug!("source cleanup after sink failure: {child_err}");
+                    // A source failure is usually the cause.
+                    match reap_source(cleanup_handle).await {
+                        Ok(()) => Err(e),
+                        Err(source_err) => Err(e.context(format!("source failed: {source_err:#}"))),
                     }
-                    Err(e)
                 }
             }
         }
         None => {
             warn!("No schema found, most likely the load failed or no Arrow Record Batches were produced.");
             // No sinks were built; surface a source failure if the handle reports one.
+            drop(src.stream_type);
             reap_source(cleanup_handle).await?;
             Ok(None)
         }

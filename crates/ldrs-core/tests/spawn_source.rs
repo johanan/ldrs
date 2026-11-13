@@ -7,7 +7,10 @@ use arrow::ipc::writer::StreamWriter;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use futures::StreamExt;
+use ldrs_core::execute::run_task;
+use ldrs_core::plan::{DestSpec, PqDest, SourceSpec, Task};
 use ldrs_core::spawn::{resolve_schema, spawn_arrow_source, Spawned};
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -187,6 +190,22 @@ async fn child_error_reports_stderr_not_the_broken_pipe() {
     );
 }
 
+/// Non-UTF-8 stderr must not replace the exit status.
+#[test_log::test(tokio::test)]
+async fn non_utf8_stderr_still_reports_the_exit_status() {
+    let out = run(shell_source(
+        r"printf '\377\376 boom' >&2; exit 1".to_string(),
+        None,
+    ))
+    .await;
+
+    let err = out
+        .settled
+        .expect_err("a non-zero exit must fail the source");
+    assert!(err.contains("exit status: 1"), "got: {err}");
+    assert!(err.contains("boom"), "got: {err}");
+}
+
 #[test_log::test(tokio::test)]
 async fn missing_extension_fails_before_the_stream_opens() {
     let out = run(duckdb_source(
@@ -263,4 +282,75 @@ async fn stream_cut_mid_message_fails_on_the_batch() {
     out.settled.expect_err("a partial message must fail");
 
     let _ = std::fs::remove_file(fixture);
+}
+
+/// A child killed because the consumer stopped reading is not a failure.
+#[test_log::test(tokio::test)]
+async fn a_source_abandoned_by_its_consumer_settles_clean() {
+    let (fixture, _) = write_ipc_fixture("ldrs_spawn_abandoned.arrows", 40, 100);
+    // `exec` so the kill reaches the process holding the pipes.
+    let source = spawn_arrow_source(shell_source(
+        format!("cat '{}'; exec sleep 30", fixture.display()),
+        None,
+    ));
+
+    let settled = tokio::time::timeout(Duration::from_secs(20), async {
+        assert!(resolve_schema(source.schema_rx).await.is_some());
+        let mut stream = source.batch_stream;
+        stream
+            .next()
+            .await
+            .expect("a first batch")
+            .expect("the first batch decodes");
+        drop(stream);
+        source
+            .command_handle
+            .await
+            .expect("cleanup task panicked")
+            .map_err(|e| format!("{e:#}"))
+    })
+    .await
+    .expect("an abandoned source should settle without waiting for the child");
+
+    assert_eq!(settled, Ok(()));
+    let _ = std::fs::remove_file(fixture);
+}
+
+/// A load failed by its source reports the source's error.
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn a_load_failed_by_its_source_reports_the_source_error() {
+    let (fixture, boundaries) = write_ipc_fixture("ldrs_spawn_run_task.arrows", 8, 2000);
+    let cut = boundaries[4] + 64;
+    let dir = std::env::temp_dir().join("ldrs_spawn_run_task");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let task = Task {
+        name: "broken_source".to_string(),
+        source: SourceSpec::Spawned(shell_source(
+            format!(
+                "head -c {cut} '{}'; echo SOURCE_BROKE >&2; exit 1",
+                fixture.display()
+            ),
+            None,
+        )),
+        dests: vec![DestSpec::Pq(PqDest {
+            url: format!("file://{}/", dir.display()),
+            namer: Box::new(|_| Ok("part-0.parquet".to_string())),
+            bloom_filters: vec![],
+            max_rows: None,
+            max_bytes: None,
+            columns: vec![],
+            target: "part-0.parquet".to_string(),
+        })],
+    };
+
+    let err = run_task(&tokio::runtime::Handle::current(), &HashMap::new(), task)
+        .await
+        .expect_err("a broken source must fail the load");
+    let err = format!("{err:#}");
+    assert!(err.contains("SOURCE_BROKE"), "got: {err}");
+
+    let _ = std::fs::remove_file(fixture);
+    let _ = std::fs::remove_dir_all(dir);
 }
