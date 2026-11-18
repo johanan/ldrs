@@ -1,13 +1,13 @@
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::complete::{tag, take_until, take_while1},
     character::complete::char,
     combinator::{map, opt, rest},
     multi::{many1, separated_list1},
     sequence::{delimited, preceded},
-    IResult, Parser,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone)]
 pub struct PathPattern<'a> {

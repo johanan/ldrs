@@ -346,9 +346,11 @@ mod tests {
         assert!(secret.contains("SCOPE 's3://bucket/prefix/'"));
         assert!(secret.ends_with(';'));
 
-        assert!(secret_statement("gs://bucket/prefix/", &[])
-            .unwrap()
-            .contains("TYPE gcs"));
+        assert!(
+            secret_statement("gs://bucket/prefix/", &[])
+                .unwrap()
+                .contains("TYPE gcs")
+        );
     }
 
     #[test]

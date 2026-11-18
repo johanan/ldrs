@@ -9,7 +9,7 @@ use arrow_schema::{DataType, Field, Schema};
 use futures::StreamExt;
 use ldrs_core::execute::run_task;
 use ldrs_core::plan::{DestSpec, PqDest, SourceSpec, Task};
-use ldrs_core::spawn::{resolve_schema, spawn_arrow_source, Spawned};
+use ldrs_core::spawn::{Spawned, resolve_schema, spawn_arrow_source};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;

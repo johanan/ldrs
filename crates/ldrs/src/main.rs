@@ -8,15 +8,15 @@ use ldrs::cli_schema;
 use ldrs::error::RunError;
 use ldrs::ldrs_config::config::LdrsConfig;
 use ldrs::ldrs_config::{
-    execute_configs, infer_env_type, parse_tables, register_from_config, resolve_delta_targets,
-    DeltaTarget,
+    DeltaTarget, execute_configs, infer_env_type, parse_tables, register_from_config,
+    resolve_delta_targets,
 };
 use ldrs::ldrs_env::get_all_ldrs_env_vars;
 use ldrs::results::Results;
-use ldrs_delta::{execute_plan, plan_optimize, vacuum, OperationConfig, Retention};
+use ldrs_delta::{OperationConfig, Retention, execute_plan, plan_optimize, vacuum};
 use serde_yaml::{Mapping, Value};
 use tracing::{error, info};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Subcommand)]
 enum DeltaCommands {

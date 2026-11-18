@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use handlebars::handlebars_helper;
 use heck::ToShoutySnakeCase;
 use ldrs_arrow::ColumnType;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 /// Screaming-snake-case an identity for env-var lookups and template scoping (the one shared rule).

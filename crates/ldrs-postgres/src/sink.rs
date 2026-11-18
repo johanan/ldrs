@@ -4,8 +4,8 @@ use anyhow::Context;
 use arrow_array::RecordBatch;
 use deadpool_postgres::Object;
 use ldrs_arrow::{ColumnSpec, TypedColumnAccessor};
-use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::Client;
+use tokio_postgres::binary_copy::BinaryCopyInWriter;
 
 use crate::extracted_values::{ColumnConverter, ExtractedValue};
 use crate::map_colspec_to_pg_type;

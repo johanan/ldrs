@@ -6,9 +6,9 @@ use std::borrow::Cow;
 
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal32Array,
-    Decimal64Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, StringArray, StructArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal32Array, Decimal64Array,
+    Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, StringArray, StructArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
@@ -96,31 +96,33 @@ define_column_accessor!(
 );
 
 impl<'a> TypedColumnAccessor<'a> {
-    pub unsafe fn as_uuid(&self, row: usize) -> Option<uuid::Uuid> { unsafe {
-        match self {
-            Self::FixedSizeBinary(arr, _) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    uuid::Uuid::from_slice(arr.value_unchecked(row))
-                        .map(Some)
-                        .unwrap_or_else(|e| {
-                            panic!("Failed to parse UUID from FixedSizeBinary: {}", e)
-                        })
+    pub unsafe fn as_uuid(&self, row: usize) -> Option<uuid::Uuid> {
+        unsafe {
+            match self {
+                Self::FixedSizeBinary(arr, _) => {
+                    if arr.is_null(row) {
+                        None
+                    } else {
+                        uuid::Uuid::from_slice(arr.value_unchecked(row))
+                            .map(Some)
+                            .unwrap_or_else(|e| {
+                                panic!("Failed to parse UUID from FixedSizeBinary: {}", e)
+                            })
+                    }
                 }
-            }
-            Self::Utf8(arr) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    uuid::Uuid::parse_str(arr.value_unchecked(row))
-                        .map(Some)
-                        .unwrap_or_else(|e| panic!("Failed to parse UUID from String: {}", e))
+                Self::Utf8(arr) => {
+                    if arr.is_null(row) {
+                        None
+                    } else {
+                        uuid::Uuid::parse_str(arr.value_unchecked(row))
+                            .map(Some)
+                            .unwrap_or_else(|e| panic!("Failed to parse UUID from String: {}", e))
+                    }
                 }
+                _ => panic!("Not a FixedSizeBinary or Utf8 array"),
             }
-            _ => panic!("Not a FixedSizeBinary or Utf8 array"),
         }
-    }}
+    }
 
     /// The row as a naive datetime, `Ok(None)` for a null, or `Err` with the raw value when
     /// chrono cannot represent it.
@@ -163,47 +165,49 @@ impl<'a> TypedColumnAccessor<'a> {
     pub unsafe fn as_chrono_tz(
         &self,
         row: usize,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, i64> { unsafe {
-        match self {
-            Self::TimestampSecond(arr, _) => {
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    let ts = arr.value_unchecked(row);
-                    DateTime::<Utc>::from_timestamp(ts, 0).map(Some).ok_or(ts)
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, i64> {
+        unsafe {
+            match self {
+                Self::TimestampSecond(arr, _) => {
+                    if arr.is_null(row) {
+                        Ok(None)
+                    } else {
+                        let ts = arr.value_unchecked(row);
+                        DateTime::<Utc>::from_timestamp(ts, 0).map(Some).ok_or(ts)
+                    }
                 }
-            }
-            Self::TimestampMillisecond(arr, _) => {
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    let ts = arr.value_unchecked(row);
-                    DateTime::<Utc>::from_timestamp_millis(ts)
-                        .map(Some)
-                        .ok_or(ts)
+                Self::TimestampMillisecond(arr, _) => {
+                    if arr.is_null(row) {
+                        Ok(None)
+                    } else {
+                        let ts = arr.value_unchecked(row);
+                        DateTime::<Utc>::from_timestamp_millis(ts)
+                            .map(Some)
+                            .ok_or(ts)
+                    }
                 }
-            }
-            Self::TimestampMicrosecond(arr, _) => {
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    let ts = arr.value_unchecked(row);
-                    DateTime::<Utc>::from_timestamp_micros(ts)
-                        .map(Some)
-                        .ok_or(ts)
+                Self::TimestampMicrosecond(arr, _) => {
+                    if arr.is_null(row) {
+                        Ok(None)
+                    } else {
+                        let ts = arr.value_unchecked(row);
+                        DateTime::<Utc>::from_timestamp_micros(ts)
+                            .map(Some)
+                            .ok_or(ts)
+                    }
                 }
-            }
-            Self::TimestampNanosecond(arr, _) => {
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    let ts = arr.value_unchecked(row);
-                    Ok(Some(DateTime::<Utc>::from_timestamp_nanos(ts)))
+                Self::TimestampNanosecond(arr, _) => {
+                    if arr.is_null(row) {
+                        Ok(None)
+                    } else {
+                        let ts = arr.value_unchecked(row);
+                        Ok(Some(DateTime::<Utc>::from_timestamp_nanos(ts)))
+                    }
                 }
+                _ => Ok(None),
             }
-            _ => Ok(None),
         }
-    }}
+    }
 
     pub fn as_text(&self, row: usize) -> Option<Cow<'a, str>> {
         match self {
@@ -231,18 +235,20 @@ impl<'a> TypedColumnAccessor<'a> {
     }
 
     #[inline]
-    pub unsafe fn TimestampMillisecond(&self, row: usize) -> Option<i64> { unsafe {
-        match self {
-            Self::TimestampMillisecond(arr, _) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value_unchecked(row))
+    pub unsafe fn TimestampMillisecond(&self, row: usize) -> Option<i64> {
+        unsafe {
+            match self {
+                Self::TimestampMillisecond(arr, _) => {
+                    if arr.is_null(row) {
+                        None
+                    } else {
+                        Some(arr.value_unchecked(row))
+                    }
                 }
+                _ => panic!("Not a TimestampMillisecond array"),
             }
-            _ => panic!("Not a TimestampMillisecond array"),
         }
-    }}
+    }
 
     #[inline]
     pub fn TimestampMicrosecond(&self, row: usize) -> Option<i64> {
@@ -273,18 +279,20 @@ impl<'a> TypedColumnAccessor<'a> {
     }
 
     #[inline]
-    pub unsafe fn Decimal128(&self, row: usize) -> Option<i128> { unsafe {
-        match self {
-            Self::Decimal128(arr, _, _) => {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value_unchecked(row))
+    pub unsafe fn Decimal128(&self, row: usize) -> Option<i128> {
+        unsafe {
+            match self {
+                Self::Decimal128(arr, _, _) => {
+                    if arr.is_null(row) {
+                        None
+                    } else {
+                        Some(arr.value_unchecked(row))
+                    }
                 }
+                _ => panic!("Not a Decimal128 array"),
             }
-            _ => panic!("Not a Decimal128 array"),
         }
-    }}
+    }
 
     #[inline]
     pub fn FixedSizeBinary(&self, row: usize) -> Option<&'a [u8]> {

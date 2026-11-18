@@ -8,19 +8,19 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit as ArrowTimeUnit};
 use deadpool_postgres::Pool;
 use ldrs_arrow::{
-    build_arrow_transform_strategy, build_source_and_target_schema, ArrowColumnTransformStrategy,
-    ColumnSpec, TimeUnit,
+    ArrowColumnTransformStrategy, ColumnSpec, TimeUnit, build_arrow_transform_strategy,
+    build_source_and_target_schema,
 };
-use ldrs_delta::{ensure_table, DeltaMergeSink, DeltaOverwriteSink, OperationConfig};
-use ldrs_parquet::{default_writer_props, with_bloom_filters, ParquetSink};
-use ldrs_postgres::{build_pg_pool, PgLoad, PgSink};
+use ldrs_delta::{DeltaMergeSink, DeltaOverwriteSink, OperationConfig, ensure_table};
+use ldrs_parquet::{ParquetSink, default_writer_props, with_bloom_filters};
+use ldrs_postgres::{PgLoad, PgSink, build_pg_pool};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::phase::PhaseOutput;
 use crate::plan::{DeltaMode, DestSpec, Task};
 use crate::sink::{
-    abort_all, drive, finish_all, ArrowStdoutSink, BatchTransform, Sink, Transforms,
+    ArrowStdoutSink, BatchTransform, Sink, Transforms, abort_all, drive, finish_all,
 };
 use crate::source::open_source;
 
@@ -74,7 +74,9 @@ pub async fn run_task(
             }
         }
         None => {
-            warn!("No schema found, most likely the load failed or no Arrow Record Batches were produced.");
+            warn!(
+                "No schema found, most likely the load failed or no Arrow Record Batches were produced."
+            );
             // No sinks were built; surface a source failure if the handle reports one.
             drop(src.stream_type);
             reap_source(cleanup_handle).await?;

@@ -1,7 +1,7 @@
 use bytes::BufMut;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use ldrs_arrow::{ColumnSpec, TypedColumnAccessor};
-use postgres_types::{to_sql_checked, ToSql, Type};
+use postgres_types::{ToSql, Type, to_sql_checked};
 
 use crate::{arrow_bridge::ToPgNumeric, pg_numeric::PgFixedNumeric};
 

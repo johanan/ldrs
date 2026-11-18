@@ -3,7 +3,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Int32Array, TimestampMicrosecondArray, TimestampMillisecondArray};
 use arrow_schema::TimeUnit;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use ldrs::arrow_access::TypedColumnAccessor;
 use ldrs::types::ColumnSchema;
 use postgres_types::Type;

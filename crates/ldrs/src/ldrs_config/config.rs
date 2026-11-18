@@ -2,10 +2,10 @@ use crate::{
     delta::{self, DeltaCommon, DeltaDestination, DeltaMerge, RegisterSpec, SfRegister},
     file_source::FileSource,
     finalize::{FinalizeItem, SfFinalize},
-    ldrs_config::field_validation::{extract_props, find_unknown_keys, UnknownKey},
+    ldrs_config::field_validation::{UnknownKey, extract_props, find_unknown_keys},
     ldrs_duckdb::duckdb_source::{DuckDbBlock, DuckDbSource},
     ldrs_snowflake::snowflake_source::{
-        from_serde_yaml as from_sf_serde_yaml, SFQuery, SFSource, SFTable,
+        SFQuery, SFSource, SFTable, from_serde_yaml as from_sf_serde_yaml,
     },
     parquet::ParquetDestination,
     postgres::postgres_destination::{PgCommon, PgDeleteInsert, PgDestination, PgMerge},

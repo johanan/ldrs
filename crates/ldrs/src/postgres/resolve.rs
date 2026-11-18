@@ -4,17 +4,17 @@
 
 use ldrs_postgres::Command;
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::complete::{escaped_transform, is_not, tag},
     character::complete::{anychar, multispace0, multispace1},
     combinator::map,
     multi::separated_list0,
     sequence::{delimited, preceded, separated_pair},
-    IResult, Parser,
 };
 
 use crate::ldrs_config::get_env_value;
-use crate::ldrs_env::{shouty, LdrsExecutionContext};
+use crate::ldrs_env::{LdrsExecutionContext, shouty};
 use crate::postgres::postgres_destination::PgDestCommand;
 
 /// One argument: an unescaped space ends it, `\x` yields `x`, and `\\` a literal backslash.

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use arrow::array::AsArray;
-use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::Array;
-use crc::{Crc, CRC_32_ISO_HDLC};
+use arrow_array::types::{Int32Type, Int64Type};
+use crc::{CRC_32_ISO_HDLC, Crc};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -143,10 +143,10 @@ pub(crate) fn read_existing_dvs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use delta_kernel::Engine;
     use delta_kernel::actions::deletion_vector::{
         DeletionVectorDescriptor as KernelDv, DeletionVectorStorageType,
     };
-    use delta_kernel::Engine;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use std::sync::Arc;
 

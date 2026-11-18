@@ -3,7 +3,7 @@ use futures::TryStreamExt;
 use ldrs::ldrs_config::{execute_configs, infer_env_type, parse_tables, resolve_delta_targets};
 use ldrs::results::Results;
 use ldrs_delta::{
-    delta_stats_to_json, parquet_metadata_to_delta_stats, vacuum, OperationConfig, Retention,
+    OperationConfig, Retention, delta_stats_to_json, parquet_metadata_to_delta_stats, vacuum,
 };
 
 mod common;
@@ -222,14 +222,18 @@ async fn test_delta_stats_json_from_users_parquet() {
     assert_eq!(json["minValues"]["active"], false);
     assert_eq!(json["maxValues"]["active"], true);
 
-    assert!(json["minValues"]["unique_id"]
-        .as_str()
-        .unwrap()
-        .contains("\\u"));
-    assert!(json["maxValues"]["unique_id"]
-        .as_str()
-        .unwrap()
-        .contains("\\u"));
+    assert!(
+        json["minValues"]["unique_id"]
+            .as_str()
+            .unwrap()
+            .contains("\\u")
+    );
+    assert!(
+        json["maxValues"]["unique_id"]
+            .as_str()
+            .unwrap()
+            .contains("\\u")
+    );
 
     assert_eq!(json["nullCount"]["nullable_id"], 2);
     assert!(json["minValues"].get("nullable_id").is_none());
@@ -1269,8 +1273,8 @@ tables:
     };
 
     assert_eq!(
-        metadata_at(1).expect("the merge changed the configuration, so v1 carries metaData")
-            ["configuration"]["delta.enableDeletionVectors"],
+        metadata_at(1).expect("the merge changed the configuration, so v1 carries metaData")["configuration"]
+            ["delta.enableDeletionVectors"],
         "true",
         "the merge should have enabled deletion vectors at v1"
     );
@@ -1561,8 +1565,7 @@ async fn test_table_properties_are_added_changed_and_never_removed() {
 
     overwrite(sized(1024)).await;
     assert_eq!(
-        configuration_at(1).expect("v1 declares a property the table lacked")
-            ["delta.targetFileSize"],
+        configuration_at(1).expect("v1 declares a property the table lacked")["delta.targetFileSize"],
         "1024"
     );
 

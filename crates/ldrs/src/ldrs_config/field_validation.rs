@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde_yaml::Value;
 
 #[derive(Debug, PartialEq, Clone)]

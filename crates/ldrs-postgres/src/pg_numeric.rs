@@ -4,7 +4,7 @@
 //! directly to a `BytesMut`, using stack-allocated digit arrays.
 
 use bytes::{BufMut, BytesMut};
-use postgres_types::{to_sql_checked, IsNull, ToSql, Type};
+use postgres_types::{IsNull, ToSql, Type, to_sql_checked};
 
 const SIGN_POS: u16 = 0x0000;
 const SIGN_NEG: u16 = 0x4000;

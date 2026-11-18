@@ -4,9 +4,9 @@ use ldrs_delta::{MergeConfig, OperationConfig, TxnConfig};
 mod common;
 use common::{merge_delta, overwrite_delta};
 use ldrs_test_fixtures::delta::{
-    cleanup_table, count_actions, delta_table_path, duckdb_count, duckdb_summary, find_action,
-    latest_version, make_batch_from_ids, make_source_batch, make_target_batch, read_log_actions,
-    test_schema, SOURCE_BASE_TS,
+    SOURCE_BASE_TS, cleanup_table, count_actions, delta_table_path, duckdb_count, duckdb_summary,
+    find_action, latest_version, make_batch_from_ids, make_source_batch, make_target_batch,
+    read_log_actions, test_schema,
 };
 use std::ops::Range;
 

@@ -276,11 +276,13 @@ tables:
             .value(0),
         1.5
     );
-    assert!(col("c_boolean")
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .unwrap()
-        .value(0));
+    assert!(
+        col("c_boolean")
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0)
+    );
     assert_eq!(
         col("c_date")
             .as_any()
