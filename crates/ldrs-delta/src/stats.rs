@@ -10,10 +10,10 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::Scalar;
 use parquet::data_type::AsBytes;
 use parquet::file::metadata::ParquetMetaData;
-use parquet::file::statistics::Statistics;
+use parquet::file::statistics::Statistics::{self, Double, Float};
 
 pub struct ColumnStats {
-    pub null_count: i64,
+    pub null_count: Option<u64>,
     pub min: Option<Scalar>,
     pub max: Option<Scalar>,
     pub tight_bounds: bool,
@@ -142,6 +142,7 @@ pub(crate) fn pick_bound(
     ordering: Ordering,
 ) -> Option<Scalar> {
     match (current, new) {
+        (current, Some(new)) if is_nan(&new) => current,
         (None, new) => new,
         (current, None) => current,
         (Some(cur), Some(new)) => {
@@ -151,6 +152,14 @@ pub(crate) fn pick_bound(
                 Some(cur)
             }
         }
+    }
+}
+
+fn is_nan(scalar: &Scalar) -> bool {
+    match scalar {
+        Scalar::Float(v) => v.is_nan(),
+        Scalar::Double(v) => v.is_nan(),
+        _ => false,
     }
 }
 
@@ -187,8 +196,13 @@ fn scalar_to_json_value(
         (Scalar::Long(v), Int64) => Some(serde_json::json!(v)),
         (Scalar::Short(v), Int16) => Some(serde_json::json!(v)),
         (Scalar::Byte(v), Int8) => Some(serde_json::json!(v)),
+
+        (Scalar::Float(v), Float16 | Float32) if v.is_nan() => Some(serde_json::json!("NaN")),
+        (Scalar::Double(v), Float64) if v.is_nan() => Some(serde_json::json!("NaN")),
+
         (Scalar::Float(v), Float16 | Float32) => Some(serde_json::json!(v)),
         (Scalar::Double(v), Float64) => Some(serde_json::json!(v)),
+
         (Scalar::Boolean(v), Boolean) => Some(serde_json::json!(v)),
 
         (Scalar::String(s), Utf8 | LargeUtf8 | Utf8View) => Some(serde_json::json!(s)),
@@ -251,17 +265,19 @@ pub fn delta_stats_to_json(
         };
 
         let data_type = field.data_type();
-        null_count.insert(col_name.clone(), serde_json::json!(col_stats.null_count));
-
-        if let Some(ref min) = col_stats.min {
-            if let Some(val) = scalar_to_json_value(min, data_type) {
-                min_values.insert(col_name.clone(), val);
-            }
+        if let Some(nulls) = col_stats.null_count {
+            null_count.insert(col_name.clone(), serde_json::json!(nulls));
         }
-        if let Some(ref max) = col_stats.max {
-            if let Some(val) = scalar_to_json_value(max, data_type) {
-                max_values.insert(col_name.clone(), val);
-            }
+
+        if let Some(ref min) = col_stats.min
+            && let Some(val) = scalar_to_json_value(min, data_type)
+        {
+            min_values.insert(col_name.clone(), val);
+        }
+        if let Some(ref max) = col_stats.max
+            && let Some(val) = scalar_to_json_value(max, data_type)
+        {
+            max_values.insert(col_name.clone(), val);
         }
     }
 
@@ -299,10 +315,12 @@ pub(crate) fn max_stat_as_i64(
     let max_scalar = source_files
         .iter()
         .flat_map(|(_, m, _)| column_statistics(m, col_name))
-        .fold(None, |acc, stats| {
+        .try_fold(None, |acc, stats| {
+            let stats = stats?;
             let (_, new_max) = stats_to_scalars(stats);
-            pick_bound(acc, new_max, Ordering::Greater)
+            Some(pick_bound(acc, new_max, Ordering::Greater))
         })
+        .flatten()
         .ok_or_else(|| anyhow::anyhow!("no stats for watermark column '{}'", col_name))?;
 
     scalar_to_i64(&max_scalar)
@@ -318,16 +336,22 @@ pub(crate) fn key_bounds_as_scalars(
     let (min, max) = source_files
         .iter()
         .flat_map(|(_, m, _)| column_statistics(m, key_col_name))
-        .fold(None, |acc, stats| {
+        .try_fold(None, |acc, stats| {
+            let stats = stats?;
+            match stats {
+                // any Nan does not have a bound
+                Float(_) | Double(_) if stats.nan_count_opt() != Some(0) => None,
+                _ => Some(()),
+            }?;
             let (new_min, new_max) = stats_to_scalars(stats);
-            match acc {
-                None => Some((new_min?, new_max?)),
-                Some((cur_min, cur_max)) => Some((
-                    pick_bound(Some(cur_min), new_min, Ordering::Less)?,
-                    pick_bound(Some(cur_max), new_max, Ordering::Greater)?,
-                )),
-            }
-        })?;
+            let (cur_min, cur_max) = acc.unzip();
+            Some(pick_bound(cur_min, new_min, Ordering::Less).zip(pick_bound(
+                cur_max,
+                new_max,
+                Ordering::Greater,
+            )))
+        })
+        .flatten()?;
 
     Some((
         coerce_to_logical(Some(min), data_type)?,
@@ -349,12 +373,12 @@ pub(crate) fn leaf_index(metadata: &ParquetMetaData, column: &str) -> Option<usi
 pub(crate) fn column_statistics<'a>(
     metadata: &'a ParquetMetaData,
     column: &str,
-) -> impl Iterator<Item = &'a Statistics> + 'a {
+) -> impl Iterator<Item = Option<&'a Statistics>> + Clone + 'a {
     let index = leaf_index(metadata, column);
     metadata
         .row_groups()
         .iter()
-        .filter_map(move |rg| index.and_then(|i| rg.column(i).statistics()))
+        .map(move |rg| index.and_then(|i| rg.column(i).statistics()))
 }
 
 /// Row groups whose stats on `column` overlap the key range.
@@ -407,10 +431,17 @@ pub fn parquet_metadata_to_delta_stats(
         .iter()
         .map(|field| {
             let col_name = field.name().clone();
+            let row_groups = column_statistics(metadata, &col_name);
 
-            let stats = column_statistics(metadata, &col_name).fold(
+            // None when any row group lacks stats or a null count
+            let null_count = row_groups
+                .clone()
+                .map(|s| s?.null_count_opt())
+                .sum::<Option<u64>>();
+
+            let stats = row_groups.clone().flatten().fold(
                 ColumnStats {
-                    null_count: 0,
+                    null_count,
                     min: None,
                     max: None,
                     tight_bounds: true,
@@ -418,15 +449,36 @@ pub fn parquet_metadata_to_delta_stats(
                 |acc, s| {
                     let (new_min, new_max) = stats_to_scalars(s);
                     ColumnStats {
-                        null_count: acc.null_count + s.null_count_opt().unwrap_or(0) as i64,
                         min: pick_bound(acc.min, new_min, Ordering::Less),
                         max: pick_bound(acc.max, new_max, Ordering::Greater),
                         tight_bounds: acc.tight_bounds && s.min_is_exact() && s.max_is_exact(),
+                        ..acc
                     }
                 },
             );
 
-            (col_name, stats)
+            let nan = match field.data_type() {
+                DataType::Float64 => Some(Scalar::Double(f64::NAN)),
+                DataType::Float16 | DataType::Float32 => Some(Scalar::Float(f32::NAN)),
+                _ => None,
+            };
+
+            let (min, max) = match (nan, null_count) {
+                (_, None) => (None, None),
+                (None, Some(_)) => (stats.min, stats.max),
+                (Some(nan), Some(nulls)) => {
+                    let nans = row_groups.map(|s| s?.nan_count_opt()).sum::<Option<u64>>();
+                    let values = num_records as u64 - nulls;
+                    match nans {
+                        None => (None, None),
+                        Some(0) => (stats.min, stats.max),
+                        Some(n) if n == values => (Some(nan.clone()), Some(nan)),
+                        Some(_) => (stats.min, Some(nan)),
+                    }
+                }
+            };
+
+            (col_name, ColumnStats { min, max, ..stats })
         })
         .collect();
 
@@ -446,9 +498,15 @@ pub fn parquet_metadata_to_delta_stats(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use arrow_schema::{DataType, TimeUnit};
+    use arrow_array::{Float32Array, Float64Array};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use delta_kernel::expressions::Scalar;
+    use parquet::arrow::ArrowSchemaConverter;
+    use parquet::file::metadata::{ColumnChunkMetaData, FileMetaData, RowGroupMetaData};
+    use parquet::file::statistics::ValueStatistics;
     use serde_json::json;
 
     #[test]
@@ -495,7 +553,7 @@ mod tests {
 
     #[test]
     fn test_scalar_to_json_timestamps() {
-        let micros = 1743342600_000_000;
+        let micros = 1_743_342_600 * 1_000_000;
 
         assert_eq!(
             scalar_to_json_value(
@@ -528,11 +586,30 @@ mod tests {
         );
     }
 
-    fn metadata_from_batch(batch: &arrow_array::RecordBatch) -> ParquetMetaData {
+    #[test]
+    fn nan_double_serializes_as_the_nan_string() {
+        assert_eq!(
+            scalar_to_json_value(&Scalar::Double(f64::NAN), &DataType::Float64),
+            Some(json!("NaN"))
+        );
+    }
+
+    #[test]
+    fn nan_float_serializes_as_the_nan_string() {
+        assert_eq!(
+            scalar_to_json_value(&Scalar::Float(f32::NAN), &DataType::Float32),
+            Some(json!("NaN"))
+        );
+    }
+
+    fn metadata_from_batches(batches: &[&arrow_array::RecordBatch]) -> ParquetMetaData {
         let mut buf: Vec<u8> = Vec::new();
         let mut writer =
-            parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
-        writer.write(batch).unwrap();
+            parquet::arrow::ArrowWriter::try_new(&mut buf, batches[0].schema(), None).unwrap();
+        for batch in batches {
+            writer.write(batch).unwrap();
+            writer.flush().unwrap();
+        }
         writer.close().unwrap();
         parquet::file::metadata::ParquetMetaDataReader::new()
             .parse_and_finish(&bytes::Bytes::from(buf))
@@ -567,7 +644,7 @@ mod tests {
             vec![Arc::new(nested), Arc::new(Int64Array::from(vec![3]))],
         )
         .unwrap();
-        let metadata = metadata_from_batch(&batch);
+        let metadata = metadata_from_batches(&[&batch]);
 
         // the nested `nested.id` leaf does not answer for top-level `id`
         assert_eq!(leaf_index(&metadata, "id"), Some(2));
@@ -600,5 +677,200 @@ mod tests {
             stats,
             json!({"minValues": {"id": 1}, "numRecords": 7, "tightBounds": false})
         );
+    }
+
+    #[test]
+    fn pick_bound_never_returns_nan() {
+        let nan = Scalar::Double(f64::NAN);
+        let one = Scalar::Double(1.0);
+
+        let min = [nan.clone(), one.clone()]
+            .into_iter()
+            .fold(None, |acc, s| pick_bound(acc, Some(s), Ordering::Less));
+
+        assert_eq!(min, Some(one));
+
+        assert_eq!(pick_bound(None, Some(nan), Ordering::Greater), None);
+    }
+
+    /// A footer for the single-column `schema`: one two-row row group per entry, each carrying
+    /// exactly the given Statistics.
+    fn metadata_with_stats(
+        schema: &Schema,
+        row_groups: Vec<Option<Statistics>>,
+    ) -> ParquetMetaData {
+        let descr = Arc::new(ArrowSchemaConverter::new().convert(schema).unwrap());
+        let row_groups: Vec<RowGroupMetaData> = row_groups
+            .into_iter()
+            .map(|stats| {
+                let column = ColumnChunkMetaData::builder(descr.column(0));
+                let column = match stats {
+                    Some(stats) => column.set_statistics(stats),
+                    None => column,
+                };
+                RowGroupMetaData::builder(descr.clone())
+                    .set_num_rows(2)
+                    .add_column_metadata(column.build().unwrap())
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let num_rows = 2 * row_groups.len() as i64;
+        ParquetMetaData::new(
+            FileMetaData::new(1, num_rows, None, None, descr, None),
+            row_groups,
+        )
+    }
+
+    fn int64_stats(min: i64, max: i64) -> Statistics {
+        Statistics::int64(Some(min), Some(max), None, Some(0), false)
+    }
+
+    fn double_stats(min: f64, max: f64, nan_count: Option<u64>) -> Statistics {
+        Statistics::Double(
+            ValueStatistics::new(Some(min), Some(max), None, Some(0), false)
+                .with_nan_count(nan_count),
+        )
+    }
+
+    fn id_schema(data_type: DataType) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", data_type, true)]))
+    }
+
+    #[test]
+    fn row_group_without_stats_drops_bounds() {
+        let schema = id_schema(DataType::Int64);
+        let metadata = metadata_with_stats(&schema, vec![Some(int64_stats(1, 2)), None]);
+
+        let stats = parquet_metadata_to_delta_stats(&metadata, &schema);
+        let (_, id) = &stats.columns[0];
+        assert_eq!(id.min, None);
+        assert_eq!(id.max, None);
+    }
+
+    #[test]
+    fn watermark_errors_when_a_row_group_has_no_stats() {
+        // the row group without stats could hold the true max
+        let schema = id_schema(DataType::Int64);
+        let metadata = metadata_with_stats(&schema, vec![None, Some(int64_stats(1, 2))]);
+        let source_files = vec![("a.parquet".to_string(), metadata, 0u64)];
+
+        assert!(max_stat_as_i64(&source_files, "id").is_err());
+    }
+
+    #[test]
+    fn key_bounds_are_none_when_a_row_group_has_no_stats() {
+        let schema = id_schema(DataType::Int64);
+        let metadata = metadata_with_stats(&schema, vec![None, Some(int64_stats(1, 2))]);
+        let source_files = vec![("a.parquet".to_string(), metadata, 0u64)];
+
+        assert_eq!(key_bounds_as_scalars(&source_files, "id", &schema), None);
+    }
+
+    #[test]
+    fn unknown_null_count_is_left_out_of_the_json() {
+        let schema = id_schema(DataType::Int64);
+        let no_null_count = Statistics::int64(Some(1), Some(2), None, None, false);
+        let metadata = metadata_with_stats(&schema, vec![Some(no_null_count)]);
+
+        let stats = parquet_metadata_to_delta_stats(&metadata, &schema);
+        let json: serde_json::Value =
+            serde_json::from_str(&delta_stats_to_json(&stats, &schema).unwrap()).unwrap();
+        assert_eq!(json["nullCount"], json!({}));
+    }
+
+    /// The add stats of a single float column `x` holding `values`.
+    fn float_stats(values: arrow_array::ArrayRef) -> ColumnStats {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            values.data_type().clone(),
+            true,
+        )]));
+        let batch = arrow_array::RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+        let metadata = metadata_from_batches(&[&batch]);
+        parquet_metadata_to_delta_stats(&metadata, &schema)
+            .columns
+            .remove(0)
+            .1
+    }
+
+    fn is_nan_bound(bound: &Option<Scalar>) -> bool {
+        bound.as_ref().is_some_and(is_nan)
+    }
+
+    #[test]
+    fn float_without_nan_keeps_its_bounds() {
+        let stats = float_stats(Arc::new(Float64Array::from(vec![1.0, 2.0])));
+        assert_eq!(stats.min, Some(Scalar::Double(1.0)));
+        assert_eq!(stats.max, Some(Scalar::Double(2.0)));
+    }
+
+    #[test]
+    fn nan_makes_the_max_nan() {
+        let stats = float_stats(Arc::new(Float64Array::from(vec![1.0, 2.0, f64::NAN])));
+        assert_eq!(stats.min, Some(Scalar::Double(1.0)));
+        assert!(is_nan_bound(&stats.max), "max: {:?}", stats.max);
+    }
+
+    #[test]
+    fn all_nan_makes_both_bounds_nan() {
+        let stats = float_stats(Arc::new(Float64Array::from(vec![f64::NAN, f64::NAN])));
+        assert!(is_nan_bound(&stats.min), "min: {:?}", stats.min);
+        assert!(is_nan_bound(&stats.max), "max: {:?}", stats.max);
+    }
+
+    #[test]
+    fn nan_with_nulls_keeps_the_real_min() {
+        let stats = float_stats(Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            None,
+            Some(f64::NAN),
+        ])));
+        assert_eq!(stats.min, Some(Scalar::Double(1.0)));
+        assert!(is_nan_bound(&stats.max), "max: {:?}", stats.max);
+    }
+
+    #[test]
+    fn nulls_do_not_count_as_values_beside_nan() {
+        // the only value is NaN, so both bounds are NaN despite the null row
+        let stats = float_stats(Arc::new(Float64Array::from(vec![None, Some(f64::NAN)])));
+        assert!(is_nan_bound(&stats.min), "min: {:?}", stats.min);
+        assert!(is_nan_bound(&stats.max), "max: {:?}", stats.max);
+    }
+
+    #[test]
+    fn float32_nan_bound_is_a_float_scalar() {
+        let stats = float_stats(Arc::new(Float32Array::from(vec![1.0, f32::NAN])));
+        assert_eq!(stats.min, Some(Scalar::Float(1.0)));
+        assert!(
+            matches!(stats.max, Some(Scalar::Float(v)) if v.is_nan()),
+            "max: {:?}",
+            stats.max
+        );
+    }
+
+    fn float_key_bounds(nan_count: Option<u64>) -> Option<(Scalar, Scalar)> {
+        let schema = id_schema(DataType::Float64);
+        let metadata = metadata_with_stats(&schema, vec![Some(double_stats(1.0, 2.0, nan_count))]);
+        let source_files = vec![("a.parquet".to_string(), metadata, 0u64)];
+        key_bounds_as_scalars(&source_files, "id", &schema)
+    }
+
+    #[test]
+    fn key_bounds_are_none_when_the_source_holds_nan() {
+        assert_eq!(float_key_bounds(Some(1)), None);
+    }
+
+    #[test]
+    fn key_bounds_cover_a_float_key_without_nan() {
+        assert_eq!(
+            float_key_bounds(Some(0)),
+            Some((Scalar::Double(1.0), Scalar::Double(2.0)))
+        );
+    }
+
+    #[test]
+    fn key_bounds_are_none_when_the_nan_count_is_unknown() {
+        assert_eq!(float_key_bounds(None), None);
     }
 }

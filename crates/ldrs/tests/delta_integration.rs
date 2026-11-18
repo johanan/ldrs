@@ -44,17 +44,17 @@ async fn test_delta_stats_from_users_parquet() {
     };
 
     let name = find("name");
-    assert_eq!(name.null_count, 0);
+    assert_eq!(name.null_count, Some(0));
     assert_eq!(name.min, Some(Scalar::Binary(b"John Doe".to_vec())));
     assert_eq!(name.max, Some(Scalar::Binary(b"Test Tester".to_vec())));
 
     let active = find("active");
     assert_eq!(active.min, Some(Scalar::Boolean(false)));
     assert_eq!(active.max, Some(Scalar::Boolean(true)));
-    assert_eq!(active.null_count, 0);
+    assert_eq!(active.null_count, Some(0));
 
     let nullable = find("nullable_id");
-    assert_eq!(nullable.null_count, 2);
+    assert_eq!(nullable.null_count, Some(2));
     assert_eq!(nullable.min, None);
     assert_eq!(nullable.max, None);
 
@@ -111,7 +111,7 @@ async fn test_delta_stats_from_strings_parquet() {
     let varchar = find("varchar_value");
     assert_eq!(varchar.min, Some(Scalar::Binary(b"a".to_vec())));
     assert_eq!(varchar.max, Some(Scalar::Binary(b"b".to_vec())));
-    assert_eq!(varchar.null_count, 0);
+    assert_eq!(varchar.null_count, Some(0));
 
     let text = find("text_value");
     assert_eq!(text.min, Some(Scalar::Binary(b"a".to_vec())));
@@ -152,7 +152,7 @@ async fn test_delta_stats_from_numbers_parquet() {
     let smallint = find("smallint_value");
     assert_eq!(smallint.min, Some(Scalar::Integer(0)));
     assert_eq!(smallint.max, Some(Scalar::Integer(32767)));
-    assert_eq!(smallint.null_count, 0);
+    assert_eq!(smallint.null_count, Some(0));
 
     let integer = find("integer_value");
     assert_eq!(integer.min, Some(Scalar::Integer(0)));
@@ -162,16 +162,17 @@ async fn test_delta_stats_from_numbers_parquet() {
     assert_eq!(bigint.min, Some(Scalar::Long(0)));
     assert_eq!(bigint.max, Some(Scalar::Long(9223372036854775807)));
 
+    // the fixture's writer (arrow-go) records no NaN count, so float bounds are unknown
     let double = find("double_value");
-    assert_eq!(double.min, Some(Scalar::Double(1.0)));
-    assert_eq!(double.max, Some(Scalar::Double(1.2345678901234568e20)));
+    assert_eq!(double.min, None);
+    assert_eq!(double.max, None);
 
     let float = find("float_value");
-    assert_eq!(float.min, Some(Scalar::Float(1.0)));
-    assert_eq!(float.max, Some(Scalar::Float(12345679.0)));
+    assert_eq!(float.min, None);
+    assert_eq!(float.max, None);
 
     let decimal = find("decimal_value");
-    assert_eq!(decimal.null_count, 0);
+    assert_eq!(decimal.null_count, Some(0));
     assert_eq!(
         decimal.min,
         Some(Scalar::Binary(vec![
@@ -266,11 +267,11 @@ async fn test_delta_stats_json_from_numbers_parquet() {
     assert_eq!(json["minValues"]["bigint_value"], 0);
     assert_eq!(json["maxValues"]["bigint_value"], 9223372036854775807_i64);
 
-    assert_eq!(json["minValues"]["double_value"], 1.0);
-    assert_eq!(json["maxValues"]["double_value"], 1.2345678901234568e20);
-
-    assert_eq!(json["minValues"]["float_value"], 1.0);
-    assert_eq!(json["maxValues"]["float_value"], 12345679.0);
+    // the fixture's writer (arrow-go) records no NaN count, so float bounds are left out
+    for column in ["double_value", "float_value"] {
+        assert!(json["minValues"].get(column).is_none());
+        assert!(json["maxValues"].get(column).is_none());
+    }
 
     let dec_min = json["minValues"]["decimal_value"].as_str().unwrap();
     let dec_max = json["maxValues"]["decimal_value"].as_str().unwrap();

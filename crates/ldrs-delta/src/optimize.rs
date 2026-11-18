@@ -12,8 +12,8 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::{Engine, Snapshot, Version};
-use futures::{stream, StreamExt, TryStreamExt};
-use ldrs_parquet::{read_parquet_metadata, stream_parquet, ParquetSink};
+use futures::{StreamExt, TryStreamExt, stream};
+use ldrs_parquet::{ParquetSink, read_parquet_metadata, stream_parquet};
 use ldrs_storage::{base_or_relative_path, build_store, store_path_from_uri};
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use parquet::arrow::parquet_to_arrow_schema;
@@ -26,8 +26,8 @@ use crate::features::{
 };
 use crate::stats::{column_statistics, pick_bound, stats_to_scalars};
 use crate::{
-    build_add, build_engine, file_path, partition_values, physical_name, snapshot_table_state,
-    version_to_log_filename, Commit, DeltaRemove, Operation, OperationConfig, TableState,
+    Commit, DeltaRemove, Operation, OperationConfig, TableState, build_add, build_engine,
+    file_path, partition_values, physical_name, snapshot_table_state, version_to_log_filename,
 };
 
 const FOOTER_CONCURRENCY: usize = 16;
@@ -354,16 +354,15 @@ fn micros_schema(schema: &Schema) -> Schema {
 /// The smallest value of `column` across the file's row groups. `None` when the file does not hold
 /// the column, the writer tracked no statistics for it, or the minimum is a NaN.
 fn min_of(metadata: &ParquetMetaData, column: &str) -> Option<Scalar> {
-    let min = column_statistics(metadata, column).fold(None, |min, statistics| {
-        pick_bound(min, stats_to_scalars(statistics).0, Ordering::Less)
-    })?;
-
-    // Parquet excludes NaN from min/max
-    match min {
-        Scalar::Float(value) if value.is_nan() => None,
-        Scalar::Double(value) if value.is_nan() => None,
-        min => Some(min),
-    }
+    column_statistics(metadata, column)
+        .try_fold(None, |min, statistics| {
+            Some(pick_bound(
+                min,
+                stats_to_scalars(statistics?).0,
+                Ordering::Less,
+            ))
+        })
+        .flatten()
 }
 
 /// The physical row positions a file's deletion vector removes, ascending; empty when it has none.
@@ -886,11 +885,15 @@ mod tests {
     #[test]
     fn a_writer_accepts_batches_whose_schema_differs_only_in_metadata() {
         let plain = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let metadata: arrow_schema::Metadata =
+            [("PARQUET:field_id".to_string(), "1".to_string())].into();
+        let writer_metadata: arrow_schema::Metadata =
+            [("writer".to_string(), "spark".to_string())].into();
         let annotated = Arc::new(
-            Schema::new(vec![Field::new("id", DataType::Int64, true).with_metadata(
-                [("PARQUET:field_id".to_string(), "1".to_string())].into(),
-            )])
-            .with_metadata([("writer".to_string(), "spark".to_string())].into()),
+            Schema::new(vec![
+                Field::new("id", DataType::Int64, true).with_metadata(metadata),
+            ])
+            .with_metadata(writer_metadata),
         );
         assert_eq!(schema_key(&plain), schema_key(&annotated));
 
@@ -917,11 +920,15 @@ mod tests {
     #[test]
     fn schema_key_ignores_metadata_but_not_nullability() {
         let plain = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let metadata: arrow_schema::Metadata =
+            [("PARQUET:field_id".to_string(), "1".to_string())].into();
+        let writer_metadata: arrow_schema::Metadata =
+            [("writer".to_string(), "spark".to_string())].into();
         let annotated = Arc::new(
-            Schema::new(vec![Field::new("id", DataType::Int64, true).with_metadata(
-                [("PARQUET:field_id".to_string(), "1".to_string())].into(),
-            )])
-            .with_metadata([("writer".to_string(), "spark".to_string())].into()),
+            Schema::new(vec![
+                Field::new("id", DataType::Int64, true).with_metadata(metadata),
+            ])
+            .with_metadata(writer_metadata),
         );
         let not_null = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         assert_eq!(schema_key(&plain), schema_key(&annotated));

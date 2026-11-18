@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arrow::row::{RowConverter, SortField};
-use arrow_array::{cast::AsArray, types::Int64Type, ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, cast::AsArray, types::Int64Type};
 use arrow_schema::SchemaRef;
 use futures::StreamExt;
 use ldrs_parquet::{
-    default_writer_props, read_parquet_metadata, stream_projected_parquet, with_bloom_filters,
-    FileNamer, ParquetSink, ROW_NUMBER_COLUMN,
+    FileNamer, ParquetSink, ROW_NUMBER_COLUMN, default_writer_props, read_parquet_metadata,
+    stream_projected_parquet, with_bloom_filters,
 };
 use ldrs_storage::{base_or_relative_path, kernel_url};
 use object_store::ObjectStore;
@@ -21,9 +21,9 @@ use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::{
-    build_add, build_engine, checkpoint_interval, cleanup_source_files, file_path, physical_name,
-    should_checkpoint, version_to_log_filename, write_checkpoint, Commit, DeltaRemove, DeltaTxn,
-    Operation, OperationConfig, MERGE_MAX_RETRIES,
+    Commit, DeltaRemove, DeltaTxn, MERGE_MAX_RETRIES, Operation, OperationConfig, build_add,
+    build_engine, checkpoint_interval, cleanup_source_files, file_path, physical_name,
+    should_checkpoint, version_to_log_filename, write_checkpoint,
 };
 
 use super::dv::{build_dv_file, build_dv_inline, serialize_dv};
@@ -31,10 +31,10 @@ use super::stats::{
     column_statistics, key_bounds_as_scalars, max_stat_as_i64, read_add_stats,
     select_row_groups_by_scalars, widen_stats,
 };
-use delta_kernel::expressions::{Expression as Expr, Predicate as Pred};
-use delta_kernel::scan::state::ScanFile;
 use delta_kernel::Engine;
 use delta_kernel::Snapshot;
+use delta_kernel::expressions::{Expression as Expr, Predicate as Pred};
+use delta_kernel::scan::state::ScanFile;
 use object_store::{PutMode, PutOptions, PutPayload};
 use roaring::RoaringTreemap;
 
@@ -156,17 +156,28 @@ pub(crate) fn validate_no_null_keys(
     source_files: &[(String, ParquetMetaData, u64)],
     merge_keys: &[String],
 ) -> Result<(), anyhow::Error> {
-    let null_key = merge_keys.iter().find_map(|key| {
-        source_files
+    for key in merge_keys {
+        for stats in source_files
             .iter()
             .flat_map(|(_, metadata, _)| column_statistics(metadata, key))
-            .filter_map(|s| s.null_count_opt())
-            .find(|count| *count > 0)
-            .map(|count| (key, count))
-    });
+        {
+            let stats = stats.ok_or_else(|| {
+                anyhow::anyhow!("merge key '{}' has missing statistics on a row group", key)
+            })?;
 
-    if let Some((col, count)) = null_key {
-        anyhow::bail!("merge key '{}' contains {} null values", col, count);
+            match stats.null_count_opt() {
+                Some(0) => Ok(()),
+                Some(n) => Err(anyhow::anyhow!(
+                    "merge key '{}' contains {} null values",
+                    key,
+                    n
+                )),
+                None => Err(anyhow::anyhow!(
+                    "merge key '{}' has a source row group without a null count",
+                    key
+                )),
+            }?
+        }
     }
     Ok(())
 }
@@ -204,12 +215,9 @@ impl DeltaMergeSink {
         if let TxnConfig::SourceWatermark {
             watermark_column, ..
         } = &merge_config.txn_config
+            && schema.column_with_name(watermark_column).is_none()
         {
-            if schema.column_with_name(watermark_column).is_none() {
-                anyhow::bail!(
-                    "watermark column '{watermark_column}' is not a column of the source"
-                );
-            }
+            anyhow::bail!("watermark column '{watermark_column}' is not a column of the source");
         }
         let url = base_or_relative_path(table_path)?;
         let bloom_columns: Vec<Vec<String>> = merge_config
@@ -332,13 +340,12 @@ async fn commit_merge(
     // Retry loop
     for _attempt in 0..MERGE_MAX_RETRIES {
         let version = snapshot.version();
-        if let (Some(app_id), Some(batch_version)) = (app_id.as_ref(), batch_version) {
-            if let Some(last_version) = snapshot.get_app_id_version(app_id, engine.as_ref())? {
-                // if there is a newer version committed, nothing to do so we skip
-                if last_version >= batch_version {
-                    return Ok(MergeStats::skipped(last_version));
-                }
-            }
+        // if there is a newer version committed, nothing to do so we skip
+        if let (Some(app_id), Some(batch_version)) = (app_id.as_ref(), batch_version)
+            && let Some(last_version) = snapshot.get_app_id_version(app_id, engine.as_ref())?
+            && last_version >= batch_version
+        {
+            return Ok(MergeStats::skipped(last_version));
         }
 
         let physical_keys = merge_config
