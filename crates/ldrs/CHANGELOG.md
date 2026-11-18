@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.4] - 2026-11-18
+
+### Bug Fixes
+
+- *(delta)* Handle NaN and missing stats
+
+Float values can be NaN, which throws a massive wrench in the stats.
+Properly handle them for compatibility with Spark.
+
+Also do the same with missing stats in a parquet footer.
+
+
+### Build
+
+- Move to 2024 and bump delta-kernel
+
+Using edition 2024 and the cargo fixes for those
+
+Bumped delta-kernel-rs which allowed the arrow/parquet/object_store
+version bumpts as well
+
+
 ## [0.25.3] - 2026-11-13
 
 ### Bug Fixes
