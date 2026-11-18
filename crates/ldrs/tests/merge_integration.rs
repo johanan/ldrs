@@ -9,9 +9,9 @@ use ldrs_delta::{MergeConfig, OperationConfig, TxnConfig};
 mod common;
 use common::{merge_delta, overwrite_delta};
 use ldrs_test_fixtures::delta::{
-    cleanup_table, count_actions, delta_table_path, duckdb_count, find_action, latest_version,
-    make_batch, make_batch_from_ids, make_source_batch, make_target_batch, read_log_actions,
-    test_schema, SOURCE_BASE_TS, TARGET_BASE_TS, TS_STEP,
+    SOURCE_BASE_TS, TARGET_BASE_TS, TS_STEP, cleanup_table, count_actions, delta_table_path,
+    duckdb_count, find_action, latest_version, make_batch, make_batch_from_ids, make_source_batch,
+    make_target_batch, read_log_actions, test_schema,
 };
 
 fn test_table_path(name: &str) -> String {
@@ -944,7 +944,10 @@ async fn test_merge_fails_when_the_txn_version_cannot_be_read() {
     }});
     std::fs::write(
         format!("{}/_delta_log/{:020}.json", table_path, 1),
-        format!("{commit_info}\n{}\n", serde_json::json!({ "metaData": metadata })),
+        format!(
+            "{commit_info}\n{}\n",
+            serde_json::json!({ "metaData": metadata })
+        ),
     )
     .unwrap();
 

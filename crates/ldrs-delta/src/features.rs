@@ -1,6 +1,6 @@
 use arrow_schema::{DataType, SchemaRef, TimeUnit};
-use delta_kernel::table_features::{TableFeature, MAX_VALID_WRITER_VERSION};
 use delta_kernel::Snapshot;
+use delta_kernel::table_features::{MAX_VALID_WRITER_VERSION, TableFeature};
 
 /// `timestamp` and `timestamp_ntz` are the only timestamp types delta has
 pub fn refuse_non_micros_timestamps(schema: &SchemaRef) -> Result<(), anyhow::Error> {
@@ -68,7 +68,11 @@ pub(crate) fn files_are_enumerable(feature: &TableFeature) -> bool {
         | ChangeDataFeed
         | V2Checkpoint => true,
         // Iceberg metadata sits outside `_delta_log` and is not named by any add action.
-        IcebergCompatV1 | IcebergCompatV2 | IcebergCompatV3 | AdaptiveMetadataPreview => false,
+        IcebergCompatV1
+        | IcebergCompatV2
+        | IcebergCompatV3
+        | IcebergNativeV4Preview
+        | AdaptiveMetadataPreview => false,
         // Commits can live outside `_delta_log`, so a snapshot read from the store may be stale
         // and a committed file could look unreferenced.
         CatalogManaged | CatalogOwnedPreview => false,
@@ -104,12 +108,14 @@ pub(crate) fn rewrite_is_supported(feature: &TableFeature) -> bool {
         | IcebergCompatV1
         | IcebergCompatV2
         | IcebergCompatV3
-        | AdaptiveMetadataPreview
         | CatalogManaged
         | CatalogOwnedPreview => true,
+        // these no longer write delta valid logs
+        | IcebergNativeV4Preview
+        | AdaptiveMetadataPreview
         // Each rewritten row keeps its row id, so the new file has to materialize them into a
         // hidden column and claim a `baseRowId` from the `domainMetadata` high watermark.
-        RowTracking => false,
+        | RowTracking => false,
         // The table declares a clustering layout that bin-packing discards while its metadata keeps
         // claiming it.
         ClusteredTable => false,

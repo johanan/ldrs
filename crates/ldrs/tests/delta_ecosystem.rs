@@ -397,8 +397,7 @@ fn duckdb_observed(table_path: &str) -> String {
 #[test_log::test]
 async fn test_optimize_rewrites_int96_timestamps_as_micros() {
     let rt = tokio::runtime::Handle::current();
-    let table_path =
-        copy_fixture_table("delta_spark/penguins_timestamps", "ecosystem_timestamps");
+    let table_path = copy_fixture_table("delta_spark/penguins_timestamps", "ecosystem_timestamps");
     let table_url = format!("file://{}/", table_path);
     let contents = duckdb_observed(&table_path);
 

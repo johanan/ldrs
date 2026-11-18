@@ -1,9 +1,9 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, Int8Array, RecordBatch, StringArray};
+use arrow_array::{Int8Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use ldrs_arrow::{build_arrow_transform_strategy, transform_batch, ColumnType};
+use ldrs_arrow::{ColumnType, build_arrow_transform_strategy, transform_batch};
 use ldrs_parquet::{FileNamer, ParquetSink};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 

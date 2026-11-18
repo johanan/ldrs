@@ -4,7 +4,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use futures::{Stream, StreamExt};
 use ldrs_delta::{
-    ensure_table, DeltaMergeSink, DeltaOverwriteSink, MergeConfig, MergeStats, OperationConfig,
+    DeltaMergeSink, DeltaOverwriteSink, MergeConfig, MergeStats, OperationConfig, ensure_table,
 };
 use tokio::runtime::Handle;
 

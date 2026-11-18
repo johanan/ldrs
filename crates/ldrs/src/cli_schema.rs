@@ -1,8 +1,8 @@
 use clap::Subcommand;
 use ldrs_arrow::{ColumnSpec, ColumnType};
 use ldrs_core::phase::PhaseOutput;
-use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
-use serde_json::{json, Value};
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use serde_json::{Value, json};
 
 use crate::{
     delta::DeltaDestination,

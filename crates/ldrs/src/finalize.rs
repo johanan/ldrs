@@ -10,7 +10,7 @@ use std::ffi::OsString;
 
 use crate::ldrs_env::LdrsExecutionContext;
 use crate::ldrs_snowflake::SnowflakeConnection;
-use crate::path_pattern::{extracted_segments_to_value, PathPattern};
+use crate::path_pattern::{PathPattern, extracted_segments_to_value};
 use ldrs_core::phase::PhaseOutput;
 use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib};
 use schemars::JsonSchema;
@@ -644,9 +644,10 @@ mod tests {
         "#;
         let err = call_finalize_script::<SfCommand>(script, "test", &delta_phase(), &ctx, &[])
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("module 'missing' not declared in lua_modules"));
+        assert!(
+            err.to_string()
+                .contains("module 'missing' not declared in lua_modules")
+        );
     }
 
     #[test]

@@ -24,26 +24,26 @@ use crate::ldrs_env::{ambient_env, starts_with_ignore_ascii_case};
 use crate::register::{register_sf, resolve_registers, run_register};
 use crate::results::{ResultLine, Results};
 use crate::{
-    delta::{delta_target_name, DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode},
-    finalize::{build_sources, call_finalize, run_sf, FinalizeItem, SfCommand},
+    delta::{DeltaDestination, DeltaMerge, MergeTxnConfig, TxnMode, delta_target_name},
+    finalize::{FinalizeItem, SfCommand, build_sources, call_finalize, run_sf},
     ldrs_config::{
         config::{
-            parse_table, validate_configs, LdrsConfig, LdrsDestination, LdrsParsedConfig,
-            LdrsSource,
+            LdrsConfig, LdrsDestination, LdrsParsedConfig, LdrsSource, parse_table,
+            validate_configs,
         },
         field_validation::UnknownKey,
     },
     ldrs_duckdb::{duckdb_spawned, resolve_binary, resolve_db},
     ldrs_env::{
-        collect_params, collect_vars_by_prefix, explain_render_error, setup_handlebars, shouty,
-        LdrsExecutionContext,
+        LdrsExecutionContext, collect_params, collect_vars_by_prefix, explain_render_error,
+        setup_handlebars, shouty,
     },
     ldrs_snowflake::{
-        resolve_conn_creds, resolve_inherited_sf_env, sf_spawned, snowflake_source::SFSource,
-        SnowflakeConnection,
+        SnowflakeConnection, resolve_conn_creds, resolve_inherited_sf_env, sf_spawned,
+        snowflake_source::SFSource,
     },
     postgres::{
-        postgres_destination::{split_pg_plan, PgPlan},
+        postgres_destination::{PgPlan, split_pg_plan},
         resolve::{resolve_command, role_from_url},
     },
 };

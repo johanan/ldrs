@@ -3,7 +3,7 @@ pub mod snowflake_source;
 use anyhow::Context;
 use ldrs_arrow::ColumnType;
 use ldrs_core::spawn::Spawned;
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::{ffi::OsString, path::PathBuf, process::Command};
 use tracing::debug;

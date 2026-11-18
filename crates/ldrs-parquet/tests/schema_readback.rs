@@ -2,13 +2,13 @@ use std::fs::File;
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, Decimal128Array, Decimal64Array, Int16Array, Int32Array, Int8Array, RecordBatch,
+    ArrayRef, Decimal64Array, Decimal128Array, Int8Array, Int16Array, Int32Array, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
-use ldrs_arrow::{build_source_and_target_schema, ColumnSpec};
+use ldrs_arrow::{ColumnSpec, build_source_and_target_schema};
 use ldrs_parquet::{columnspec_from_parquet, get_fields};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// Fresh per-test output dir alongside the other generated test outputs under tests/test_data.
 fn out_dir(name: &str) -> String {

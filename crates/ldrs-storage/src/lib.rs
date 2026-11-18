@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use object_store::{path::Path, ObjectStore, ObjectStoreScheme};
+use object_store::{ObjectStore, ObjectStoreScheme, path::Path};
 use url::{ParseError, Url};
 
 pub fn base_or_relative_path(path: &str) -> Result<Url, anyhow::Error> {

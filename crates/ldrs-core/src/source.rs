@@ -8,7 +8,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use futures::Stream;
 use ldrs_arrow::ColumnSpec;
-use ldrs_parquet::{builder_from_url, columnspec_from_parquet, get_fields, SpawnedStoreReader};
+use ldrs_parquet::{SpawnedStoreReader, builder_from_url, columnspec_from_parquet, get_fields};
 use parquet::arrow::async_reader::ParquetRecordBatchStream;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;

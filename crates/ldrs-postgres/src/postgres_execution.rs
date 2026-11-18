@@ -1,7 +1,7 @@
 use anyhow::Context;
 use bytes::{BufMut, BytesMut};
 use ldrs_arrow::{ColumnSpec, ColumnType};
-use postgres_types::{to_sql_checked, Format, IsNull, ToSql, Type};
+use postgres_types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use tokio_postgres::Client;
 
 pub fn map_colspec_to_pg_ddl(pq: &ColumnSpec) -> String {

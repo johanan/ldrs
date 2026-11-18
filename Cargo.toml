@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/*"]
 default-members = [
     "crates/ldrs",
@@ -12,23 +12,23 @@ default-members = [
 ]
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 authors = ["Joshua Johanan"]
 repository = "https://github.com/johanan/ldrs"
 
 [workspace.dependencies]
-arrow = { version = "59", features = ["chrono-tz"] }
-arrow-array = "59"
-arrow-schema = { version = "59", features = ["serde", "canonical_extension_types"] }
+arrow = { version = "60", features = ["chrono-tz"] }
+arrow-array = "60"
+arrow-schema = { version = "60", features = ["serde", "canonical_extension_types"] }
 anyhow = "1.0.102"
 bytes = "1"
 chrono = "0.4.44"
 deadpool-postgres = "0.14.1"
-delta_kernel = "0.29.0"
-delta_kernel_default_engine = { version = "0.29.0", default-features = false, features = ["arrow-59", "rustls"] }
+delta_kernel = "0.30.1"
+delta_kernel_default_engine = { version = "0.30.1", default-features = false, features = ["arrow-60", "rustls"] }
 futures = "0.3.32"
-object_store = { version = "0.13.1", features = [ "aws","azure", "gcp"] }
-parquet = { version = "59", features = ["async", "arrow", "object_store", "arrow_canonical_extension_types"] }
+object_store = { version = "0.14.2", features = [ "aws","azure", "gcp"] }
+parquet = { version = "60", features = ["async", "arrow", "object_store", "arrow_canonical_extension_types"] }
 postgres-native-tls = "0.5.3"
 postgres-types = "0.2.13"
 serde = { version = "1.0.228", features = ["serde_derive"] }

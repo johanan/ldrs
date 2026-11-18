@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use delta_kernel::Engine;
-use ldrs_parquet::{default_writer_props, FileNamer, ParquetSink};
+use ldrs_parquet::{FileNamer, ParquetSink, default_writer_props};
 use ldrs_storage::base_or_relative_path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use parquet::file::metadata::ParquetMetaData;
@@ -14,9 +14,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    build_add, build_engine, build_overwrite_commit, checkpoint_interval, cleanup_source_files,
-    should_checkpoint, snapshot_table_state, version_to_log_filename, write_checkpoint,
-    OperationConfig, MAX_COMMIT_RETRIES,
+    MAX_COMMIT_RETRIES, OperationConfig, build_add, build_engine, build_overwrite_commit,
+    checkpoint_interval, cleanup_source_files, should_checkpoint, snapshot_table_state,
+    version_to_log_filename, write_checkpoint,
 };
 
 /// Streaming Delta overwrite. Writes data files through an embedded [`ParquetSink`]

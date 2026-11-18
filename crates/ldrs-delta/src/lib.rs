@@ -9,8 +9,8 @@ use delta_kernel::schema::{DataType as DeltaDataType, StructField, StructType};
 use delta_kernel::snapshot::CheckpointWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::{Engine, Snapshot, SnapshotRef, Version};
-use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngineBuilder;
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use ldrs_storage::{
     base_or_relative_path, build_store, join_store_path, kernel_url, store_path_from_uri,
 };
@@ -1242,9 +1242,11 @@ mod tests {
         let current = declaring(&[], &[unknown.clone()]);
         let target = upgrade(current, &[], Operation::Merge.writer_features()).unwrap();
         assert_eq!(target.writer_features.as_deref().unwrap()[0], unknown);
-        assert!(serde_json::to_string(&target)
-            .unwrap()
-            .contains("someFutureFeature"));
+        assert!(
+            serde_json::to_string(&target)
+                .unwrap()
+                .contains("someFutureFeature")
+        );
     }
 
     #[test]

@@ -11,9 +11,9 @@ use url::Url;
 use crate::delta::{DeltaDestination, Refresh, RegisterSpec};
 use crate::ldrs_config::config::LdrsDestination;
 use crate::ldrs_config::get_dest_url;
-use crate::ldrs_env::{ambient_env, LdrsExecutionContext};
+use crate::ldrs_env::{LdrsExecutionContext, ambient_env};
 use crate::ldrs_snowflake::{
-    resolve_conn_creds, resolve_inherited_sf_env, SnowflakeConnection, StatementResult,
+    SnowflakeConnection, StatementResult, resolve_conn_creds, resolve_inherited_sf_env,
 };
 use crate::results::{ResultLine, Results};
 
@@ -424,10 +424,12 @@ mod tests {
 
     /// Shaped as `DESCRIBE EXTERNAL VOLUME` returns it, sibling ACTIVE row included.
     fn volume_result(base_urls: &[&str]) -> StatementResult {
-        let mut rows = vec![json!(["", "ALLOW_WRITES", "Boolean", "false", "true"])
-            .as_array()
-            .unwrap()
-            .clone()];
+        let mut rows = vec![
+            json!(["", "ALLOW_WRITES", "Boolean", "false", "true"])
+                .as_array()
+                .unwrap()
+                .clone(),
+        ];
         for (i, url) in base_urls.iter().enumerate() {
             let location = json!({ "NAME": format!("loc{i}"), "STORAGE_PROVIDER": "AZURE",
                                    "STORAGE_BASE_URL": url })

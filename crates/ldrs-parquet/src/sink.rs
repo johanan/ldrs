@@ -219,10 +219,10 @@ impl ParquetSink {
     /// Failure path: abort the in-flight upload (S3 and GCS keep uploaded parts
     /// otherwise), then delete the completed files.
     pub async fn abort(mut self) {
-        if let Some(w) = self.writer.take() {
-            if let Err(e) = w.into_inner().abort().await {
-                warn!("could not abort upload of {}: {}", self.current_filename, e);
-            }
+        if let Some(w) = self.writer.take()
+            && let Err(e) = w.into_inner().abort().await
+        {
+            warn!("could not abort upload of {}: {}", self.current_filename, e);
         }
         self.delete_completed().await;
     }

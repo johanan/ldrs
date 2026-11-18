@@ -237,8 +237,7 @@ mod tests {
         drop_runtime(rt);
     }
 
-    const INT96_FILE: &str =
-        "delta_spark/penguins_timestamps/part-00000-e9077e78-29e5-443c-af05-b254237e5ccb-c000.snappy.parquet";
+    const INT96_FILE: &str = "delta_spark/penguins_timestamps/part-00000-e9077e78-29e5-443c-af05-b254237e5ccb-c000.snappy.parquet";
 
     #[tokio::test]
     async fn int96_reads_as_zoneless_micros() {

@@ -6,8 +6,8 @@ use arrow::{
     util::display::FormatOptions,
 };
 use arrow_array::{
-    Array, ArrayRef, Decimal32Array, Decimal64Array, FixedSizeBinaryArray, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    Array, ArrayRef, Decimal32Array, Decimal64Array, FixedSizeBinaryArray, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, SchemaRef};
 
@@ -382,7 +382,7 @@ pub fn int_to_decimal_arrow_cast(
             return Err(anyhow::anyhow!(
                 "Unsupported source type for int_to_decimal: {:?}",
                 source.data_type()
-            ))
+            ));
         }
     };
 
@@ -417,7 +417,7 @@ pub fn rescale_decimal_array(
         _ => {
             return Err(anyhow::anyhow!(
                 "Unsupported source type for rescale_decimal_array"
-            ))
+            ));
         }
     };
     let decimal_arr = arrow::compute::cast_with_options(
