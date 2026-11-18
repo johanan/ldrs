@@ -68,14 +68,14 @@ macro_rules! define_column_accessor {
             // Generate getter methods for each type
             $(
                 #[inline]
-                pub unsafe fn $variant(&self, row: usize) -> Option<$value_type> {
+                pub unsafe fn $variant(&self, row: usize) -> Option<$value_type> { unsafe {
                     match self {
                         Self::$variant(arr) => {
                             if arr.is_null(row) { None } else { Some(arr.value_unchecked(row)) }
                         },
                         _ => panic!(concat!("Not a ", stringify!($variant), " array")),
                     }
-                }
+                }}
             )*
         }
     };
@@ -96,7 +96,7 @@ define_column_accessor!(
 );
 
 impl<'a> TypedColumnAccessor<'a> {
-    pub unsafe fn as_uuid(&self, row: usize) -> Option<uuid::Uuid> {
+    pub unsafe fn as_uuid(&self, row: usize) -> Option<uuid::Uuid> { unsafe {
         match self {
             Self::FixedSizeBinary(arr, _) => {
                 if arr.is_null(row) {
@@ -120,7 +120,7 @@ impl<'a> TypedColumnAccessor<'a> {
             }
             _ => panic!("Not a FixedSizeBinary or Utf8 array"),
         }
-    }
+    }}
 
     /// The row as a naive datetime, `Ok(None)` for a null, or `Err` with the raw value when
     /// chrono cannot represent it.
@@ -163,7 +163,7 @@ impl<'a> TypedColumnAccessor<'a> {
     pub unsafe fn as_chrono_tz(
         &self,
         row: usize,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, i64> {
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, i64> { unsafe {
         match self {
             Self::TimestampSecond(arr, _) => {
                 if arr.is_null(row) {
@@ -203,7 +203,7 @@ impl<'a> TypedColumnAccessor<'a> {
             }
             _ => Ok(None),
         }
-    }
+    }}
 
     pub fn as_text(&self, row: usize) -> Option<Cow<'a, str>> {
         match self {
@@ -231,7 +231,7 @@ impl<'a> TypedColumnAccessor<'a> {
     }
 
     #[inline]
-    pub unsafe fn TimestampMillisecond(&self, row: usize) -> Option<i64> {
+    pub unsafe fn TimestampMillisecond(&self, row: usize) -> Option<i64> { unsafe {
         match self {
             Self::TimestampMillisecond(arr, _) => {
                 if arr.is_null(row) {
@@ -242,7 +242,7 @@ impl<'a> TypedColumnAccessor<'a> {
             }
             _ => panic!("Not a TimestampMillisecond array"),
         }
-    }
+    }}
 
     #[inline]
     pub fn TimestampMicrosecond(&self, row: usize) -> Option<i64> {
@@ -273,7 +273,7 @@ impl<'a> TypedColumnAccessor<'a> {
     }
 
     #[inline]
-    pub unsafe fn Decimal128(&self, row: usize) -> Option<i128> {
+    pub unsafe fn Decimal128(&self, row: usize) -> Option<i128> { unsafe {
         match self {
             Self::Decimal128(arr, _, _) => {
                 if arr.is_null(row) {
@@ -284,7 +284,7 @@ impl<'a> TypedColumnAccessor<'a> {
             }
             _ => panic!("Not a Decimal128 array"),
         }
-    }
+    }}
 
     #[inline]
     pub fn FixedSizeBinary(&self, row: usize) -> Option<&'a [u8]> {
