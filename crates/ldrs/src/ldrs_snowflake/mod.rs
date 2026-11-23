@@ -74,6 +74,26 @@ impl SnowflakeConnection {
         });
     }
 
+    /// The database and schema the connection sets: the `/DB/SCH` path, else the lowercase
+    /// `database=` / `schema=` params, matching gosnowflake.
+    pub fn scope(&self) -> (Option<String>, Option<String>) {
+        let param = |key: &str| {
+            self.conn_url
+                .query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        };
+        let mut path = self
+            .conn_url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .filter(|segment| !segment.is_empty());
+        let database = path.next().map(String::from).or_else(|| param("database"));
+        let schema = path.next().map(String::from).or_else(|| param("schema"));
+        (database, schema)
+    }
+
     /// Runs the statements in order; an error discards the results of the ones that already ran.
     pub fn exec(
         &self,
@@ -264,6 +284,64 @@ mod tests {
             ],
             "managed env is auth keys (no PEM_FILE when None) then ordered params"
         );
+    }
+
+    fn connection_at(url: &str) -> SnowflakeConnection {
+        SnowflakeConnection {
+            conn_url: Url::parse(url).unwrap(),
+            raw_conn_url: url.to_string(),
+            binary_path: PathBuf::from("ldrs-sf"),
+            pem_key: None,
+            pem_file: None,
+            inherited_sf_env: Vec::new(),
+        }
+    }
+
+    fn scope(url: &str) -> (Option<String>, Option<String>) {
+        connection_at(url).scope()
+    }
+
+    fn some(database: &str, schema: Option<&str>) -> (Option<String>, Option<String>) {
+        (Some(database.to_string()), schema.map(String::from))
+    }
+
+    #[test]
+    fn scope_reads_the_params() {
+        assert_eq!(
+            scope("snowflake://user@acct?database=DB&schema=SCH&role=R"),
+            some("DB", Some("SCH"))
+        );
+    }
+
+    #[test]
+    fn scope_reads_the_path() {
+        assert_eq!(
+            scope("snowflake://user@acct/DB/SCH"),
+            some("DB", Some("SCH"))
+        );
+        assert_eq!(scope("snowflake://user@acct/DB"), some("DB", None));
+    }
+
+    /// gosnowflake ignores param keys in any other case.
+    #[test]
+    fn scope_ignores_uppercase_params() {
+        assert_eq!(
+            scope("snowflake://user@acct?DATABASE=DB&Schema=SCH"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn scope_takes_the_path_over_the_params() {
+        assert_eq!(
+            scope("snowflake://user@acct/DB/SCH?database=OTHER&schema=OTHER"),
+            some("DB", Some("SCH"))
+        );
+    }
+
+    #[test]
+    fn scope_is_empty_without_either() {
+        assert_eq!(scope("snowflake://user@acct?role=R"), (None, None));
     }
 
     fn connection(inherited: Vec<(String, String)>) -> SnowflakeConnection {

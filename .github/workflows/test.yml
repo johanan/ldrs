@@ -10,7 +10,8 @@ permissions:
 # The duckdb range ldrs is tested against.
 env:
   DUCKDB_MIN: "1.2.1"
-  DUCKDB_MAX: "1.5.2"
+  DUCKDB_MAX: "2.0.1"
+  RUSTFLAGS: "-C target-cpu=x86-64-v3"
 
 jobs:
   build_and_test:
@@ -22,7 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Set up Rust
+      - name: Set up Go
         uses: actions/setup-go@v5
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -35,12 +36,10 @@ jobs:
         run: scripts/setup_test.sh
         shell: bash
       - run: cargo test
-        env:
-          RUSTFLAGS: "-C target-cpu=x86-64-v3"
       - name: DuckDB floor
         run: |
           PATH="$HOME/.duckdb/cli/$DUCKDB_MIN:$PATH" \
-            cargo test -p ldrs --test duckdb_integration -- --skip postgres
+            cargo test -p ldrs --test it -- duckdb_integration:: --skip postgres
         shell: bash
       - name: Shutdown Postgres
         run: scripts/shutdown_test.sh

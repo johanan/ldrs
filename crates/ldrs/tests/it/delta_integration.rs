@@ -6,8 +6,7 @@ use ldrs_delta::{
     OperationConfig, Retention, delta_stats_to_json, parquet_metadata_to_delta_stats, vacuum,
 };
 
-mod common;
-use common::overwrite_delta;
+use crate::common::overwrite_delta;
 use ldrs_parquet::builder_from_string;
 use ldrs_test_fixtures::delta::{cleanup_table, delta_table_path, make_target_batch, test_schema};
 use ldrs_test_fixtures::{data_url, fixture, fixture_url};
@@ -564,7 +563,7 @@ tables:
 async fn test_delta_merge_with_config() {
     // Same config run twice:
     //   1st run: ensure_table creates v0, merge inserts all source rows at v1
-    //   2nd run: merge finds same keys in target, writes DVs + new adds at v2
+    //   2nd run: merge finds same keys in target, removes the matched files + new adds at v2
     let config = r#"
 src: file
 src_defaults:
@@ -671,7 +670,7 @@ tables:
     let v2_commit: serde_json::Value = serde_json::from_str(v2_lines[0]).unwrap();
     assert_eq!(v2_commit["commitInfo"]["operation"], "MERGE");
 
-    // Second merge should find the same keys → at least one remove + DV add
+    // Second merge should find the same keys → at least one remove
     let v2_removes = v2_lines
         .iter()
         .filter(|line| {
@@ -682,14 +681,6 @@ tables:
         })
         .count();
     assert!(v2_removes > 0, "second merge should produce remove actions");
-
-    let has_dv_add = v2_lines.iter().any(|line| {
-        serde_json::from_str::<serde_json::Value>(line)
-            .ok()
-            .and_then(|v| v.get("add").and_then(|a| a.get("deletionVector")).cloned())
-            .is_some()
-    });
-    assert!(has_dv_add, "second merge should produce an add with a DV");
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
 }
@@ -969,6 +960,62 @@ async fn test_vacuum_refuses_retention_under_the_table_floor() {
     );
 
     tokio::runtime::Handle::current().spawn_blocking(move || drop(rt));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_vacuum_ages_a_removed_file_by_its_remove_not_its_mtime() {
+    let rt = tokio::runtime::Handle::current();
+    let table_path = delta_table_path("vacuum_removed_mtime");
+    cleanup_table(&table_path);
+    let table_url = format!("file://{}/", table_path);
+
+    // v1 adds a file, v2 removes it and adds another
+    for _ in 0..2 {
+        overwrite_delta(
+            &table_url,
+            test_schema(),
+            futures::stream::iter(vec![Ok(make_target_batch(1..11))]),
+            None,
+            None,
+            &OperationConfig::new("ldrs-test"),
+            &rt,
+        )
+        .await
+        .unwrap();
+    }
+    let removed = format!(
+        "{}/{}",
+        table_path,
+        added_path(&format!("{}/_delta_log/{:020}.json", table_path, 1))
+    );
+    let orphan = format!("{}/orphan.parquet", table_path);
+    std::fs::write(&orphan, b"never committed").unwrap();
+
+    let thirty_days_ago =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+    for path in [&removed, &orphan] {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(thirty_days_ago)
+            .unwrap();
+    }
+
+    let report = vacuum(&table_url, Retention::TableDefault, false, &rt)
+        .await
+        .unwrap();
+
+    assert_eq!(report.files_deleted, 1);
+    assert!(
+        std::path::Path::new(&removed).exists(),
+        "a file removed inside retention is kept"
+    );
+    assert!(
+        !std::path::Path::new(&orphan).exists(),
+        "an uncommitted file past the cutoff is deleted"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

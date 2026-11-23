@@ -18,9 +18,10 @@ use crate::ldrs_snowflake::{
 use crate::results::{ResultLine, Results};
 
 pub(crate) struct ResolvedSfRegister {
+    /// `database.schema.name`.
     pub table: String,
-    /// Everything before the last dot. `None` leaves the scope to the connection's own.
-    pub schema_path: Option<String>,
+    pub database: String,
+    pub schema: String,
     pub name: String,
     pub integration: String,
     pub external_volume: String,
@@ -32,6 +33,34 @@ fn delta_register(dest: &DeltaDestination) -> Option<&RegisterSpec> {
     match dest {
         DeltaDestination::Overwrite(c) => c.register.as_ref(),
         DeltaDestination::Merge(m) => m.common.register.as_ref(),
+    }
+}
+
+/// `table` as database, schema and name, taking the parts it leaves out from the connection.
+fn qualify(
+    table: &str,
+    conn: &SnowflakeConnection,
+) -> Result<(String, String, String), anyhow::Error> {
+    let (database, schema) = conn.scope();
+    match (
+        table.split('.').collect::<Vec<_>>().as_slice(),
+        database,
+        schema,
+    ) {
+        ([database, schema, name], _, _) => {
+            Ok((database.to_string(), schema.to_string(), name.to_string()))
+        }
+        ([schema, name], Some(database), _) => Ok((database, schema.to_string(), name.to_string())),
+        ([name], Some(database), Some(schema)) => Ok((database, schema, name.to_string())),
+        ([_, _], None, _) => Err(anyhow::anyhow!(
+            "register table '{table}' needs a database: name it in the table or set database= on the connection"
+        )),
+        ([_], _, _) => Err(anyhow::anyhow!(
+            "register table '{table}' needs a database and schema: name them in the table or set database= and schema= on the connection"
+        )),
+        _ => Err(anyhow::anyhow!(
+            "register table '{table}' has more than three parts"
+        )),
     }
 }
 
@@ -50,27 +79,26 @@ pub(crate) fn resolve_registers(
             match delta_register(delta) {
                 None => Ok(None),
                 Some(RegisterSpec::Snowflake(sf)) => {
-                    let table = context.render_template(&sf.table)?;
-                    let (schema_path, name) = match table.rsplit_once('.') {
-                        Some((path, name)) => (Some(path.to_string()), name.to_string()),
-                        None => (None, table.clone()),
-                    };
+                    let rendered = context.render_template(&sf.table)?;
                     // The rendered table is the connection ident, so it walks the usual tier chain.
-                    let (key, url) = get_dest_url(ldrs_env, &table, "SF")?;
+                    let (key, url) = get_dest_url(ldrs_env, &rendered, "SF")?;
                     let (pem_key, pem_file) = resolve_conn_creds(ldrs_env, key);
+                    let conn = SnowflakeConnection::create_connection(
+                        url,
+                        pem_key,
+                        pem_file,
+                        resolve_inherited_sf_env(ldrs_env),
+                    )?;
+                    let (database, schema, name) = qualify(&rendered, &conn)?;
                     Ok(Some(ResolvedSfRegister {
-                        schema_path,
+                        table: format!("{database}.{schema}.{name}"),
+                        database,
+                        schema,
                         name,
                         integration: context.render_template(&sf.integration)?,
                         external_volume: context.render_template(&sf.external_volume)?,
                         refresh: sf.refresh,
-                        conn: SnowflakeConnection::create_connection(
-                            url,
-                            pem_key,
-                            pem_file,
-                            resolve_inherited_sf_env(ldrs_env),
-                        )?,
-                        table,
+                        conn,
                     }))
                 }
             }
@@ -138,8 +166,15 @@ struct StorageLocation {
     storage_base_url: String,
 }
 
+#[derive(Deserialize)]
+struct NameRow {
+    name: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct IcebergTableRow {
+    name: String,
+    schema_name: String,
     external_volume_name: String,
     catalog_name: String,
     base_location: String,
@@ -151,49 +186,66 @@ struct IcebergTableRow {
 #[derive(Debug)]
 struct Probe {
     volume_base_urls: Vec<String>,
+    schema_to_create: Option<String>,
     existing: Option<IcebergTableRow>,
 }
 
-fn read_probe(results: &[StatementResult]) -> Result<Probe, anyhow::Error> {
-    match results {
-        [volume, integration, show] => {
-            // The other two result sets are bounded; only this one grows with configuration.
-            match volume.truncated {
-                true => Err(anyhow::anyhow!(
-                    "the external volume reported more locations than ldrs-sf captured"
-                )),
-                false => Ok(()),
-            }?;
+fn read_probe(
+    results: &[StatementResult],
+    register: &ResolvedSfRegister,
+) -> Result<Probe, anyhow::Error> {
+    let [volume, integration, show, schemas] = results else {
+        return Err(anyhow::anyhow!(
+            "the probe returned {} result sets, expected 4",
+            results.len()
+        ));
+    };
 
-            let volume_base_urls = volume
-                .rows_as::<PropertyRow>()?
-                .iter()
-                // the sibling ACTIVE row shares the parent but holds a name, not JSON
-                .filter(|row| {
-                    row.parent_property == "STORAGE_LOCATIONS"
-                        && row.property.starts_with("STORAGE_LOCATION_")
-                })
-                .map(|row| {
-                    serde_json::from_str::<StorageLocation>(&row.property_value)
-                        .map(|location| location.storage_base_url)
-                        .with_context(|| {
-                            format!("could not read storage location '{}'", row.property)
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            check_integration(integration)?;
-
-            Ok(Probe {
-                volume_base_urls,
-                existing: show.rows_as::<IcebergTableRow>()?.into_iter().next(),
-            })
-        }
-        other => Err(anyhow::anyhow!(
-            "expected three probe result sets, got {}",
-            other.len()
+    // The other result sets are bounded; only this one grows with configuration.
+    match volume.truncated {
+        true => Err(anyhow::anyhow!(
+            "the external volume reported more locations than ldrs-sf captured"
         )),
-    }
+        false => Ok(()),
+    }?;
+
+    let volume_base_urls = volume
+        .rows_as::<PropertyRow>()?
+        .iter()
+        // the sibling ACTIVE row shares the parent but holds a name, not JSON
+        .filter(|row| {
+            row.parent_property == "STORAGE_LOCATIONS"
+                && row.property.starts_with("STORAGE_LOCATION_")
+        })
+        .map(|row| {
+            serde_json::from_str::<StorageLocation>(&row.property_value)
+                .map(|location| location.storage_base_url)
+                .with_context(|| format!("could not read storage location '{}'", row.property))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    check_integration(integration)?;
+
+    let schema_to_create = match schemas
+        .rows_as::<NameRow>()?
+        .iter()
+        .any(|row| row.name.eq_ignore_ascii_case(&register.schema))
+    {
+        true => None,
+        false => Some(format!("{}.{}", register.database, register.schema)),
+    };
+
+    // LIKE treats `_` as a wildcard and the lookup spans the database, so match the name exactly
+    let existing = show.rows_as::<IcebergTableRow>()?.into_iter().find(|row| {
+        row.name.eq_ignore_ascii_case(&register.name)
+            && row.schema_name.eq_ignore_ascii_case(&register.schema)
+    });
+
+    Ok(Probe {
+        volume_base_urls,
+        schema_to_create,
+        existing,
+    })
 }
 
 fn check_integration(result: &StatementResult) -> Result<(), anyhow::Error> {
@@ -234,21 +286,33 @@ fn refresh_statement(register: &ResolvedSfRegister) -> String {
     format!("ALTER ICEBERG TABLE {} REFRESH", register.table)
 }
 
-/// The statements that bring the catalog in line with the config, or the mismatch that stops us.
+/// The statements that bring the catalog in line with the config, the action they amount to,
+/// or the mismatch that stops us.
 fn write_statements(
     register: &ResolvedSfRegister,
     base_location: &str,
-    existing: Option<&IcebergTableRow>,
-) -> Result<Vec<String>, anyhow::Error> {
+    probe: &Probe,
+) -> Result<(&'static str, Vec<String>), anyhow::Error> {
     let table = &register.table;
-    match existing {
-        None => Ok(match register.refresh {
-            Refresh::Load => vec![
-                create_statement(register, base_location),
-                refresh_statement(register),
-            ],
-            Refresh::Auto => vec![create_statement(register, base_location)],
-        }),
+    match &probe.existing {
+        None => {
+            let create = match register.refresh {
+                Refresh::Load => vec![
+                    create_statement(register, base_location),
+                    refresh_statement(register),
+                ],
+                Refresh::Auto => vec![create_statement(register, base_location)],
+            };
+            Ok((
+                "created",
+                probe
+                    .schema_to_create
+                    .iter()
+                    .map(|schema| format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+                    .chain(create)
+                    .collect(),
+            ))
+        }
 
         Some(row)
             if !row
@@ -279,17 +343,21 @@ fn write_statements(
 
         // present and ours, so only the refresh mode can still need changing
         Some(row) => Ok(match (register.refresh, row.auto_refresh_status.as_str()) {
-            (Refresh::Load, "") => vec![refresh_statement(register)],
-            (Refresh::Load, _) => vec![
-                format!("ALTER ICEBERG TABLE {table} SET AUTO_REFRESH = FALSE"),
-                refresh_statement(register),
-            ],
-            (Refresh::Auto, "") => {
+            (Refresh::Load, "") => ("refreshed", vec![refresh_statement(register)]),
+            (Refresh::Load, _) => (
+                "refreshed",
+                vec![
+                    format!("ALTER ICEBERG TABLE {table} SET AUTO_REFRESH = FALSE"),
+                    refresh_statement(register),
+                ],
+            ),
+            (Refresh::Auto, "") => (
+                "altered",
                 vec![format!(
                     "ALTER ICEBERG TABLE {table} SET AUTO_REFRESH = TRUE"
-                )]
-            }
-            (Refresh::Auto, _) => vec![],
+                )],
+            ),
+            (Refresh::Auto, _) => ("unchanged", vec![]),
         }),
     }
 }
@@ -321,18 +389,19 @@ fn derive_base_location(probe: &Probe, full_url: &str) -> Result<String, anyhow:
     }
 }
 
-fn probe_statements(register: &ResolvedSfRegister) -> [String; 3] {
-    let show = match &register.schema_path {
-        Some(path) => format!(
-            "SHOW ICEBERG TABLES LIKE '{}' IN SCHEMA {path}",
-            register.name
-        ),
-        None => format!("SHOW ICEBERG TABLES LIKE '{}'", register.name),
-    };
+/// The lookups are scoped to the database so a missing schema returns no rows instead of failing.
+fn probe_statements(register: &ResolvedSfRegister) -> [String; 4] {
     [
         format!("DESCRIBE EXTERNAL VOLUME {}", register.external_volume),
         format!("DESCRIBE CATALOG INTEGRATION {}", register.integration),
-        show,
+        format!(
+            "SHOW ICEBERG TABLES LIKE '{}' IN DATABASE {}",
+            register.name, register.database
+        ),
+        format!(
+            "SHOW SCHEMAS LIKE '{}' IN DATABASE {}",
+            register.schema, register.database
+        ),
     ]
 }
 
@@ -348,17 +417,11 @@ pub(crate) async fn register_sf(
         .await
         .map_err(|e| format!("register task panicked: {e}"))?
         .map_err(|e| format!("{e:#}"))?;
-    let probe = read_probe(&results).map_err(|e| format!("{e:#}"))?;
+    let probe = read_probe(&results, register).map_err(|e| format!("{e:#}"))?;
 
     let base_location = derive_base_location(&probe, full_url).map_err(|e| format!("{e:#}"))?;
-    let statements = write_statements(register, &base_location, probe.existing.as_ref())
-        .map_err(|e| format!("{e:#}"))?;
-
-    let action = match (&probe.existing, statements.as_slice()) {
-        (None, _) => "created",
-        (Some(_), []) => "unchanged",
-        (Some(_), _) => "refreshed",
-    };
+    let (action, statements) =
+        write_statements(register, &base_location, &probe).map_err(|e| format!("{e:#}"))?;
 
     match statements.as_slice() {
         // already registered and already in the configured refresh mode
@@ -382,9 +445,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn conn() -> SnowflakeConnection {
+        conn_at("snowflake://acct")
+    }
+
+    fn conn_at(url: &str) -> SnowflakeConnection {
         SnowflakeConnection {
-            conn_url: Url::parse("snowflake://acct").unwrap(),
-            raw_conn_url: "snowflake://acct".to_string(),
+            conn_url: Url::parse(url).unwrap(),
+            raw_conn_url: url.to_string(),
             binary_path: PathBuf::from("ldrs-sf"),
             pem_key: None,
             pem_file: None,
@@ -392,10 +459,55 @@ mod tests {
         }
     }
 
+    fn parts(database: &str, schema: &str, name: &str) -> (String, String, String) {
+        (database.to_string(), schema.to_string(), name.to_string())
+    }
+
+    #[test]
+    fn qualify_keeps_a_fully_qualified_table() {
+        let got = qualify(
+            "DB.SCH.TBL",
+            &conn_at("snowflake://acct?database=X&schema=Y"),
+        )
+        .unwrap();
+        assert_eq!(got, parts("DB", "SCH", "TBL"));
+    }
+
+    #[test]
+    fn qualify_takes_the_database_from_the_connection() {
+        let got = qualify("SCH.TBL", &conn_at("snowflake://acct?database=DB")).unwrap();
+        assert_eq!(got, parts("DB", "SCH", "TBL"));
+    }
+
+    #[test]
+    fn qualify_takes_the_database_and_schema_from_the_connection() {
+        let got = qualify("TBL", &conn_at("snowflake://acct/DB/SCH")).unwrap();
+        assert_eq!(got, parts("DB", "SCH", "TBL"));
+    }
+
+    #[test]
+    fn qualify_needs_a_database() {
+        let err = qualify("SCH.TBL", &conn()).unwrap_err();
+        assert!(format!("{err:#}").contains("needs a database"));
+    }
+
+    #[test]
+    fn qualify_needs_a_schema_for_a_bare_name() {
+        let err = qualify("TBL", &conn_at("snowflake://acct?database=DB")).unwrap_err();
+        assert!(format!("{err:#}").contains("needs a database and schema"));
+    }
+
+    #[test]
+    fn qualify_rejects_more_than_three_parts() {
+        let err = qualify("A.DB.SCH.TBL", &conn()).unwrap_err();
+        assert!(format!("{err:#}").contains("more than three parts"));
+    }
+
     fn register(refresh: Refresh) -> ResolvedSfRegister {
         ResolvedSfRegister {
             table: "DB.SCH.TBL".to_string(),
-            schema_path: Some("DB.SCH".to_string()),
+            database: "DB".to_string(),
+            schema: "SCH".to_string(),
             name: "TBL".to_string(),
             integration: "cat_int".to_string(),
             external_volume: "vol".to_string(),
@@ -406,6 +518,8 @@ mod tests {
 
     fn existing(auto_refresh_status: &str) -> IcebergTableRow {
         IcebergTableRow {
+            name: "TBL".to_string(),
+            schema_name: "SCH".to_string(),
             external_volume_name: "VOL".to_string(),
             catalog_name: "CAT_INT".to_string(),
             base_location: "one/two/tbl/".to_string(),
@@ -492,10 +606,21 @@ mod tests {
         )
     }
 
+    fn schemas_result(names: &[&str]) -> StatementResult {
+        result(
+            &["created_on", "name", "database_name"],
+            names
+                .iter()
+                .map(|name| vec![json!(""), json!(name), json!("DB")])
+                .collect(),
+        )
+    }
+
     fn show_result(rows: Vec<Vec<serde_json::Value>>) -> StatementResult {
         result(
             &[
                 "name",
+                "schema_name",
                 "external_volume_name",
                 "catalog_name",
                 "iceberg_table_type",
@@ -509,7 +634,16 @@ mod tests {
     fn probe(volume_base_urls: &[&str]) -> Probe {
         Probe {
             volume_base_urls: volume_base_urls.iter().map(|u| u.to_string()).collect(),
+            schema_to_create: None,
             existing: None,
+        }
+    }
+
+    fn found(existing: Option<IcebergTableRow>) -> Probe {
+        Probe {
+            volume_base_urls: Vec::new(),
+            schema_to_create: None,
+            existing,
         }
     }
 
@@ -593,11 +727,15 @@ mod tests {
 
     #[test]
     fn read_probe_skips_the_active_row_and_reads_the_locations() {
-        let probe = read_probe(&[
-            volume_result(&["azure://acct.blob.core.windows.net/cont/"]),
-            integration_result("true", "OBJECT_STORE", "DELTA"),
-            show_result(vec![]),
-        ])
+        let probe = read_probe(
+            &[
+                volume_result(&["azure://acct.blob.core.windows.net/cont/"]),
+                integration_result("true", "OBJECT_STORE", "DELTA"),
+                show_result(vec![]),
+                schemas_result(&["SCH"]),
+            ],
+            &register(Refresh::Load),
+        )
         .unwrap();
         assert_eq!(
             probe.volume_base_urls,
@@ -611,25 +749,33 @@ mod tests {
 
     #[test]
     fn read_probe_reads_every_location() {
-        let probe = read_probe(&[
-            volume_result(&[
-                "azure://acct.blob.core.windows.net/one/",
-                "azure://acct.blob.core.windows.net/two/",
-            ]),
-            integration_result("true", "OBJECT_STORE", "DELTA"),
-            show_result(vec![]),
-        ])
+        let probe = read_probe(
+            &[
+                volume_result(&[
+                    "azure://acct.blob.core.windows.net/one/",
+                    "azure://acct.blob.core.windows.net/two/",
+                ]),
+                integration_result("true", "OBJECT_STORE", "DELTA"),
+                show_result(vec![]),
+                schemas_result(&["SCH"]),
+            ],
+            &register(Refresh::Load),
+        )
         .unwrap();
         assert_eq!(probe.volume_base_urls.len(), 2);
     }
 
     #[test]
     fn read_probe_reads_the_existing_table() {
-        let probe = read_probe(&[
-            volume_result(&["azure://acct.blob.core.windows.net/cont/"]),
-            integration_result("true", "OBJECT_STORE", "DELTA"),
-            show_result(vec![show_row("one/two/tbl/", "")]),
-        ])
+        let probe = read_probe(
+            &[
+                volume_result(&["azure://acct.blob.core.windows.net/cont/"]),
+                integration_result("true", "OBJECT_STORE", "DELTA"),
+                show_result(vec![show_row("TBL", "SCH", "one/two/tbl/")]),
+                schemas_result(&["SCH"]),
+            ],
+            &register(Refresh::Load),
+        )
         .unwrap();
         let row = probe
             .existing
@@ -643,33 +789,45 @@ mod tests {
     fn read_probe_rejects_a_truncated_volume() {
         let mut volume = volume_result(&["azure://acct.blob.core.windows.net/cont/"]);
         volume.truncated = true;
-        let err = read_probe(&[
-            volume,
-            integration_result("true", "OBJECT_STORE", "DELTA"),
-            show_result(vec![]),
-        ])
+        let err = read_probe(
+            &[
+                volume,
+                integration_result("true", "OBJECT_STORE", "DELTA"),
+                show_result(vec![]),
+                schemas_result(&["SCH"]),
+            ],
+            &register(Refresh::Load),
+        )
         .unwrap_err();
         assert!(format!("{err:#}").contains("captured"));
     }
 
     #[test]
     fn read_probe_rejects_a_disabled_integration() {
-        let err = read_probe(&[
-            volume_result(&["azure://acct.blob.core.windows.net/cont/"]),
-            integration_result("false", "OBJECT_STORE", "DELTA"),
-            show_result(vec![]),
-        ])
+        let err = read_probe(
+            &[
+                volume_result(&["azure://acct.blob.core.windows.net/cont/"]),
+                integration_result("false", "OBJECT_STORE", "DELTA"),
+                show_result(vec![]),
+                schemas_result(&["SCH"]),
+            ],
+            &register(Refresh::Load),
+        )
         .unwrap_err();
         assert!(format!("{err:#}").contains("disabled"));
     }
 
     #[test]
     fn read_probe_rejects_the_wrong_table_format() {
-        let err = read_probe(&[
-            volume_result(&["azure://acct.blob.core.windows.net/cont/"]),
-            integration_result("true", "OBJECT_STORE", "ICEBERG"),
-            show_result(vec![]),
-        ])
+        let err = read_probe(
+            &[
+                volume_result(&["azure://acct.blob.core.windows.net/cont/"]),
+                integration_result("true", "OBJECT_STORE", "ICEBERG"),
+                show_result(vec![]),
+                schemas_result(&["SCH"]),
+            ],
+            &register(Refresh::Load),
+        )
         .unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("ICEBERG"), "{message}");
@@ -677,13 +835,70 @@ mod tests {
 
     #[test]
     fn read_probe_rejects_the_wrong_number_of_result_sets() {
-        let err = read_probe(&[integration_result("true", "OBJECT_STORE", "DELTA")]).unwrap_err();
-        assert!(format!("{err:#}").contains("got 1"));
+        let err = read_probe(
+            &[integration_result("true", "OBJECT_STORE", "DELTA")],
+            &register(Refresh::Load),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("returned 1"));
+    }
+
+    #[test]
+    fn read_probe_marks_a_missing_schema_for_creation() {
+        let probe = read_probe(
+            &[
+                volume_result(&["azure://acct.blob.core.windows.net/cont/"]),
+                integration_result("true", "OBJECT_STORE", "DELTA"),
+                show_result(vec![]),
+                schemas_result(&[]),
+            ],
+            &register(Refresh::Load),
+        )
+        .unwrap();
+        assert_eq!(probe.schema_to_create.as_deref(), Some("DB.SCH"));
+        assert!(probe.existing.is_none());
+    }
+
+    #[test]
+    fn read_probe_matches_the_table_name_and_schema_exactly() {
+        let probe = read_probe(
+            &[
+                volume_result(&["azure://acct.blob.core.windows.net/cont/"]),
+                integration_result("true", "OBJECT_STORE", "DELTA"),
+                show_result(vec![
+                    show_row("TXL", "SCH", "like/match/"),
+                    show_row("TBL", "OTHER", "other/schema/"),
+                    show_row("TBL", "SCH", "one/two/tbl/"),
+                ]),
+                schemas_result(&["SCH"]),
+            ],
+            &register(Refresh::Load),
+        )
+        .unwrap();
+        assert!(probe.schema_to_create.is_none());
+        assert_eq!(probe.existing.unwrap().base_location, "one/two/tbl/");
+    }
+
+    #[test]
+    fn absent_with_a_missing_schema_creates_the_schema_first() {
+        let probe = Probe {
+            volume_base_urls: Vec::new(),
+            schema_to_create: Some("DB.SCH".to_string()),
+            existing: None,
+        };
+        let (action, got) =
+            write_statements(&register(Refresh::Load), "one/two/tbl/", &probe).unwrap();
+        assert_eq!(action, "created");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], "CREATE SCHEMA IF NOT EXISTS DB.SCH");
+        assert!(got[1].starts_with("CREATE ICEBERG TABLE IF NOT EXISTS DB.SCH.TBL"));
     }
 
     #[test]
     fn absent_under_load_creates_then_refreshes() {
-        let got = write_statements(&register(Refresh::Load), "one/two/tbl/", None).unwrap();
+        let (action, got) =
+            write_statements(&register(Refresh::Load), "one/two/tbl/", &found(None)).unwrap();
+        assert_eq!(action, "created");
         assert_eq!(got.len(), 2);
         assert!(got[0].starts_with("CREATE ICEBERG TABLE IF NOT EXISTS DB.SCH.TBL"));
         assert!(got[0].contains("BASE_LOCATION = 'one/two/tbl/'"));
@@ -693,7 +908,9 @@ mod tests {
 
     #[test]
     fn absent_under_auto_creates_only() {
-        let got = write_statements(&register(Refresh::Auto), "one/two/tbl/", None).unwrap();
+        let (action, got) =
+            write_statements(&register(Refresh::Auto), "one/two/tbl/", &found(None)).unwrap();
+        assert_eq!(action, "created");
         assert_eq!(got.len(), 1);
         assert!(got[0].contains("AUTO_REFRESH = TRUE"));
     }
@@ -701,14 +918,18 @@ mod tests {
     #[test]
     fn present_under_load_refreshes() {
         let row = existing("");
-        let got = write_statements(&register(Refresh::Load), "one/two/tbl/", Some(&row)).unwrap();
+        let (action, got) =
+            write_statements(&register(Refresh::Load), "one/two/tbl/", &found(Some(row))).unwrap();
+        assert_eq!(action, "refreshed");
         assert_eq!(got, vec!["ALTER ICEBERG TABLE DB.SCH.TBL REFRESH"]);
     }
 
     #[test]
     fn present_under_load_disables_auto_before_refreshing() {
         let row = existing(r#"{"executionState":"RUNNING"}"#);
-        let got = write_statements(&register(Refresh::Load), "one/two/tbl/", Some(&row)).unwrap();
+        let (action, got) =
+            write_statements(&register(Refresh::Load), "one/two/tbl/", &found(Some(row))).unwrap();
+        assert_eq!(action, "refreshed");
         assert_eq!(
             got,
             vec![
@@ -721,7 +942,9 @@ mod tests {
     #[test]
     fn present_under_auto_enables_it() {
         let row = existing("");
-        let got = write_statements(&register(Refresh::Auto), "one/two/tbl/", Some(&row)).unwrap();
+        let (action, got) =
+            write_statements(&register(Refresh::Auto), "one/two/tbl/", &found(Some(row))).unwrap();
+        assert_eq!(action, "altered");
         assert_eq!(
             got,
             vec!["ALTER ICEBERG TABLE DB.SCH.TBL SET AUTO_REFRESH = TRUE"]
@@ -731,7 +954,9 @@ mod tests {
     #[test]
     fn present_under_auto_already_polling_has_nothing_to_do() {
         let row = existing(r#"{"executionState":"RUNNING"}"#);
-        let got = write_statements(&register(Refresh::Auto), "one/two/tbl/", Some(&row)).unwrap();
+        let (action, got) =
+            write_statements(&register(Refresh::Auto), "one/two/tbl/", &found(Some(row))).unwrap();
+        assert_eq!(action, "unchanged");
         assert!(
             got.is_empty(),
             "an empty batch is what skips the second spawn"
@@ -742,15 +967,17 @@ mod tests {
     #[test]
     fn identifiers_compare_case_insensitively() {
         let row = existing("");
-        assert!(write_statements(&register(Refresh::Load), "one/two/tbl/", Some(&row)).is_ok());
+        assert!(
+            write_statements(&register(Refresh::Load), "one/two/tbl/", &found(Some(row))).is_ok()
+        );
     }
 
     #[test]
     fn a_different_volume_is_a_mismatch() {
         let mut row = existing("");
         row.external_volume_name = "OTHER_VOL".to_string();
-        let err =
-            write_statements(&register(Refresh::Load), "one/two/tbl/", Some(&row)).unwrap_err();
+        let err = write_statements(&register(Refresh::Load), "one/two/tbl/", &found(Some(row)))
+            .unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("OTHER_VOL"), "{message}");
         assert!(message.contains("vol"), "{message}");
@@ -760,16 +987,20 @@ mod tests {
     fn a_different_catalog_is_a_mismatch() {
         let mut row = existing("");
         row.catalog_name = "OTHER_CAT".to_string();
-        let err =
-            write_statements(&register(Refresh::Load), "one/two/tbl/", Some(&row)).unwrap_err();
+        let err = write_statements(&register(Refresh::Load), "one/two/tbl/", &found(Some(row)))
+            .unwrap_err();
         assert!(format!("{err:#}").contains("OTHER_CAT"));
     }
 
     #[test]
     fn a_different_base_location_is_a_mismatch() {
         let row = existing("");
-        let err =
-            write_statements(&register(Refresh::Load), "one/two/other/", Some(&row)).unwrap_err();
+        let err = write_statements(
+            &register(Refresh::Load),
+            "one/two/other/",
+            &found(Some(row)),
+        )
+        .unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("one/two/tbl/"), "{message}");
         assert!(message.contains("one/two/other/"), "{message}");
@@ -779,19 +1010,20 @@ mod tests {
     fn a_snowflake_managed_table_is_a_mismatch() {
         let mut row = existing("");
         row.iceberg_table_type = "MANAGED".to_string();
-        let err =
-            write_statements(&register(Refresh::Load), "one/two/tbl/", Some(&row)).unwrap_err();
+        let err = write_statements(&register(Refresh::Load), "one/two/tbl/", &found(Some(row)))
+            .unwrap_err();
         assert!(format!("{err:#}").contains("MANAGED"));
     }
 
-    fn show_row(base_location: &str, auto_refresh_status: &str) -> Vec<serde_json::Value> {
+    fn show_row(name: &str, schema: &str, base_location: &str) -> Vec<serde_json::Value> {
         vec![
-            json!("TBL"),
+            json!(name),
+            json!(schema),
             json!("VOL"),
             json!("CAT_INT"),
             json!("UNMANAGED"),
             json!(base_location),
-            json!(auto_refresh_status),
+            json!(""),
         ]
     }
 }

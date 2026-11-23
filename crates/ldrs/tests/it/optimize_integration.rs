@@ -1,13 +1,13 @@
 use futures::stream;
 use ldrs_delta::{MergeConfig, OperationConfig, TxnConfig};
 
-mod common;
-use common::{merge_delta, overwrite_delta};
+use crate::common::{merge_delta, overwrite_delta};
 use ldrs_test_fixtures::delta::{
     SOURCE_BASE_TS, cleanup_table, count_actions, delta_table_path, duckdb_count, duckdb_summary,
     find_action, latest_version, make_batch_from_ids, make_source_batch, make_target_batch,
     read_log_actions, test_schema,
 };
+use serde_json::json;
 use std::ops::Range;
 
 fn test_table_path(name: &str) -> String {
@@ -154,7 +154,7 @@ async fn test_optimize_commits_removes_with_no_add_for_an_all_deleted_bin() {
     .await
     .unwrap();
 
-    let stats = merge_delta(
+    merge_delta(
         &table_url,
         schema.clone(),
         stream::iter(vec![Ok(make_source_batch(1..101))]),
@@ -171,8 +171,7 @@ async fn test_optimize_commits_removes_with_no_add_for_an_all_deleted_bin() {
     )
     .await
     .unwrap();
-    assert_eq!(stats.matched_rows, 100);
-    assert_eq!(stats.files_with_dvs, 1);
+    readd_with_full_dv(&table_path);
 
     let contents = duckdb_summary(&table_path);
     assert_eq!(contents, "10000,100,1,100");
@@ -211,6 +210,41 @@ async fn test_optimize_commits_removes_with_no_add_for_an_all_deleted_bin() {
 
     assert_eq!(duckdb_summary(&table_path), contents);
     assert_eq!(duckdb_count(&table_path), "100");
+}
+
+/// An inline deletion vector over rows 0..=99.
+const ALL_100_ROWS_DV: &str = "^Bg9^0rr910000000000iXQKl0rr91003He5c8Xg000310SSr51onP91][(d2MLeh3igCl3&*.p4GE1t5c9px5=-NB6Aw<F762cJ7YUAN8upYR8#{#V9SNnZaoiL+a]&?/bMGa<ciby[c&+W@dGy$0ec4m4e=WK8fAr*cg5%9ggYPxkhukVoh#>@siSIkwjodIAj]^!EkMB7Ili6vMl&YTQmGt{Unb#iYn=RG:oAm=!p5[5&pYKt)qufR}q#/[#rSDh3so8F7s].+btMw4fui1sju&TQnvGo)r";
+
+/// Commit v1's file again with a deletion vector over all 100 of its rows.
+fn readd_with_full_dv(table_path: &str) {
+    let mut add = find_action(&read_log_actions(table_path, 1), "add")
+        .expect("v1 should add the target file")
+        .clone();
+    add["dataChange"] = json!(true);
+    add["deletionVector"] = json!({
+        "storageType": "i",
+        "pathOrInlineDv": ALL_100_ROWS_DV,
+        "sizeInBytes": 232,
+        "cardinality": 100,
+    });
+
+    let version = latest_version(table_path);
+    let timestamp = find_action(&read_log_actions(table_path, version), "commitInfo")
+        .expect("every commit has a commitInfo")["inCommitTimestamp"]
+        .as_i64()
+        .unwrap()
+        + 1;
+    let commit = [
+        json!({"commitInfo": {"inCommitTimestamp": timestamp, "timestamp": timestamp, "operation": "WRITE"}}),
+        json!({"add": add}),
+    ]
+    .map(|action| action.to_string())
+    .join("\n");
+    std::fs::write(
+        format!("{table_path}/_delta_log/{:020}.json", version + 1),
+        commit,
+    )
+    .unwrap();
 }
 
 async fn small_file_table(table_path: &str, rt: &tokio::runtime::Handle) -> String {

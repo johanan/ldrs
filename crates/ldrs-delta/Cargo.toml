@@ -1,6 +1,6 @@
 [package]
 name = "ldrs-delta"
-version = "0.1.6"
+version = "0.1.7"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -16,7 +16,7 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
 crc = "3.4"
-delta_kernel = { workspace = true, features = ["internal-api", "arrow-59"] }
+delta_kernel = { workspace = true, features = ["internal-api", "arrow-60"] }
 delta_kernel_default_engine = { workspace = true }
 futures.workspace = true
 object_store.workspace = true

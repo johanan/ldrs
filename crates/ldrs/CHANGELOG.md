@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.5] - 2026-11-23
+
+### Bug Fixes
+
+- *(delta)* Do not add fully deleted file
+
+When a parquet is fully deleted (every row is in a DV), do not keep that
+file in the commit. Remove it along with any DV that was attached.
+
+Also bumps a missed arrow-60 and cleaner integration tests.
+
+- *(delta)* Vacuum by deletion timestamp
+
+Vacuum previously used mtime and the deletion timestamp from the commit.
+This would remove files immediately, not giving a window (default 7
+days).
+
+- *(register)* Qualify table and create schema
+
+Use either the full name in the config or parse the DB and SCHEMA from
+the connection to fully qualify the table to be registered in Snowflake.
+
+Also try to create the schema if it does not exist.
+
+
 ## [0.25.4] - 2026-11-18
 
 ### Bug Fixes
