@@ -13,7 +13,7 @@ use serde::Serialize;
 pub enum ResultLine<'a> {
     /// One per task: its load, written before any post-load phase runs.
     Load(&'a PhaseOutput),
-    /// One per registration that ran: `created`, `refreshed`, or `unchanged`, or why it failed.
+    /// One per registration that ran: `created`, `refreshed`, `altered`, or `unchanged`, or why it failed.
     Register {
         name: &'a str,
         target: &'a str,
