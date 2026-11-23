@@ -6,8 +6,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArra
 use futures::stream;
 use ldrs_delta::{MergeConfig, OperationConfig, TxnConfig};
 
-mod common;
-use common::{merge_delta, overwrite_delta};
+use crate::common::{merge_delta, overwrite_delta};
 use ldrs_test_fixtures::delta::{
     SOURCE_BASE_TS, TARGET_BASE_TS, TS_STEP, cleanup_table, count_actions, delta_table_path,
     duckdb_count, find_action, latest_version, make_batch, make_batch_from_ids, make_source_batch,
@@ -380,27 +379,28 @@ async fn test_merge_all_matches() {
         "should have remove actions for matched files"
     );
 
+    // Fully matched target files are removed, not re-added.
     let add_actions: Vec<&serde_json::Value> =
         actions.iter().filter_map(|a| a.get("add")).collect();
-    let dv_adds: Vec<&&serde_json::Value> = add_actions
+    assert!(
+        add_actions
+            .iter()
+            .all(|a| a.get("deletionVector").is_none()),
+        "a fully deleted file should not be re-added with a DV"
+    );
+    let removed: Vec<&str> = actions
         .iter()
-        .filter(|a| a.get("deletionVector").is_some())
+        .filter_map(|a| a.get("remove"))
+        .map(|r| r["path"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        dv_adds.len(),
-        remove_count,
-        "each removed file should be re-added with a DV"
+    assert!(
+        add_actions
+            .iter()
+            .all(|a| !removed.contains(&a["path"].as_str().unwrap())),
+        "a fully deleted file should not be re-added"
     );
 
-    // DV cardinality should cover all 1000 target rows
-    let total_dv_cardinality: i64 = dv_adds
-        .iter()
-        .map(|a| a["deletionVector"]["cardinality"].as_i64().unwrap())
-        .sum();
-    assert_eq!(
-        total_dv_cardinality, 1000,
-        "DVs should cover all 1000 target rows"
-    );
+    assert_eq!(duckdb_count(&table_path), "1000");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -473,19 +473,24 @@ async fn test_merge_with_existing_dvs() {
     // Second merge commit at v3 (v0=create, v1=overwrite, v2=first merge, v3=second merge)
     let actions = read_log_actions(&table_path, 3);
 
-    // DV cardinality after second merge = 1000 (union of first 500 + second 500)
-    let dv_adds: Vec<&serde_json::Value> = actions
-        .iter()
-        .filter_map(|a| a.get("add"))
-        .filter(|a| a.get("deletionVector").is_some())
-        .collect();
-    let total_dv_cardinality: i64 = dv_adds
-        .iter()
-        .map(|a| a["deletionVector"]["cardinality"].as_i64().unwrap())
-        .sum();
-    assert_eq!(
-        total_dv_cardinality, 1000,
-        "DVs after second merge should cover all 1000 rows (union of both merges)"
+    // The existing DV plus the new matches cover the target file, so it is removed, not re-added.
+    let removes: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("remove")).collect();
+    assert_eq!(removes.len(), 1, "the target file should be removed");
+    assert!(
+        removes[0].get("deletionVector").is_some(),
+        "the remove should carry the existing DV"
+    );
+    let add_actions: Vec<&serde_json::Value> =
+        actions.iter().filter_map(|a| a.get("add")).collect();
+    assert!(
+        add_actions
+            .iter()
+            .all(|a| a.get("deletionVector").is_none()),
+        "a fully deleted file should not be re-added with a DV"
+    );
+    assert!(
+        add_actions.iter().all(|a| a["path"] != removes[0]["path"]),
+        "a fully deleted file should not be re-added"
     );
 
     // Protocol upgrade should NOT happen on second merge (already enabled)

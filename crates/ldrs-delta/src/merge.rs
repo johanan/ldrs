@@ -431,7 +431,10 @@ async fn commit_merge(
         const DV_INLINE_CEILING: usize = 1024;
 
         let mut adds_with_dvs = Vec::with_capacity(file_matches.len());
-        for fm in &file_matches {
+        for fm in file_matches
+            .iter()
+            .filter(|fm| fm.deleted_rows.len() < fm.metadata.file_metadata().num_rows() as u64)
+        {
             let dv_bytes = serialize_dv(&fm.deleted_rows);
             let cardinality = fm.deleted_rows.len() as i64;
             let descriptor = match (

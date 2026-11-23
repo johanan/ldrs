@@ -36,8 +36,6 @@ where
     sink.finish().await
 }
 
-// delta_integration drives only the overwrite sink
-#[allow(dead_code)]
 pub async fn merge_delta<S>(
     table_path: &str,
     schema: SchemaRef,
