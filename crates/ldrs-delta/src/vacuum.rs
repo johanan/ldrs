@@ -8,9 +8,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use arrow::array::AsArray;
 use arrow_array::Array;
+use arrow_array::types::Int64Type;
 use chrono::{DateTime, Utc};
 use delta_kernel::commit_range::{CommitRange, DeltaAction};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::history_manager::timestamp_range_to_versions;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::table_features::TableFeature;
@@ -133,19 +135,29 @@ pub async fn vacuum(
         }
     }
 
-    match needs_change_data {
-        false => (),
+    let cutoff_ms = cutoff.timestamp_millis();
+    let rescued = match needs_change_data {
         true => {
             let oldest_commit = oldest_commit.ok_or_else(|| {
                 anyhow::anyhow!("no commit files found under {base_path}/_delta_log")
             })?;
-            let cdc_hash = read_cdc_paths(&kernel_url(&url)?, oldest_commit, &engine)?;
-            sweep.candidates.retain(|location| {
-                relative_path(&base_path, location)
-                    .is_none_or(|relative| !cdc_hash.contains(relative))
-            });
+            read_rescued_paths(&kernel_url(&url)?, oldest_commit, cutoff_ms, &engine)?
         }
-    }
+        false => match snapshot.get_timestamp(engine.as_ref())? >= cutoff_ms {
+            // no commit since the cutoff, so nothing was removed inside retention
+            false => HashSet::new(),
+            true => {
+                let (start, _) =
+                    timestamp_range_to_versions(&snapshot, engine.as_ref(), cutoff_ms, None)?;
+                read_rescued_paths(&kernel_url(&url)?, start, cutoff_ms, &engine)?
+            }
+        },
+    };
+    let candidates = sweep.candidates.len();
+    sweep.candidates.retain(|location| {
+        relative_path(&base_path, location).is_none_or(|relative| !rescued.contains(relative))
+    });
+    sweep.kept += (candidates - sweep.candidates.len()) as u64;
 
     let mut report = VacuumOutcome {
         files_listed: sweep.listed,
@@ -342,14 +354,18 @@ fn may_have_change_data(snapshot: &Snapshot) -> bool {
     }
 }
 
-fn read_cdc_paths(
+/// Paths a candidate is kept for: files removed at or after `cutoff_ms` with their deletion vector
+/// files, and every cdc file a commit from `start_version` on names.
+fn read_rescued_paths(
     table_root: &Url,
     start_version: Version,
+    cutoff_ms: i64,
     engine: &Arc<dyn Engine>,
 ) -> Result<HashSet<String>, anyhow::Error> {
+    let actions = &[DeltaAction::Remove, DeltaAction::Cdc];
     let range = CommitRange::builder_for(table_root, start_version).build(engine.as_ref())?;
     let mut paths = HashSet::new();
-    for commit in range.commits(engine.clone(), None, &[DeltaAction::Cdc])? {
+    for commit in range.commits(engine.clone(), None, actions)? {
         for batch in commit?.get_actions(engine.as_ref())? {
             let batch = batch?;
             let batch = batch
@@ -357,6 +373,30 @@ fn read_cdc_paths(
                 .downcast_ref::<ArrowEngineData>()
                 .ok_or_else(|| anyhow::anyhow!("commit actions were not ArrowEngineData"))?
                 .record_batch();
+            let remove = batch
+                .column_by_name("remove")
+                .map(|c| c.as_struct())
+                .ok_or_else(|| anyhow::anyhow!("commit action schema has no remove column"))?;
+            let remove_paths = remove
+                .column_by_name("path")
+                .map(|c| c.as_string::<i32>())
+                .ok_or_else(|| anyhow::anyhow!("remove has no path column"))?;
+            let deleted_at = remove
+                .column_by_name("deletionTimestamp")
+                .map(|c| c.as_primitive::<Int64Type>())
+                .ok_or_else(|| anyhow::anyhow!("remove has no deletionTimestamp column"))?;
+            let dv = remove
+                .column_by_name("deletionVector")
+                .map(|c| c.as_struct())
+                .ok_or_else(|| anyhow::anyhow!("remove has no deletionVector column"))?;
+            let storage_type = dv
+                .column_by_name("storageType")
+                .map(|c| c.as_string::<i32>())
+                .ok_or_else(|| anyhow::anyhow!("deletionVector has no storageType column"))?;
+            let path_or_inline = dv
+                .column_by_name("pathOrInlineDv")
+                .map(|c| c.as_string::<i32>())
+                .ok_or_else(|| anyhow::anyhow!("deletionVector has no pathOrInlineDv column"))?;
             let cdc = batch
                 .column_by_name("cdc")
                 .map(|c| c.as_struct())
@@ -365,12 +405,29 @@ fn read_cdc_paths(
                 .column_by_name("path")
                 .map(|c| c.as_string::<i32>())
                 .ok_or_else(|| anyhow::anyhow!("cdc has no path column"))?;
-            for row in 0..batch.num_rows() {
-                // most rows in a commit are some other action
-                if cdc.is_null(row) || cdc_paths.is_null(row) {
-                    continue;
+
+            let rows = remove_paths
+                .iter()
+                .zip(deleted_at.iter())
+                .zip(storage_type.iter().zip(path_or_inline.iter()))
+                .zip(cdc_paths.iter());
+
+            for (((removed, deleted_at), dv), cdc_path) in rows {
+                match (removed, deleted_at, cdc_path) {
+                    // removed inside retention; a remove with no timestamp counts as expired
+                    (Some(path), Some(at), _) if at >= cutoff_ms => {
+                        paths.insert(keep_path(path)?);
+                        if let (Some(storage_type), Some(path_or_inline)) = dv
+                            && let Some(dv_path) = dv_file_path(storage_type, path_or_inline)?
+                        {
+                            paths.insert(dv_path);
+                        }
+                    }
+                    (_, _, Some(path)) => {
+                        paths.insert(keep_path(path)?);
+                    }
+                    _ => (),
                 }
-                paths.insert(keep_path(cdc_paths.value(row))?);
             }
         }
     }
