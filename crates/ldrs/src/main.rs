@@ -288,6 +288,7 @@ async fn checkpoint_target(
         target = %target.target,
         version = outcome.version,
         written = outcome.written,
+        log_files_deleted = outcome.log_files_deleted,
         "checkpoint complete"
     );
     Ok(())

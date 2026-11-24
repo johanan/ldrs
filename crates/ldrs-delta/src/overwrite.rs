@@ -9,14 +9,13 @@ use ldrs_storage::base_or_relative_path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use parquet::file::metadata::ParquetMetaData;
 use tokio::runtime::Handle;
-use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
     MAX_COMMIT_RETRIES, OperationConfig, build_add, build_engine, build_overwrite_commit,
-    checkpoint_interval, cleanup_source_files, should_checkpoint, snapshot_table_state,
-    version_to_log_filename, write_checkpoint,
+    checkpoint_and_clean, checkpoint_interval, cleanup_source_files, should_checkpoint,
+    snapshot_table_state, version_to_log_filename,
 };
 
 /// Streaming Delta overwrite. Writes data files through an embedded [`ParquetSink`]
@@ -152,10 +151,13 @@ async fn commit_overwrite(
                     table_state.snapshot.log_segment().checkpoint_version,
                     checkpoint_interval(&table_state.snapshot),
                 ) {
-                    match write_checkpoint(engine.clone(), table_state.snapshot).await {
-                        Ok((r, _)) => info!(version, result = ?r, "checkpoint"),
-                        Err(e) => warn!(version, error = %e, "failed to create checkpoint"),
-                    }
+                    checkpoint_and_clean(
+                        engine.clone(),
+                        store.as_ref(),
+                        base_path,
+                        table_state.snapshot,
+                    )
+                    .await;
                 }
                 return Ok(());
             }

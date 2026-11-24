@@ -21,6 +21,8 @@ use uuid::Uuid;
 
 mod dv;
 mod features;
+mod log_cleanup;
+use log_cleanup::cleanup_expired_logs;
 mod merge;
 mod optimize;
 mod overwrite;
@@ -342,12 +344,36 @@ async fn write_checkpoint(
     }
 }
 
+/// Checkpoint the snapshot, then delete the log it lets us expire. Best effort: the commit
+/// has landed, so failures are logged, not returned.
+async fn checkpoint_and_clean(
+    engine: Arc<dyn Engine>,
+    store: &dyn ObjectStore,
+    base_path: &object_store::path::Path,
+    snapshot: SnapshotRef,
+) {
+    let version = snapshot.version();
+    match write_checkpoint(engine.clone(), snapshot).await {
+        Ok((result, snapshot)) => {
+            tracing::info!(version, ?result, "checkpoint");
+            match cleanup_expired_logs(engine, store, base_path, snapshot, chrono::Utc::now()).await
+            {
+                Ok(deleted) => tracing::info!(version, deleted, "log cleanup"),
+                Err(e) => tracing::warn!(version, error = %e, "log cleanup failed"),
+            }
+        }
+        Err(e) => tracing::warn!(version, error = %e, "failed to create checkpoint"),
+    }
+}
+
 /// What a checkpoint request did.
 #[derive(Debug, Clone, Copy)]
 pub struct CheckpointOutcome {
     pub version: Version,
     /// `false` when the version already had a checkpoint
     pub written: bool,
+    /// Expired `_delta_log` entries removed after the checkpoint
+    pub log_files_deleted: u64,
 }
 
 /// Consolidate the log at the table's current version
@@ -356,15 +382,31 @@ pub async fn checkpoint(
     cloud_io: &Handle,
 ) -> Result<CheckpointOutcome, anyhow::Error> {
     let url = base_or_relative_path(table_path)?;
-    let (store, _, _) = build_store(&url)?;
-    let engine = build_engine(store, cloud_io);
+    let (store, base_path, _) = build_store(&url)?;
+    let engine = build_engine(store.clone(), cloud_io);
     let snapshot = Snapshot::builder_for(kernel_url(&url)?).build(engine.as_ref())?;
     let version = snapshot.version();
 
-    let (result, _) = write_checkpoint(engine, snapshot).await?;
+    let (result, snapshot) = write_checkpoint(engine.clone(), snapshot).await?;
+    let log_files_deleted = match cleanup_expired_logs(
+        engine,
+        store.as_ref(),
+        &base_path,
+        snapshot,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(deleted) => deleted,
+        Err(e) => {
+            tracing::warn!(version, error = %e, "log cleanup failed");
+            0
+        }
+    };
     Ok(CheckpointOutcome {
         version,
         written: matches!(result, CheckpointWriteResult::Written),
+        log_files_deleted,
     })
 }
 

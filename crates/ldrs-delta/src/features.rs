@@ -123,6 +123,44 @@ pub(crate) fn rewrite_is_supported(feature: &TableFeature) -> bool {
     }
 }
 
+pub(crate) fn log_can_truncate(feature: &TableFeature) -> bool {
+    use TableFeature::*;
+    match feature {
+        AppendOnly
+        | Invariants
+        | CheckConstraints
+        | GeneratedColumns
+        | IdentityColumns
+        | InCommitTimestamp
+        | DomainMetadata
+        | RowTracking
+        | ColumnMapping
+        | TypeWidening
+        | TypeWideningPreview
+        | VariantType
+        | VariantTypePreview
+        | VariantShredding
+        | VariantShreddingPreview
+        | GeospatialType
+        | MaterializePartitionColumns
+        | AllowColumnDefaults
+        | ClusteredTable
+        | TimestampWithoutTimezone
+        | DeletionVectors
+        | VacuumProtocolCheck
+        | ChangeDataFeed
+        | V2Checkpoint
+        | IcebergCompatV1
+        | IcebergCompatV2
+        | IcebergCompatV3 => true,
+        // Table state lives in a manifest tree, not in commits replayed from a checkpoint.
+        IcebergNativeV4Preview | AdaptiveMetadataPreview => false,
+        // The catalog owns the commits and must permit metadata cleanup.
+        CatalogManaged | CatalogOwnedPreview => false,
+        Unknown(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
