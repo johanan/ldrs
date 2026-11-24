@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.26.0] - 2026-11-24
+
+### Features
+
+- *(delta)* Add log cleanup
+
+ldrs will now remove old log commits after a checkpoint. This happens
+through normal writes (when it has been more than 10 commits since a
+checkpoint) or with maintenance.
+
+
 ## [0.25.5] - 2026-11-23
 
 ### Bug Fixes
