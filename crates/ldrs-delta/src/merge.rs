@@ -14,7 +14,6 @@ use ldrs_storage::{base_or_relative_path, kernel_url};
 use object_store::ObjectStore;
 use parquet::file::metadata::ParquetMetaData;
 use tokio::runtime::Handle;
-use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -22,8 +21,8 @@ use std::collections::HashMap;
 
 use crate::{
     Commit, DeltaRemove, DeltaTxn, MERGE_MAX_RETRIES, Operation, OperationConfig, build_add,
-    build_engine, checkpoint_interval, cleanup_source_files, file_path, physical_name,
-    should_checkpoint, version_to_log_filename, write_checkpoint,
+    build_engine, checkpoint_and_clean, checkpoint_interval, cleanup_source_files, file_path,
+    physical_name, should_checkpoint, version_to_log_filename,
 };
 
 use super::dv::{build_dv_file, build_dv_inline, serialize_dv};
@@ -523,10 +522,7 @@ async fn commit_merge(
                     snapshot.log_segment().checkpoint_version,
                     checkpoint_interval(&snapshot),
                 ) {
-                    match write_checkpoint(engine.clone(), snapshot).await {
-                        Ok((r, _)) => info!(version, result = ?r, "checkpoint"),
-                        Err(e) => warn!(version, error = %e, "failed to create checkpoint"),
-                    }
+                    checkpoint_and_clean(engine.clone(), store.as_ref(), base_path, snapshot).await;
                 }
                 let source_rows: usize = source_files
                     .iter()
